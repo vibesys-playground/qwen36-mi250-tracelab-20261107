@@ -1,21 +1,43 @@
-version = "0.1"
+# Qwen3.6-35B-A3B on one MI250 node (8 GCDs), TraceLab recorded-session replay: a task of two
+# images for vibesys-cli (schema 0.2). The candidate's server runs in the image Dockerfile.rocm
+# builds from the candidate's commit, with the node's AMD GPUs; this directory is the task image
+# (Dockerfile here), which runs the checker and the replay against the server at
+# VIBESYS_SERVICE_URL.
+version = "0.2"
 backends = ["rocm"]
 
 [agent]
 domain = "llm-serving"
 interface = "service"
 
+# The operator provides the node's AMD GPUs, and the Hugging Face cache holding
+# Qwen/Qwen3.6-35B-A3B at the pinned revision as the read-only mount named "hf"
+# (/vibesys/mounts/hf), which the candidate's image reads offline.
+[environment]
+needs = ["rocm", "mounts"]
+
+[candidate]
+dockerfile = "Dockerfile.rocm"
+context = "."
+serve = ["python", "-m", "engine.server", "--host", "127.0.0.1", "--port", "${PORT}"]
+ready = "/health"
+# Loading about 70 GB of BF16 weights from the shared file system onto eight GCDs.
+startup_timeout_seconds = 1800
+
+# The shared service checker (sentinel echo, known answers, greedy repeatability).
 [accuracy]
-command = ["uv", "run", "python", "-I", "${PROJECT_ROOT}/.vibesys/tasks/default/accuracy_checker/checker.py"]
+command = ["sh", "-c", "exec python3 -I /task/checker.py --url \"$VIBESYS_SERVICE_URL\""]
 timeout_seconds = 300
 
-[evaluator]
-name = "vibesys-evaluator-request-factory"
-version = "0.1.0"
-
+# The TraceLab replay through Request Factory's session_runner, launched by the evaluator's
+# adapter as the earlier `request-factory-adapter` entrypoint did; vibesys-cli appends
+# --vs-output FILE, which "$@" passes on to replay.py.
 [benchmark]
-entrypoint = "request-factory-adapter"
-args = ["${PROJECT_ROOT}/.vibesys/shared/tracelab/replay.py"]
+command = [
+  "sh", "-c",
+  "exec python3 /task/adapter.py --engine /usr/local/bin/session_runner -- /task/replay.py --url \"$VIBESYS_SERVICE_URL\" \"$@\"",
+  "benchmark",
+]
 timeout_seconds = 3600
 result_protocol = 2
 

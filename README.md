@@ -95,6 +95,10 @@ uv pip install 'torch==2.9.1+rocm6.4' --index-url https://download.pytorch.org/w
 uv pip install -r requirements-agentx.txt
 ```
 
+For `mi2508x-tracelab`, vibesys-cli builds the same environment as a container
+image from [`Dockerfile.rocm`](Dockerfile.rocm) and runs the service command in
+it; see that task's objective.
+
 This torch build cannot run `torch._grouped_mm`, Transformers' default MoE
 experts kernel: it raises "grouped gemm is not supported on ROCM" at the first
 forward pass, even though Transformers' availability check passes (an MI250

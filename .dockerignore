@@ -1,0 +1,4 @@
+# The build context of Dockerfile.rocm (the candidate's image) is the project root; it needs
+# only the engine's pinned dependencies. The engine's code is run from the checkout.
+*
+!requirements-agentx.txt

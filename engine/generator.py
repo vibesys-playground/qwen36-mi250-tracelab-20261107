@@ -14,6 +14,15 @@ was taken: at a chunk boundary, or after all but the last token of an earlier
 prompt. Because a reused snapshot was computed over the same chunk boundaries a
 cold prefill would use, reuse does not change the computation, and identical
 greedy requests return identical tokens whether or not they hit the cache.
+
+When a request finishes, its cache covers its prompt and every generated token
+but the last (which was picked, never fed). That cache is kept as a *session
+tail*: a multi-round client sends the next round as this round's prompt, its
+output and new tokens, so the next round resumes from the tail at any length
+instead of re-prefilling the history from the last chunk boundary. A tail is
+handed over (not copied) to the round that extends it, and a newer tail that
+extends an older one replaces it. Entries are budgeted by count, tokens and the
+bytes their tensors hold, and evicted least recently used first.
 """
 
 from __future__ import annotations
@@ -56,44 +65,140 @@ class Step:
     finish: FinishReason | None
 
 
-class PrefixCache:
-    """LRU snapshots of the model cache, keyed by the token ids they cover."""
+def _compact(cache: DynamicCache, *, move: bool) -> tuple[DynamicCache, int]:
+    """A copy of ``cache`` whose tensors own compact storage, and the bytes they hold.
 
-    def __init__(self, chunk_tokens: int, max_tokens: int, max_entries: int) -> None:
+    After a batched decode step (``batching.split``), a request's tensors are
+    views of the padded batch; keeping such a view (or a plain deep copy of
+    it) would keep the whole batch alive. Every tensor is cloned, except that
+    with ``move`` a tensor that already owns exactly its storage is taken over
+    as is, so ``cache`` must not be used afterwards.
+    """
+    memo: dict[int, Any] = {}
+    nbytes = 0
+
+    def own(tensor: torch.Tensor) -> None:
+        nonlocal nbytes
+        if id(tensor) in memo:
+            return
+        owned = tensor._base is None and tensor.untyped_storage().nbytes() == tensor.nbytes
+        keep = move and owned
+        memo[id(tensor)] = tensor if keep else tensor.clone(memory_format=torch.contiguous_format)
+        nbytes += tensor.nbytes
+
+    for layer in cache.layers:
+        for value in vars(layer).values():
+            values = value.values() if isinstance(value, dict) else (value,)
+            for item in values:
+                if isinstance(item, torch.Tensor):
+                    own(item)
+    return copy.deepcopy(cache, memo), nbytes
+
+
+@dataclass
+class _Entry:
+    cache: DynamicCache
+    nbytes: int
+    tail: bool
+
+
+class PrefixCache:
+    """LRU snapshots of the model cache, keyed by the token ids they cover.
+
+    A chunk-boundary or all-but-last-token snapshot is reused only at exactly
+    those lengths and is copied on reuse. A session tail (see the module
+    docstring) is reused by any longer prompt that starts with it and is handed
+    over on reuse.
+    """
+
+    def __init__(
+        self, chunk_tokens: int, max_tokens: int, max_entries: int, max_bytes: int | None = None
+    ) -> None:
         self._chunk = chunk_tokens
         self._max_tokens = max_tokens
         self._max_entries = max_entries
-        self._entries: OrderedDict[tuple[int, ...], DynamicCache] = OrderedDict()
+        self._max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[int, ...], _Entry] = OrderedDict()
         self._tokens = 0
+        self.bytes = 0
+        self.tail_hits = 0
+        self.evictions = 0
 
-    def _usable(self, key: tuple[int, ...], prompt: tuple[int, ...]) -> bool:
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _usable(self, key: tuple[int, ...], entry: _Entry, prompt: tuple[int, ...]) -> bool:
         length = len(key)
         return (
             0 < length < len(prompt)
-            and (length % self._chunk == 0 or length == len(prompt) - 1)
+            and (entry.tail or length % self._chunk == 0 or length == len(prompt) - 1)
             and prompt[:length] == key
         )
 
     def lookup(self, prompt: tuple[int, ...]) -> tuple[int, DynamicCache | None]:
-        """The longest usable snapshot for ``prompt``, copied, and how many tokens it covers."""
-        best = max((k for k in self._entries if self._usable(k, prompt)), key=len, default=None)
+        """The longest usable snapshot for ``prompt``, and how many tokens it covers.
+
+        The caller owns the returned cache: a snapshot is copied, a tail is removed.
+        """
+        best = max(
+            (k for k, e in self._entries.items() if self._usable(k, e, prompt)),
+            key=len,
+            default=None,
+        )
         if best is None:
             return 0, None
+        entry = self._entries[best]
+        if entry.tail:
+            self._remove(best)
+            self.tail_hits += 1
+            return len(best), entry.cache
         self._entries.move_to_end(best)
-        return len(best), copy.deepcopy(self._entries[best])
+        return len(best), copy.deepcopy(entry.cache)
 
     def store(self, key: tuple[int, ...], cache: DynamicCache) -> None:
         """Keep a copy of ``cache``, which covers exactly ``key``."""
         if key in self._entries:
             self._entries.move_to_end(key)
             return
-        if not key or len(key) > self._max_tokens or self._max_entries == 0:
+        if not self._admits(key):
             return
-        self._entries[key] = copy.deepcopy(cache)
+        copied, nbytes = _compact(cache, move=False)
+        self._insert(key, _Entry(copied, nbytes, tail=False))
+
+    def store_tail(self, key: tuple[int, ...], cache: DynamicCache) -> None:
+        """Keep ``cache``, which covers exactly ``key``, as a session tail; takes ownership."""
+        for older in [k for k, e in self._entries.items() if e.tail and key[: len(k)] == k]:
+            self._remove(older)  # superseded: the new tail extends it
+        if key in self._entries:
+            self._entries[key].tail = True
+            self._entries.move_to_end(key)
+            return
+        if not self._admits(key):
+            return
+        compact, nbytes = _compact(cache, move=True)
+        self._insert(key, _Entry(compact, nbytes, tail=True))
+
+    def _admits(self, key: tuple[int, ...]) -> bool:
+        return bool(key) and len(key) <= self._max_tokens and self._max_entries > 0
+
+    def _insert(self, key: tuple[int, ...], entry: _Entry) -> None:
+        if self._max_bytes is not None and entry.nbytes > self._max_bytes:
+            return
+        self._entries[key] = entry
         self._tokens += len(key)
-        while self._tokens > self._max_tokens or len(self._entries) > self._max_entries:
-            evicted, _ = self._entries.popitem(last=False)
-            self._tokens -= len(evicted)
+        self.bytes += entry.nbytes
+        while (
+            self._tokens > self._max_tokens
+            or len(self._entries) > self._max_entries
+            or (self._max_bytes is not None and self.bytes > self._max_bytes)
+        ):
+            self._remove(next(iter(self._entries)))
+            self.evictions += 1
+
+    def _remove(self, key: tuple[int, ...]) -> None:
+        entry = self._entries.pop(key)
+        self._tokens -= len(key)
+        self.bytes -= entry.nbytes
 
 
 class Generation:
@@ -107,9 +212,12 @@ class Generation:
         cache: DynamicCache,
         logits: torch.Tensor,
         max_tokens: int,
+        prompt: tuple[int, ...] = (),
     ) -> None:
         self._generator = generator
         self._sampling = sampling
+        self._prompt = prompt
+        self._picked: list[int] = []
         self.cached_tokens = cached_tokens
         self.cache = cache
         self.logits = logits
@@ -127,12 +235,26 @@ class Generation:
         token = g.pick(self.logits, self._sampling, self._count, self._rng)
         self._count += 1
         self.last_token = token
+        self._picked.append(token)
         if token in g.eos_ids and not self._sampling.ignore_eos:
             self.done = True
             return Step(token, emit=False, finish="stop")
         finish: FinishReason | None = "length" if self._count == self._max_tokens else None
         self.done = finish is not None
         return Step(token, emit=True, finish=finish)
+
+    def retire(self) -> None:
+        """Hand this finished request's cache to the prefix cache as a session tail.
+
+        Call once the request has ended and no further decode step will run for
+        it. The cache covers the prompt and every picked token but the last,
+        which was never fed to the model.
+        """
+        if self.cache is None or not self._prompt or not self._picked:
+            return
+        key = self._prompt + tuple(self._picked[:-1])
+        cache, self.cache = self.cache, None
+        self._generator.keep_tail(key, cache)
 
 
 class Generator:
@@ -148,14 +270,20 @@ class Generator:
         chunk_tokens: int,
         prefix_cache_tokens: int,
         prefix_cache_entries: int,
+        prefix_cache_bytes: int | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.eos_ids = eos_ids
         self.max_model_len = max_model_len
         self._chunk = chunk_tokens
-        self._prefix_cache = PrefixCache(chunk_tokens, prefix_cache_tokens, prefix_cache_entries)
+        self._prefix_cache = PrefixCache(
+            chunk_tokens, prefix_cache_tokens, prefix_cache_entries, prefix_cache_bytes
+        )
         self._device = model.get_input_embeddings().weight.device
+        # Prompt counters, shown on /health: tokens run through prefill vs reused from the cache.
+        self.prefilled_tokens = 0
+        self.cached_tokens = 0
         # Decode counters, shown on /health: tokens fed per step tell whether requests were batched.
         self.decode_steps = 0
         self.decoded_tokens = 0
@@ -236,8 +364,30 @@ class Generator:
             if cache is None:
                 cache = DynamicCache(config=self.model.config)
             logits = self.prefill(prompt, reused, cache)
+        self.cached_tokens += reused
+        self.prefilled_tokens += len(prompt) - reused
         max_tokens = sampling.max_tokens if sampling.max_tokens is not None else budget
-        return Generation(self, sampling, reused, cache, logits, max_tokens)
+        return Generation(self, sampling, reused, cache, logits, max_tokens, prompt)
+
+    def keep_tail(self, key: tuple[int, ...], cache: DynamicCache) -> None:
+        """Keep a finished request's ``cache``, covering exactly ``key``, for the next round."""
+        with torch.inference_mode():
+            self._prefix_cache.store_tail(key, cache)
+
+    def stats(self) -> dict[str, int]:
+        """Counters for /health."""
+        pc = self._prefix_cache
+        return {
+            "decode_steps": self.decode_steps,
+            "decoded_tokens": self.decoded_tokens,
+            "largest_batch": self.largest_batch,
+            "prefilled_tokens": self.prefilled_tokens,
+            "cached_tokens": self.cached_tokens,
+            "prefix_cache_tail_hits": pc.tail_hits,
+            "prefix_cache_entries": len(pc),
+            "prefix_cache_bytes": pc.bytes,
+            "prefix_cache_evictions": pc.evictions,
+        }
 
     def decode(self, generations: list[Generation]) -> None:
         """Feed each generation's last token in one forward pass and store its next logits.

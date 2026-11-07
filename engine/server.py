@@ -9,13 +9,23 @@ loop: prefill each newly arrived request, one at a time, then pick one token
 for every running request and feed all of them back in a single batched decode
 step. The port opens only after the weights are loaded, so a readiness probe on
 ``/health`` passes once the server can answer.
+
+With more than one replica in its layout (by default one per two visible GPUs,
+so four 2-GCD replicas on an eight-GCD MI250 node; ``--replicas``,
+``--gpus-per-replica`` and ``--replica-devices`` or their ``ENGINE_*`` variables
+change it), this process instead becomes the front of ``engine.router``: it
+starts each replica as this same server on its own devices and routes every
+request to one of them, keeping a session on one replica. With one GPU, none,
+or ``--replicas 1``, it serves in-process as described above.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -23,7 +33,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import experts, protocol
+from engine import experts, protocol, router
 from engine.generator import CHECKPOINT, Generation, Generator, Step
 from engine.protocol import ChatRequest, CompletionRequest, Envelope, RequestError, Usage
 from engine.text import Detokenizer, StopMatcher
@@ -401,7 +411,38 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help=f"Transformers MoE experts implementation (default: {experts.NAME} on ROCm, Transformers' own elsewhere)",
     )
+    parser.add_argument(
+        "--replicas",
+        type=int,
+        default=router.env_int("ENGINE_REPLICAS"),
+        help="data-parallel model replicas, each its own process behind a session-affinity "
+        "router (env ENGINE_REPLICAS; default: one per --gpus-per-replica visible GPUs, "
+        "one on the CPU)",
+    )
+    parser.add_argument(
+        "--gpus-per-replica",
+        type=int,
+        default=router.env_int("ENGINE_GPUS_PER_REPLICA"),
+        help="GPUs each replica shards its weights over (env ENGINE_GPUS_PER_REPLICA; "
+        "default 2, or all GPUs / --replicas when that is given)",
+    )
+    parser.add_argument(
+        "--replica-devices",
+        default=os.environ.get("ENGINE_REPLICA_DEVICES"),
+        help="explicit device groups such as '0,1;2,3;4,5;6,7' (env ENGINE_REPLICA_DEVICES)",
+    )
+    if argv is None:
+        argv = sys.argv[1:]
     args = parser.parse_args(argv)
+    import torch
+
+    gpus = router.visible_gpus()
+    layout = router.resolve_layout(
+        gpus, args.replicas, args.gpus_per_replica, args.replica_devices or None
+    )
+    if len(layout) > 1 or (gpus and len(layout[0]) < gpus):
+        router.serve(argv, args.host, args.port, layout, hip=bool(torch.version.hip))
+        return
     revision = args.revision
     if revision is None and args.model == CHECKPOINT["model"]:
         revision = CHECKPOINT["revision"]
@@ -415,6 +456,11 @@ def main(argv: list[str] | None = None) -> None:
         experts_impl=args.experts_implementation,
     )
     server = _Server((args.host, args.port), generator, args.served_model_name or args.model)
+    if gpus:
+        per_gpu = ", ".join(
+            f"{d}: {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(gpus)
+        )
+        print(f"engine: weights loaded, allocated per GPU {per_gpu}", flush=True)
     print(f"engine: serving {args.model} on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
 

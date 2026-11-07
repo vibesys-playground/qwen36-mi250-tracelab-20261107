@@ -349,13 +349,16 @@ class FastModel:
             conv[slot].copy_(c)
             rec[slot].copy_(r)
         full = snap.length // PAGE
+        held = list(snap.pages)
+        for page in held:  # held first: allocating below may evict ``snap`` itself
+            self.pool.ref(page)
         pages = []
-        for index, page in enumerate(snap.pages):
+        for index, page in enumerate(held):
             if index < full:
-                self.pool.ref(page)
                 pages.append(page)
             else:
                 pages.append(self._copy_page(page))
+                self.pool.unref(page)
         self.slot_pages[slot] = pages
         self._push_table(slot)
 

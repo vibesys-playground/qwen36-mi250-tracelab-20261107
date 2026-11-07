@@ -26,6 +26,7 @@ plan's stage-0 criteria.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -116,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         print("triton", triton.__version__)
     except ImportError:
         print("triton not installed")
+    os.environ["ENGINE_FAST"] = "0"  # the reference: the Transformers path, as the base serves
     t0 = time.perf_counter()
     generator = Generator.load(
         args.model,
@@ -248,6 +250,41 @@ def main(argv: list[str] | None = None) -> int:
             f"fast_graph={results[f'fast_b{batch}']:.2f} fast_eager={results[f'fast_eager_b{batch}']:.1f} "
             f"speedup_graph={results[f'hf_b{batch}'] / results[f'fast_b{batch}']:.1f}x"
         )
+
+    # ---------------------------------------------------------------- kernels alone, batch 8
+    try:
+        if torch.cuda.is_available():
+            from engine import experts as base_experts
+            from engine.fast import kernels
+
+            layer = next(i for i, t in enumerate(fast.layer_types) if t == "full_attention")
+            mlp = fast.layers[layer].mlp
+            dev = mlp.experts.gate_up_proj.device
+            x = torch.randn(8, text_cfg.hidden_size, device=dev, dtype=torch.bfloat16)
+            probs = torch.softmax(torch.randn(8, text_cfg.num_experts, device=dev), -1)
+            w, idx = torch.topk(probs, text_cfg.num_experts_per_tok, dim=-1)
+            w = (w / w.sum(-1, keepdim=True)).to(torch.bfloat16)
+            with torch.inference_mode():
+                ref = base_experts.experts_forward(mlp.experts, x, idx, w)
+                got = kernels.moe_decode(
+                    x, idx, w, mlp.experts.gate_up_proj, mlp.experts.down_proj, use_triton=True
+                )
+                err = float((ref.float() - got.float()).abs().max() / ref.float().abs().max())
+                t_ref = _time(lambda: base_experts.experts_forward(mlp.experts, x, idx, w), 20)
+                t_new = _time(
+                    lambda: kernels.moe_decode(
+                        x, idx, w, mlp.experts.gate_up_proj, mlp.experts.down_proj, use_triton=True
+                    ),
+                    50,
+                )
+            uniq = int(idx.unique().numel())
+            gbps = uniq * mlp.experts.gate_up_proj[0].numel() * 2 * 1.5 / (t_new / 1e3) / 1e9
+            print(
+                f"RESULT moe_layer_b8_ms base_batched_mm={t_ref:.3f} triton={t_new:.3f} "
+                f"rel_err={err:.4f} unique_experts={uniq} expert_read_GBps={gbps:.0f}"
+            )
+    except Exception as exc:  # noqa: BLE001 - informational only
+        print(f"RESULT moe_layer_b8_ms error={type(exc).__name__}: {exc}")
 
     # ---------------------------------------------------------------- verdict
     graph_ok = fast.use_graphs and fast.graph_error is None

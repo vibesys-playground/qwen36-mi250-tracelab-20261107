@@ -40,6 +40,13 @@ RUN pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://downlo
  && rm /tmp/requirements-agentx.txt \
  && python -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('torch', torch.__version__, 'hip', torch.version.hip)"
 
+# flash-linear-attention's Triton kernels (package `fla`) for the 30 Gated DeltaNet layers:
+# Transformers uses its chunk and fused-recurrent gated delta rule when `fla` imports, and
+# engine/gdn.py its fused gated RMSNorm. --no-deps so pip cannot swap torch's ROCm Triton
+# (pytorch-triton-rocm) for the CUDA `triton` wheel; fla-core's only other dependency is einops.
+RUN pip install --no-cache-dir --no-deps 'fla-core==0.5.2' 'einops==0.8.1' \
+ && python -c "import importlib.metadata as m, importlib.util as u, torch; assert torch.version.hip and u.find_spec('fla') and u.find_spec('triton'); print('fla-core', m.version('fla-core'), 'triton', m.version('pytorch-triton-rocm'))"
+
 # A job runs as the invoking user, whose HOME may not exist; the image's files are read-only
 # under Apptainer, so caches (Triton, Hugging Face modules) go under /tmp.
 ENV PYTHONUNBUFFERED=1 HOME=/tmp HF_HOME=/vibesys/mounts/hf HF_HUB_OFFLINE=1 \

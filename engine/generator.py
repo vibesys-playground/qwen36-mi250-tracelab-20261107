@@ -28,7 +28,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts
+from engine import batching, experts, gdn
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -188,6 +188,7 @@ class Generator:
             **({"experts_implementation": chosen} if chosen else {}),
         )
         lm.eval()
+        kernels = gdn.install(lm)
         if device_map is not None:
             placed = {str(p.device) for p in lm.parameters()}
             if any(d in ("cpu", "meta", "disk") for d in placed):
@@ -200,7 +201,9 @@ class Generator:
         if eos is None:
             eos = lm.config.eos_token_id
         eos_ids = frozenset([eos] if isinstance(eos, int) else (eos or []))
-        return cls(lm, tokenizer, eos_ids, **options)
+        generator = cls(lm, tokenizer, eos_ids, **options)
+        gdn.ready(generator, kernels)
+        return generator
 
     def encode_text(self, prompt: str) -> tuple[int, ...]:
         return tuple(self.tokenizer.encode(prompt))

@@ -417,7 +417,16 @@ class _FrontHandler(BaseHTTPRequestHandler):
             except (OSError, ValueError) as exc:
                 self._send_json(503, {"status": "unavailable", "error": str(exc)})
                 return
-            counters = ("decode_steps", "decoded_tokens")
+            counters = (
+                "decode_steps",
+                "decoded_tokens",
+                "prefilled_tokens",
+                "cached_tokens",
+                "prefix_cache_tail_hits",
+                "prefix_cache_entries",
+                "prefix_cache_bytes",
+                "prefix_cache_evictions",
+            )
             body: dict[str, Any] = {"status": "ok"}
             body.update({k: sum(s.get(k, 0) for s in states) for k in counters})
             body["largest_batch"] = max(s.get("largest_batch", 0) for s in states)

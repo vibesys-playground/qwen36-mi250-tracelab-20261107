@@ -235,6 +235,10 @@ def test_two_replicas_keep_each_session_and_its_cache(front: str) -> None:
     with ThreadPoolExecutor(4) as pool:
         results = list(pool.map(session, range(4)))
     after = _replica_tokens(front)
+    health = httpx.get(f"{front}/health").json()
+    # The front sums the replicas' prefill and prefix-cache counters.
+    for key in ("prefilled_tokens", "cached_tokens", "prefix_cache_tail_hits"):
+        assert health[key] == sum(r[key] for r in health["replicas"]) > 0
     # Both replicas did work: the sessions were spread.
     assert all(a > b for a, b in zip(after, before, strict=True))
     for rounds in results:

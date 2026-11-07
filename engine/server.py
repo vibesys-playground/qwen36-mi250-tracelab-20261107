@@ -404,7 +404,8 @@ def main(argv: list[str] | None = None) -> None:
         "--prefix-cache-gib",
         type=float,
         default=16.0,
-        help="GiB of snapshot tensors kept, summed over all devices",
+        help="GiB of snapshot tensors kept by this process, summed over its devices; with "
+        "--replicas it is each replica's budget over that replica's GPUs",
     )
     parser.add_argument(
         "--experts-implementation",

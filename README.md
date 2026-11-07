@@ -31,7 +31,9 @@ Every task except `mi2508x-tracelab-sglang` starts from the baseline engine in
   split again after the step. Greedy outputs match those of the same request
   served alone; the CPU check holds this. There is no fused or custom kernel.
 - A prefix cache keeps snapshots of the model cache: at prefill-chunk
-  boundaries, and after all but the last token of each prompt. Usage reports
+  boundaries, after all but the last token of each prompt, and, when a request
+  finishes, over its prompt and all but its last output token (a session tail
+  that the next round of a multi-round session resumes from). Usage reports
   the reused tokens as `prompt_tokens_details.cached_tokens`, which TraceLab's
   prefix-cache preflight requires.
 - It serves `GET /health`, `GET /v1/models`, and streaming or non-streaming

@@ -169,6 +169,7 @@ def _run(
         reasoning, content = output.push(step)
         finish = "stop" if output.stopped else step.finish
         if finish is not None:
+            generation.retire()
             r_tail, c_tail = ("", "") if output.stopped else output.flush()
             yield step, reasoning + r_tail, content + c_tail, finish
             return
@@ -279,13 +280,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            g = self.server.generator
-            stats = {
-                "decode_steps": g.decode_steps,
-                "decoded_tokens": g.decoded_tokens,
-                "largest_batch": g.largest_batch,
-            }
-            self._send_json(200, {"status": "ok", **stats})
+            self._send_json(200, {"status": "ok", **self.server.generator.stats()})
         elif self.path == "/v1/models":
             card = {
                 "id": self.server.model_name,
@@ -390,10 +385,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-model-len", type=int, default=262144)
     parser.add_argument("--prefill-chunk-tokens", type=int, default=2048)
     parser.add_argument(
-        "--prefix-cache-tokens", type=int, default=262144, help="tokens of snapshots kept"
+        "--prefix-cache-tokens", type=int, default=1048576, help="tokens of snapshots kept"
     )
     parser.add_argument(
-        "--prefix-cache-entries", type=int, default=16, help="snapshots kept (0 disables the cache)"
+        "--prefix-cache-entries", type=int, default=64, help="snapshots kept (0 disables the cache)"
+    )
+    parser.add_argument(
+        "--prefix-cache-gib",
+        type=float,
+        default=16.0,
+        help="GiB of snapshot tensors kept, summed over all devices",
     )
     parser.add_argument(
         "--experts-implementation",
@@ -412,6 +413,7 @@ def main(argv: list[str] | None = None) -> None:
         chunk_tokens=args.prefill_chunk_tokens,
         prefix_cache_tokens=args.prefix_cache_tokens,
         prefix_cache_entries=args.prefix_cache_entries,
+        prefix_cache_bytes=int(args.prefix_cache_gib * 2**30),
         experts_impl=args.experts_implementation,
     )
     server = _Server((args.host, args.port), generator, args.served_model_name or args.model)

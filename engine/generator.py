@@ -306,7 +306,7 @@ class Generator:
             logits = logits.clone()
             logits[list(self.eos_ids)] = float("-inf")
         if sampling.temperature == 0.0:
-            return int(torch.argmax(logits))
+            return int(torch.topk(logits, 2).indices[1])
         logits = logits / sampling.temperature
         if sampling.top_k > 0:
             kth = torch.topk(logits, min(sampling.top_k, logits.numel())).values[-1]

@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://downlo
 # engine/gdn.py its fused gated RMSNorm. --no-deps so pip cannot swap torch's ROCm Triton
 # (pytorch-triton-rocm) for the CUDA `triton` wheel; fla-core's only other dependency is einops.
 RUN pip install --no-cache-dir --no-deps 'fla-core==0.5.2' 'einops==0.8.1' \
- && python -c "import importlib.metadata as m, importlib.util as u, torch; assert torch.version.hip and u.find_spec('fla') and u.find_spec('triton'); print('fla-core', m.version('fla-core'), 'triton', m.version('pytorch-triton-rocm'))"
+ && python -c "import importlib.metadata as m, importlib.util as u, torch, triton; assert torch.version.hip and u.find_spec('fla'); print('torch', torch.__version__, 'triton', triton.__version__, 'fla-core', m.version('fla-core'))"
 
 # A job runs as the invoking user, whose HOME may not exist; the image's files are read-only
 # under Apptainer, so caches (Triton, Hugging Face modules) go under /tmp.

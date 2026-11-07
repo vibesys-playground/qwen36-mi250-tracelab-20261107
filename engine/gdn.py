@@ -22,8 +22,8 @@ new solver search) for almost every prompt length.
 
 ``ENGINE_GDN`` chooses: ``auto`` (default: fla when it imports and the model is
 on a GPU, else torch), ``fla`` (fail if fla cannot be used), ``torch`` (the
-Transformers torch recurrence with this conv) or ``reference`` (everything as
-Transformers ships it). ``warmup`` runs a few prefills and decode steps so
+Transformers torch recurrence with this conv) or ``reference`` (Transformers'
+own torch fallback for all of it, as served without fla). ``warmup`` runs a few prefills and decode steps so
 Triton compiles and autotunes before the server answers; ``ENGINE_WARMUP=0``
 skips it.
 """
@@ -262,9 +262,9 @@ def install(model: torch.nn.Module, mode: str | None = None) -> dict[str, Any]:
     norms = {type(m.norm) for m in layers if hasattr(m, "norm")}
     for name, module in modules.items():
         saved = _ORIGINAL.setdefault(name, {g: getattr(module, g) for g in _GLOBALS})
-        if chosen == "reference":
+        if chosen == "reference":  # Transformers' torch fallback, even where it found fla
             for g in _GLOBALS:
-                setattr(module, g, saved[g])
+                setattr(module, g, _unwrapped(saved[g]))
             continue
         module.causal_conv1d_fn = causal_conv1d_fn
         module.causal_conv1d_update = causal_conv1d_update
@@ -331,9 +331,21 @@ def warmup(generator: Any) -> float:
 
 
 def ready(generator: Any, installed: dict[str, Any]) -> None:
-    """Warm up (unless ``ENGINE_WARMUP=0``) and say which GDN kernels serve."""
+    """Warm up (unless ``ENGINE_WARMUP=0``) and say which GDN kernels serve.
+
+    Under ``ENGINE_GDN=auto``, fla kernels that fail to compile or run during the
+    warmup are replaced by the torch path before the server opens.
+    """
     seconds = None
     if os.environ.get("ENGINE_WARMUP", "1") != "0":
-        seconds = warmup(generator)
+        try:
+            seconds = warmup(generator)
+        except Exception as exc:
+            explicit = os.environ.get("ENGINE_GDN", "auto").strip().lower() != "auto"
+            if installed["mode"] != "fla" or explicit:
+                raise
+            print(f"engine: fla GDN kernels failed in warmup ({type(exc).__name__}: {exc}); using torch", flush=True)
+            installed = install(generator.model, "torch")
+            seconds = warmup(generator)
     warm = "skipped" if seconds is None else f"{seconds:.1f}s"
     print(f"engine: gdn {installed}, warmup {warm}", flush=True)

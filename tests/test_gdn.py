@@ -154,13 +154,13 @@ def test_torch_mode_model_matches_reference(dtype):
         )
 
 
-def test_reference_mode_restores_transformers_functions():
+def test_reference_mode_restores_transformers_torch_functions():
     model = _tiny_model(torch.float32)
     gdn.install(model, "torch")
     gdn.install(model, "reference")
     saved = gdn._ORIGINAL[modeling.__name__]
     for name in gdn._GLOBALS:
-        assert getattr(modeling, name) is saved[name]
+        assert getattr(modeling, name) is gdn._unwrapped(saved[name])
     assert modeling.Qwen3_5MoeRMSNormGated.forward is gdn._ORIGINAL_NORM[modeling.Qwen3_5MoeRMSNormGated]
 
 

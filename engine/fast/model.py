@@ -123,10 +123,20 @@ class _Device:
     """Per-device inputs of a decode step and the page table, kept at fixed addresses."""
 
     device: torch.device
-    slots: torch.Tensor
-    positions: torch.Tensor
-    tokens: torch.Tensor
+    packed: torch.Tensor  # [3, longest bucket]: tokens, slots, positions, filled by one copy
     page_table: torch.Tensor
+
+    @property
+    def tokens(self) -> torch.Tensor:
+        return self.packed[0]
+
+    @property
+    def slots(self) -> torch.Tensor:
+        return self.packed[1]
+
+    @property
+    def positions(self) -> torch.Tensor:
+        return self.packed[2]
 
 
 @dataclass
@@ -186,6 +196,7 @@ class FastModel:
         if self.use_graphs and not self.use_triton:
             raise ValueError("graph capture needs the Triton kernels (the references synchronize)")
         self.buckets = sorted(buckets)
+        self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
 
         # Per-layer state, allocated once on the layer's device.
@@ -235,12 +246,12 @@ class FastModel:
 
     def _device(self, dev: torch.device, inv_freq: torch.Tensor) -> _Device:
         if dev not in self.devices:
-            longest = max(self.buckets)
+            longest = self._rows
+            packed = torch.zeros((3, longest), dtype=torch.long, device=dev)
+            packed[1].fill_(self.slots)
             self.devices[dev] = _Device(
                 device=dev,
-                slots=torch.full((longest,), self.slots, dtype=torch.long, device=dev),
-                positions=torch.zeros((longest,), dtype=torch.long, device=dev),
-                tokens=torch.zeros((longest,), dtype=torch.long, device=dev),
+                packed=packed,
                 page_table=torch.zeros(
                     (self.slots + 1, self.max_pages), dtype=torch.int32, device=dev
                 ),
@@ -619,18 +630,14 @@ class FastModel:
             self._ensure_pages(slot, position + 1)
         size = self.bucket(batch) if self.use_graphs else batch
         pad = size - batch
-        host = torch.tensor(
-            [
-                list(tokens) + [0] * pad,
-                list(slots) + [self.dummy] * pad,
-                list(positions) + [0] * pad,
-            ],
-            dtype=torch.long,
-        )
+        longest = self._rows
+        host = torch.zeros((3, longest), dtype=torch.long)
+        host[1].fill_(self.dummy)
+        host[0, :batch] = torch.tensor(list(tokens), dtype=torch.long)
+        host[1, :batch] = torch.tensor(list(slots), dtype=torch.long)
+        host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
         for meta in self.devices.values():
-            meta.tokens[:size].copy_(host[0])
-            meta.slots[:size].copy_(host[1])
-            meta.positions[:size].copy_(host[2])
+            meta.packed.copy_(host)
         if self.use_graphs and self.graph_error is None:
             if size not in self.segments[0].graphs:
                 self.capture(size)

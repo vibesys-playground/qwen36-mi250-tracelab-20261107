@@ -105,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slots", type=int, default=16)
     parser.add_argument("--prompt-lengths", default="1024,2048,3072,4000")
     parser.add_argument("--timing-length", type=int, default=2048)
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=0,
+        help="load only the checkpoint's first N decoder layers (0: all), for one small GPU",
+    )
     args = parser.parse_args(argv)
     revision = args.revision
     if revision is None and args.model == CHECKPOINT["model"]:
@@ -119,9 +125,22 @@ def main(argv: list[str] | None = None) -> int:
         print("triton not installed")
     os.environ["ENGINE_FAST"] = "0"  # the reference: the Transformers path, as the base serves
     t0 = time.perf_counter()
+    config = None
+    if args.layers:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(args.model, revision=revision)
+        for cfg in {id(c): c for c in (config, config.get_text_config())}.values():
+            if hasattr(cfg, "layer_types"):
+                cfg.layer_types = list(cfg.layer_types)[: args.layers]
+                cfg.num_hidden_layers = args.layers
+            if hasattr(cfg, "mtp_num_hidden_layers"):
+                cfg.mtp_num_hidden_layers = 0
+        print("truncated to layers", config.get_text_config().layer_types)
     generator = Generator.load(
         args.model,
         revision,
+        config=config,
         max_model_len=args.max_len,
         chunk_tokens=args.chunk,
         prefix_cache_tokens=0,
@@ -250,6 +269,28 @@ def main(argv: list[str] | None = None) -> int:
             f"fast_graph={results[f'fast_b{batch}']:.2f} fast_eager={results[f'fast_eager_b{batch}']:.1f} "
             f"speedup_graph={results[f'hf_b{batch}'] / results[f'fast_b{batch}']:.1f}x"
         )
+        if args.layers:
+            # Per decoder layer: the step minus embedding, final norm and LM head, run alone.
+            from torch.nn import functional as F
+
+            from engine.fast.model import _rms
+
+            with torch.inference_mode():
+                ids = torch.full((batch,), 100, dtype=torch.long, device=fast.embed.device)
+
+                def head(ids=ids):
+                    x = _rms(F.embedding(ids, fast.embed), fast.final_norm, fast.eps)
+                    return F.linear(x.to(fast.lm_head.device), fast.lm_head).float()
+
+                head_ms = _time(head, args.timing_steps)
+            n = len(fast.layers)
+            per = {k: (results[f"{k}_b{batch}"] - head_ms) / n for k in ("hf", "fast", "fast_eager")}
+            print(
+                f"RESULT per_layer_ms batch={batch} layers={n} head_ms={head_ms:.2f} "
+                f"hf={per['hf']:.2f} fast_graph={per['fast']:.3f} fast_eager={per['fast_eager']:.2f} "
+                f"speedup_graph={per['hf'] / max(per['fast'], 1e-6):.1f}x "
+                f"speedup_eager={per['hf'] / max(per['fast_eager'], 1e-6):.1f}x"
+            )
 
     # ---------------------------------------------------------------- kernels alone, batch 8
     try:

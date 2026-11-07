@@ -254,12 +254,19 @@ class Generator:
 
     @classmethod
     def load(
-        cls, model: str, revision: str | None, *, experts_impl: str | None = None, **options: int
+        cls,
+        model: str,
+        revision: str | None,
+        *,
+        experts_impl: str | None = None,
+        config: Any = None,
+        **options: int,
     ) -> Generator:
         """Load BF16 weights, sharded over all visible GPUs, else on the CPU.
 
         ``experts_impl`` names the MoE experts implementation; None chooses
-        ``experts_implementation(torch.version.hip)``.
+        ``experts_implementation(torch.version.hip)``. ``config`` replaces the
+        checkpoint's config (a test harness loads a few layers this way).
         """
         tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
         device_map = "auto" if torch.cuda.is_available() else None
@@ -271,6 +278,7 @@ class Generator:
             dtype=torch.bfloat16,
             device_map=device_map,
             **({"experts_implementation": chosen} if chosen else {}),
+            **({"config": config} if config is not None else {}),
         )
         lm.eval()
         if device_map is not None:

@@ -16,6 +16,19 @@ unoptimized and is not a validated performance baseline. Making the ROCm serving
 path fast, by changing or replacing any part of it, is the task. Keep that
 launch command working: the project README gives it as the service command.
 
+vibesys-cli runs the server in a container of the image that
+[`Dockerfile.rocm`](../../../Dockerfile.rocm) builds from the candidate's commit
+(its context is the project root, filtered by the root `.dockerignore`), with
+the node's eight GCDs, as `python -m engine.server --host 127.0.0.1 --port
+<port>` from the checkout's root, and waits for `/health` (30 minutes at most).
+That image and its `.dockerignore` are part of the candidate, as `engine/` is;
+the seed holds the README's environment (Python 3.12, `torch==2.9.1+rocm6.4`,
+`requirements-agentx.txt`). Weights are never baked into it: the pinned
+checkpoint is read from the operator's Hugging Face cache, mounted read-only at
+`/vibesys/mounts/hf` (`HF_HOME`, with `HF_HUB_OFFLINE=1`). The image's own files
+are read-only at run time; write only under `/tmp`. The checker and the replay
+run in a separate task image and reach the server over HTTP.
+
 Partition BF16 weights across the eight GCDs. Explore tensor, expert or
 pipeline parallelism over all eight, or replicas such as two of four GCDs or
 four of two GCDs. The two GCDs of one card are joined by an in-package

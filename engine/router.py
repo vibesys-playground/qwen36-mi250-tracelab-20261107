@@ -17,7 +17,17 @@ previous prompt (the earlier prompt plus the model output plus new input).
 request whose prompt starts with a remembered prompt goes to that prompt's
 replica, choosing the longest such prompt. A prompt that extends none goes to
 the least-loaded replica, counting in-flight requests and sessions that ended a
-round moments ago and are likely to continue. A prompt is compared as token
+round moments ago and are likely to continue. With balancing on (the default,
+``ENGINE_ROUTER_BALANCE=1``) a new session also retires the session that ended
+a round most recently (within ``ENGINE_SESSION_SUCCESSOR_SECONDS``): a
+closed-loop client such as the saturated replay starts a session the moment
+another ends, so that ended session is gone, not resting, and it no longer
+counts; the new session prefers the replica it freed. The idle window then
+only has to cover tool waits between rounds (``ENGINE_SESSION_IDLE_SECONDS``,
+1.5 s, against the recorded waits' 0.6 s maximum). This depends on the
+arrival pattern: with back-to-back sessions it keeps each replica at its fair
+share of live sessions, where a 10 s ghost of every finished session stacked
+three or four on one replica while another held one. A prompt is compared as token
 ids, as text, or for chat as the sequence of its messages, so a chat session's
 growing history matches message by message. The replica holding a session holds
 its prefix-cache snapshots, so affinity is also what makes cached tokens real.
@@ -188,6 +198,7 @@ class Entry:
     replica: int
     ended_at: float | None = None
     continued: bool = False
+    retired: bool = False
 
 
 @dataclass
@@ -198,21 +209,64 @@ class Affinity:
     unrelated sessions onto its replica: a remembered prompt shorter than that
     attracts only an identical prompt. ``idle_seconds`` is how long a session
     that just finished a round still counts as load on its replica.
+    ``successor_seconds`` > 0 turns on successor retirement: a new session
+    retires the uncontinued, unretired prompt that ended most recently within
+    that many seconds (its session ended and this one replaced it) and prefers
+    that prompt's replica when loads tie. 0 keeps the plain idle window.
+
+    It also keeps, per replica, the seconds spent with each number of requests
+    in flight (from the first request on): ``stats()`` reports that histogram.
     """
 
     replicas: int
     max_entries: int = 4096
     min_tokens: int = 64
-    idle_seconds: float = 10.0
+    idle_seconds: float = 1.5
+    successor_seconds: float = 0.25
     _entries: OrderedDict[int, Entry] = field(default_factory=OrderedDict)
     _inflight: list[int] = field(default_factory=list)
     _new_sessions: list[int] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _next_id: int = 0
+    _seconds_at: list[list[float]] = field(default_factory=list)
+    _clock: float | None = None
+    _retired: int = 0
 
     def __post_init__(self) -> None:
         self._inflight = [0] * self.replicas
         self._new_sessions = [0] * self.replicas
+        self._seconds_at = [[] for _ in range(self.replicas)]
+
+    def _advance(self, now: float) -> None:
+        """Add the time since the last change to each replica's current in-flight level."""
+        if self._clock is not None:
+            dt = max(now - self._clock, 0.0)
+            for r, level in enumerate(self._inflight):
+                hist = self._seconds_at[r]
+                if len(hist) <= level:
+                    hist.extend([0.0] * (level + 1 - len(hist)))
+                hist[level] += dt
+        self._clock = now
+
+    def stats(self, now: float | None = None) -> dict[str, Any]:
+        """Per replica, seconds at each in-flight count; the share of time above two."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._clock is not None:
+                self._advance(now)
+            hist = [[round(t, 2) for t in h] for h in self._seconds_at]
+            total = sum(sum(h) for h in self._seconds_at)
+            busy = sum(sum(h[1:]) for h in self._seconds_at)
+            over = sum(sum(h[3:]) for h in self._seconds_at)
+            return {
+                "inflight_seconds": hist,
+                "share_over_2": round(over / total, 4) if total else 0.0,
+                "share_over_2_of_busy": round(over / busy, 4) if busy else 0.0,
+                "max_inflight": [len(h) - 1 if h else 0 for h in self._seconds_at],
+                "retired_successors": self._retired,
+                "idle_seconds": self.idle_seconds,
+                "successor_seconds": self.successor_seconds,
+            }
 
     def _match(self, key: Key) -> Entry | None:
         best: Entry | None = None
@@ -236,24 +290,51 @@ class Affinity:
         for entry in self._entries.values():
             if (
                 not entry.continued
+                and not entry.retired
                 and entry.ended_at is not None
                 and now - entry.ended_at < self.idle_seconds
             ):
                 load[entry.replica] += 1
         return load
 
-    def route(self, key: Key | None) -> tuple[int, int]:
+    def _retire_predecessor(self, now: float) -> int | None:
+        """Retire the prompt that ended most recently within ``successor_seconds``; its replica."""
+        latest: Entry | None = None
+        for entry in self._entries.values():
+            if (
+                entry.continued
+                or entry.retired
+                or entry.ended_at is None
+                or now - entry.ended_at >= self.successor_seconds
+            ):
+                continue
+            if latest is None or entry.ended_at > latest.ended_at:  # type: ignore[operator]
+                latest = entry
+        if latest is None:
+            return None
+        latest.retired = True
+        self._retired += 1
+        return latest.replica
+
+    def route(self, key: Key | None, now: float | None = None) -> tuple[int, int]:
         """(replica, ticket) for a request; pass the ticket to ``finish`` when it ends."""
         with self._lock:
-            now = time.monotonic()
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             match = self._match(key) if key is not None else None
             if match is not None:
                 replica = match.replica
                 match.continued = True
             else:
+                freed = (
+                    self._retire_predecessor(now)
+                    if self.successor_seconds > 0 and key is not None
+                    else None
+                )
                 load = self._load(now)
                 replica = min(
-                    range(self.replicas), key=lambda r: (load[r], self._new_sessions[r], r)
+                    range(self.replicas),
+                    key=lambda r: (load[r], r != freed, self._new_sessions[r], r),
                 )
                 self._new_sessions[replica] += 1
             self._inflight[replica] += 1
@@ -265,12 +346,33 @@ class Affinity:
                     self._entries.popitem(last=False)
             return replica, ticket
 
-    def finish(self, ticket: int, replica: int) -> None:
+    def finish(self, ticket: int, replica: int, now: float | None = None) -> None:
         with self._lock:
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             self._inflight[replica] -= 1
             entry = self._entries.get(ticket)
             if entry is not None:
-                entry.ended_at = time.monotonic()
+                entry.ended_at = now
+
+
+def make_affinity(replicas: int, env: dict[str, str] | None = None) -> Affinity:
+    """The router's ``Affinity`` from the environment.
+
+    ``ENGINE_ROUTER_BALANCE=0`` restores the old placement (a 10 s idle window,
+    no successor retirement) for A/B runs; the two windows can be set on their
+    own with ``ENGINE_SESSION_IDLE_SECONDS`` and ``ENGINE_SESSION_SUCCESSOR_SECONDS``.
+    """
+    env = os.environ if env is None else env
+    balance = (env.get("ENGINE_ROUTER_BALANCE") or "1").strip() not in ("0", "false", "no")
+    idle = env.get("ENGINE_SESSION_IDLE_SECONDS") or ("1.5" if balance else "10")
+    successor = env.get("ENGINE_SESSION_SUCCESSOR_SECONDS") or ("0.25" if balance else "0")
+    return Affinity(
+        replicas,
+        min_tokens=int(env.get("ENGINE_AFFINITY_MIN_TOKENS") or 64),
+        idle_seconds=float(idle),
+        successor_seconds=float(successor),
+    )
 
 
 # ----------------------------------------------------------------------------- replicas
@@ -439,6 +541,7 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 {"devices": list(r.devices), **s} for r, s in zip(replicas, states, strict=True)
             ]
             body["load"] = self.server.affinity.load()
+            body["router"] = self.server.affinity.stats()
             self._send_json(200, body)
             return
         try:
@@ -521,11 +624,7 @@ def serve(
     except BaseException:
         stop_replicas(replicas)
         raise
-    affinity = Affinity(
-        len(replicas),
-        min_tokens=env_int("ENGINE_AFFINITY_MIN_TOKENS") or 64,
-        idle_seconds=float(os.environ.get("ENGINE_SESSION_IDLE_SECONDS") or 10.0),
-    )
+    affinity = make_affinity(len(replicas))
     front = _Front((host, port), replicas, affinity)
 
     def watch() -> None:

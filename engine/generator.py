@@ -76,8 +76,9 @@ def use_fast_path(setting: str | None, gpu: bool) -> bool:
 
 
 def use_tensor_parallel() -> bool:
-    """``ENGINE_TP``: "2" splits every layer over the replica's two GPUs (``engine.fast.tp``),
-    "1" keeps the layer split; it applies only with exactly two visible GPUs."""
+    """``ENGINE_TP``: "2" (default) splits every layer over the replica's two GPUs
+    (``engine.fast.tp``), "1" keeps the layer split; it applies only with exactly two visible
+    GPUs (a replica of the default 4 x 2 layout)."""
     from engine.fast import tp
 
     return tp.size() == 2 and torch.cuda.is_available() and torch.cuda.device_count() == 2

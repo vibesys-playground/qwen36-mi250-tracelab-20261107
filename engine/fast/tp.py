@@ -44,7 +44,9 @@ import copy
 import ctypes
 import math
 import os
+import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -61,14 +63,17 @@ triton, tl = kernels.triton, kernels.tl
 CHUNK = 64  # 32-bit words per CTA of the in-graph all-reduce
 CAPACITY = 1 << 16  # words per parity buffer: 64 rows x 2048 BF16 (a verify step of bucket 32)
 MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeouts``)
+# Python's thread switch interval while both ranks run eagerly (prefill): the threads hand the
+# GIL to each other at every all-reduce, so a short interval only bounds the odd stall.
+SWITCH_S = float(os.environ.get("ENGINE_TP_SWITCH_S", "0.0002"))
 # Seconds an eager all-reduce waits for the peer thread before failing the pass.
 WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
 
 
 def size() -> int:
-    """``ENGINE_TP``: 2 for tensor parallelism over a replica's two GPUs, 1 (default) for the
-    layer split."""
-    return int(os.environ.get("ENGINE_TP", "1"))
+    """``ENGINE_TP``: 2 (default) for tensor parallelism over a replica's two GPUs, 1 for the
+    layer split (one GPU's layers after the other's)."""
+    return int(os.environ.get("ENGINE_TP", "2"))
 
 
 if triton is not None:
@@ -247,12 +252,17 @@ class Group:
             self._seq[rank] += 1
             self._box[(seq, rank)] = (x, event)
             self._cv.notify_all()
+            # The peer got here first and waits on us: after this hand it the GIL at once, or it
+            # would wait for Python's switch interval (5 ms by default) at every all-reduce.
+            handoff = (seq, 1 - rank) in self._box
             while (seq, 1 - rank) not in self._box:
                 if self._broken is not None:
                     raise RuntimeError(f"tensor-parallel peer failed: {self._broken}")
                 if not self._cv.wait(timeout=WAIT_S):
                     raise RuntimeError("tensor-parallel peer did not reach the all-reduce")
             theirs, their_event = self._box.pop((seq, 1 - rank))
+        if handoff:
+            time.sleep(0)
         if not theirs.is_cuda or theirs.device == x.device:
             return theirs
         # The copy runs on the source device's current stream (torch's cross-device copy),
@@ -574,6 +584,16 @@ class TPModel:
                 group.abort(f"rank 1: {type(exc).__name__}: {exc}")
                 raise
 
+        # Both threads launch kernels between rendezvous: switch between them quickly.
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(SWITCH_S)
+        try:
+            return self._both_run(fn, run1)
+        finally:
+            sys.setswitchinterval(interval)
+
+    def _both_run(self, fn: Callable[[FastModel], Any], run1: Callable[[], Any]) -> list[Any]:
+        group, r0 = self.group, self.ranks[0]
         future = self._pool.submit(run1)
         try:
             if r0.embed.device.type == "cuda":

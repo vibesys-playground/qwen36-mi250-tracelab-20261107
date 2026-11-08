@@ -139,6 +139,9 @@ def _ipc_worker(rank: int, conn, barrier, port: int) -> None:
             barrier.abort()
         except Exception:  # noqa: BLE001
             pass
+    # Leave without tearing down RCCL or the IPC mappings (j139: the workers did not exit).
+    sys.stdout.flush()
+    os._exit(0)
 
 
 def _ipc_body(rank: int, conn, barrier, port: int, emit) -> None:
@@ -411,7 +414,7 @@ def _rccl_tests(rank, dev, port, sync, emit) -> None:
         sync()
         emit("rccl_561x2048", dtype=str(dtype).split(".")[-1], one_shot_us_median=round(statistics.median(lat), 1),
              back_to_back_us=round((time.perf_counter() - t0) / 50 * 1e6, 1))
-    dist.destroy_process_group()
+    dist.barrier()
 
 
 def ipc(args) -> int:

@@ -136,17 +136,21 @@ def layer_section(device) -> None:
     inputs["decode1"] = torch.randn(1, 1, hidden, device=device, dtype=torch.bfloat16)
     inputs["decode8"] = torch.randn(8, 1, hidden, device=device, dtype=torch.bfloat16)
     with torch.inference_mode():
+        gdn.install(layer, "reference")  # prime the states with Transformers' torch fallback
         base = {name: fresh_cache(x.shape[0]) for name, x in inputs.items()}
         outputs = {}
         for mode in modes:
             gdn.install(layer, mode)
             for name, x in inputs.items():
+              try:
                 cache = copy.deepcopy(base[name])
                 out = layer(x, cache_params=cache)
                 outputs[mode, name] = (out.float(), *[s.float() for s in state(cache)])
                 work = copy.deepcopy(base[name])
                 med, low = timed(lambda: layer(x, cache_params=work), device)
                 result(f"layer_ms {mode} {name}", f"median {med:.3f} min {low:.3f}")
+              except Exception as exc:  # one failing mode must not hide the others
+                result(f"layer_failed {mode} {name}", f"{type(exc).__name__}: {exc}")
             # The pieces alone at 2048 tokens.
             x = inputs["prefill2048"]
             mixed = layer.in_proj_qkv(x).transpose(1, 2)
@@ -154,11 +158,16 @@ def layer_section(device) -> None:
 
             conv = modeling.causal_conv1d_fn
             w = layer.conv1d.weight.squeeze(1)
-            med, low = timed(lambda: conv(mixed, w, None, activation="silu"), device)
-            result(f"conv_ms {mode} 2048", f"median {med:.3f} min {low:.3f}")
+            try:
+                med, low = timed(lambda: conv(mixed, w, None, activation="silu"), device)
+                result(f"conv_ms {mode} 2048", f"median {med:.3f} min {low:.3f}")
+            except Exception as exc:
+                result(f"conv_failed {mode}", f"{type(exc).__name__}: {exc}")
         gdn.install(layer, "reference")
         for mode in modes[1:]:
             for name in inputs:
+                if (mode, name) not in outputs or ("reference", name) not in outputs:
+                    continue
                 ref, got = outputs["reference", name], outputs[mode, name]
                 diffs = [float((a - b).abs().max()) for a, b in zip(got, ref, strict=True)]
                 scale = float(ref[0].abs().max())

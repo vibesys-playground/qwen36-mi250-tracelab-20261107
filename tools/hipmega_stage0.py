@@ -510,8 +510,9 @@ def slice_main(args) -> None:
     torch.cuda.set_device(ranks[0].embed.device)
     out("step", at="rank_slices", recv=[hex(p) for p in recv_ptrs])
     rs = [RankSlice(rtc, code, ranks[r], r, layers, states[r], x_in[r], recv_ptrs, nl) for r in (0, 1)]
-    out("slice_setup", grid=rs[0].grid, occupancy=rs[0].slice_fn.occupancy(512),
+    out("slice_setup", grid=rs[0].grid, occupancy=[r.slice_fn.occupancy(512) for r in rs],
         regs=rs[0].slice_fn.attr(4))
+    torch.cuda.set_device(ranks[0].embed.device)
     torch.cuda.set_device(ranks[0].embed.device)
     nbar = 6 * nl
     cur_nl = [nl]

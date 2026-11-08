@@ -19,20 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from engine import gdn  # noqa: E402
 
 REF_CONV = gdn._unwrapped(modeling.causal_conv1d_fn)
-REF_UPDATE = gdn._unwrapped(modeling.causal_conv1d_update)
-
-
-def _ulps(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Largest difference in units of the bf16 spacing at b's magnitude."""
-    spacing = torch.clamp(b.float().abs(), min=2.0**-100) * 2.0**-7
-    return float(((a.float() - b.float()).abs() / spacing).max())
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("length", [1, 2, 3, 4, 5, 37, 129])
+@pytest.mark.parametrize("length", [1, 2, 3, 4, 5, 37, 255, 256, 257, 600])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("activation", [None, "silu"])
-def test_causal_conv_matches_transformers(dtype, length, with_bias, activation):
+def test_bucketed_causal_conv_equals_transformers(dtype, length, with_bias, activation):
     torch.manual_seed(length)
     channels, kernel = 48, 4
     x = torch.randn(2, channels, length, dtype=dtype)
@@ -41,41 +34,33 @@ def test_causal_conv_matches_transformers(dtype, length, with_bias, activation):
     want = REF_CONV(x, weight, bias, activation=activation)
     got = gdn.causal_conv1d_fn(x, weight, bias, activation=activation)
     assert got.dtype == want.dtype and got.shape == want.shape
-    if dtype == torch.float32:
-        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-    else:
-        # Both accumulate in fp32 and round once; only the summation order may differ.
-        assert _ulps(got, want) <= 1.0
-        assert (got == want).float().mean() > 0.98
+    # Right padding never reaches a kept causal output: the same values.
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_causal_conv_reads_a_transposed_view():
     """The GDN forward passes ``in_proj(x).transpose(1, 2)``, a non-contiguous view."""
     torch.manual_seed(0)
-    x = torch.randn(1, 37, 48, dtype=torch.bfloat16).transpose(1, 2)
-    weight = torch.randn(48, 4, dtype=torch.bfloat16)
-    want = REF_CONV(x, weight, None, activation="silu")
-    got = gdn.causal_conv1d_fn(x, weight, None, activation="silu")
-    assert _ulps(got, want) <= 1.0
+    for length in (37, 256):
+        x = torch.randn(1, length, 48, dtype=torch.bfloat16).transpose(1, 2)
+        weight = torch.randn(48, 4, dtype=torch.bfloat16)
+        want = REF_CONV(x, weight, None, activation="silu")
+        got = gdn.causal_conv1d_fn(x, weight, None, activation="silu")
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("length", [1, 2])
-@pytest.mark.parametrize("batch", [1, 3])
-def test_causal_conv_update_matches_transformers(dtype, length, batch):
-    torch.manual_seed(batch * 10 + length)
-    channels, kernel = 48, 4
-    state = torch.randn(batch, channels, kernel, dtype=dtype)
-    x = torch.randn(batch, channels, length, dtype=dtype)
-    weight = torch.randn(channels, kernel, dtype=dtype)
-    want_state, got_state = state.clone(), state.clone()
-    want = REF_UPDATE(x, want_state, weight, None, "silu")
-    got = gdn.causal_conv1d_update(x, got_state, weight, None, "silu")
-    assert torch.equal(got_state, want_state)  # the conv state is a copy: exactly equal
-    if dtype == torch.float32:
-        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
-    else:
-        assert _ulps(got, want) <= 1.0
+def test_buckets():
+    assert [gdn.bucket(n) for n in (1, 255, 256, 257, 2052)] == [256, 256, 256, 512, 2304]
+
+
+def test_warm_conv_runs_each_bucket_and_batch_once_per_shape():
+    model = _tiny_model(torch.bfloat16)
+    try:
+        gdn.install(model, "torch")
+        # Two GDN layers of one shape on one device: one set of problems.
+        assert gdn.warm_conv(model, 2048 + 4) == 9 + gdn.WARM_BATCH
+    finally:
+        gdn.install(model, "reference")
 
 
 def _tiny_model(dtype: torch.dtype):
@@ -139,6 +124,8 @@ def test_torch_mode_model_matches_reference(dtype):
         info = gdn.install(model, "torch")
         assert info == {"mode": "torch", "layers": 2, "fla": None, "fla_error": info["fla_error"]}
         assert modeling.causal_conv1d_fn is gdn.causal_conv1d_fn
+        # The decode conv update stays Transformers' torch function.
+        assert modeling.causal_conv1d_update is gdn._unwrapped(gdn._ORIGINAL[modeling.__name__]["causal_conv1d_update"])
         got, got_cache = _run(model, prompt, 8)
     finally:
         gdn.install(model, "reference")

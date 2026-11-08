@@ -5,15 +5,16 @@ imported: the recurrence from ``fla`` (flash-linear-attention) if it imports,
 else its own torch code, and the causal convolution from the ``causal_conv1d``
 package, else ``F.conv1d``. Its gated RMSNorm has no fast path without the
 ``kernels`` hub. The ROCm image has no ``causal_conv1d``, so the prefill conv is
-a depthwise ``F.conv1d`` that MIOpen serves, with a new problem (and possibly a
-new solver search) for almost every prompt length.
+a depthwise ``F.conv1d`` that MIOpen serves, with a new problem (compiled on
+first use) for almost every prompt length.
 
 ``install`` rebinds the module-level functions the GDN forward calls:
 
-- ``causal_conv1d_fn`` / ``causal_conv1d_update``: a depthwise causal conv built
-  from shifted multiply-adds (fp32 accumulation, rounded to the weight dtype,
-  then SiLU: the same steps ``F.conv1d`` + ACT2FN take), so no length is ever
-  new to a library and nothing goes to MIOpen.
+- ``causal_conv1d_fn``: the same ``F.conv1d`` call, on the input right-padded
+  to a multiple of ``BUCKET`` positions, so MIOpen sees a few lengths that
+  ``warm_conv`` compiles at startup instead of a new one per prompt (30-110 ms
+  each on gfx90a, j23). Outputs are those of the unpadded call. The decode
+  ``causal_conv1d_update`` stays Transformers' own; its batch sizes are warmed.
 - with ``fla`` on a GPU: ``chunk_gated_delta_rule`` (prefill) and
   ``fused_recurrent_gated_delta_rule`` (decode) Triton kernels, and fla's fused
   gated RMSNorm. These are the kernels Transformers itself selects when fla is
@@ -23,9 +24,9 @@ new solver search) for almost every prompt length.
 ``ENGINE_GDN`` chooses: ``auto`` (default: fla when it imports and the model is
 on a GPU, else torch), ``fla`` (fail if fla cannot be used), ``torch`` (the
 Transformers torch recurrence with this conv) or ``reference`` (Transformers'
-own torch fallback for all of it, as served without fla). ``warmup`` runs a few prefills and decode steps so
-Triton compiles and autotunes before the server answers; ``ENGINE_WARMUP=0``
-skips it.
+own torch fallback for all of it, as served without fla). ``warmup`` compiles the
+conv problems and runs a few prefills and decode steps so Triton compiles and
+autotunes before the server answers; ``ENGINE_WARMUP=0`` skips it.
 """
 
 from __future__ import annotations
@@ -54,28 +55,18 @@ _ORIGINAL_NORM: dict[type, Any] = {}
 
 
 # ---------------------------------------------------------------------------------------------
-# Causal depthwise convolution without MIOpen
+# Causal depthwise convolution on a fixed set of MIOpen problems
+
+# Prefill conv inputs are right-padded to a multiple of this many positions. Zeros after the
+# last position never reach a causal output that is kept, so the result is the same; MIOpen
+# then sees at most chunk/BUCKET + 1 lengths, all compiled by ``warm_conv`` before serving.
+BUCKET = 256
+# Decode batch sizes whose conv update ``warm_conv`` compiles.
+WARM_BATCH = 16
 
 
-def _taps(padded: torch.Tensor, weight: torch.Tensor, length: int, start: int) -> torch.Tensor:
-    """sum_j weight[:, j] * padded[..., start + j : start + j + length], accumulated in fp32."""
-    w = weight.float()
-    kernel = w.shape[-1]
-    acc = padded[..., start : start + length].float() * w[:, 0, None]
-    for j in range(1, kernel):
-        acc.addcmul_(padded[..., start + j : start + j + length], w[:, j, None])
-    return acc
-
-
-def _finish(acc: torch.Tensor, bias: torch.Tensor | None, dtype: torch.dtype, activation: str | None):
-    if bias is not None:
-        acc.add_(bias.float()[:, None])
-    out = acc.to(dtype)  # F.conv1d returns the weight dtype; the activation runs on that
-    if activation is not None:
-        if activation not in ("silu", "swish"):
-            raise ValueError(f"unsupported conv activation {activation!r}")
-        out = F.silu(out)
-    return out
+def bucket(length: int) -> int:
+    return -(-length // BUCKET) * BUCKET
 
 
 def causal_conv1d_fn(
@@ -85,35 +76,55 @@ def causal_conv1d_fn(
     activation: str | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
-    """Transformers' ``causal_conv1d_fn``: x ``[B, D, L]``, weight ``[D, K]``, output ``[B, D, L]``."""
+    """Transformers' ``causal_conv1d_fn`` (x ``[B, D, L]``, weight ``[D, K]``) on a bucketed length.
+
+    The same F.conv1d call as Transformers' torch path, so the same kernel and dtype
+    steps: conv in the weight dtype, then SiLU, then the input dtype.
+    """
     if kwargs.get("seq_idx") is not None or kwargs.get("cu_seqlens") is not None:
         raise ValueError("packed sequences are not supported by engine.gdn.causal_conv1d_fn")
-    length = hidden_states.shape[-1]
+    channels, length = hidden_states.shape[-2:]
     kernel = weight.shape[-1]
-    padded = F.pad(hidden_states.to(weight.dtype), (kernel - 1, 0))
-    out = _finish(_taps(padded, weight, length, 0), bias, weight.dtype, activation)
+    x = hidden_states.to(weight.dtype)
+    padded = bucket(length)
+    # Always contiguous, so a bucket is one MIOpen problem whatever the caller's strides.
+    x = F.pad(x, (0, padded - length)) if padded != length else x.contiguous()
+    out = F.conv1d(x, weight.unsqueeze(1), bias, padding=kernel - 1, groups=channels)[..., :length]
+    if activation is not None:
+        if activation not in ("silu", "swish"):
+            raise ValueError(f"unsupported conv activation {activation!r}")
+        out = F.silu(out)
     return out.to(hidden_states.dtype)
 
 
-def causal_conv1d_update(
-    hidden_states: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    activation: str | None = None,
-) -> torch.Tensor:
-    """Transformers' ``causal_conv1d_update``: shifts ``conv_state`` in place, returns ``[B, D, L]``."""
-    length = hidden_states.shape[-1]
-    state_len = conv_state.shape[-1]
-    kernel = weight.shape[-1]
-    full = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state.copy_(full[:, :, -state_len:])
-    # F.conv1d(full, padding=0)[..., -length:]: output i reads full[start + i : start + i + K].
-    start = full.shape[-1] - kernel + 1 - length
-    if start < 0:
-        raise ValueError("conv state shorter than the kernel")
-    out = _finish(_taps(full, weight, length, start), bias, weight.dtype, activation)
-    return out.to(hidden_states.dtype)
+def warm_conv(model: torch.nn.Module, max_length: int) -> int:
+    """Run the prefill conv at every bucket up to ``max_length`` and the decode conv update at
+    batch 1..WARM_BATCH, once per device and conv shape, so MIOpen compiles them now.
+    Returns the number of problems run."""
+    layers = gdn_modules(model)
+    if not layers:
+        return 0
+    module = sys.modules[type(layers[0]).__module__]
+    update = module.causal_conv1d_update
+    seen, count = set(), 0
+    with torch.inference_mode():
+        for layer in layers:
+            weight = layer.conv1d.weight.squeeze(1)
+            key = (weight.device, weight.dtype, tuple(weight.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            channels, kernel = weight.shape
+            for padded in range(BUCKET, bucket(max_length) + 1, BUCKET):
+                x = torch.zeros(1, channels, padded, dtype=weight.dtype, device=weight.device)
+                causal_conv1d_fn(x, weight, layer.conv1d.bias, activation=layer.activation)
+                count += 1
+            for batch in range(1, WARM_BATCH + 1):
+                state = torch.zeros(batch, channels, kernel, dtype=weight.dtype, device=weight.device)
+                x = torch.zeros(batch, channels, 1, dtype=weight.dtype, device=weight.device)
+                update(x, state, weight, layer.conv1d.bias, layer.activation)
+                count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------------------------
@@ -239,6 +250,10 @@ def _unwrapped(fn: Any) -> Any:
     return getattr(fn, "__wrapped__", fn)
 
 
+def _installed_modules(model: torch.nn.Module) -> list[ModuleType]:
+    return [sys.modules[n] for n in {type(m).__module__ for m in gdn_modules(model)}]
+
+
 def resolve_mode(model: torch.nn.Module, mode: str | None = None) -> str:
     mode = (mode or os.environ.get("ENGINE_GDN", "auto")).strip().lower()
     if mode not in MODES:
@@ -267,7 +282,7 @@ def install(model: torch.nn.Module, mode: str | None = None) -> dict[str, Any]:
                 setattr(module, g, _unwrapped(saved[g]))
             continue
         module.causal_conv1d_fn = causal_conv1d_fn
-        module.causal_conv1d_update = causal_conv1d_update
+        module.causal_conv1d_update = _unwrapped(saved["causal_conv1d_update"])
         if chosen == "fla":
             module.torch_chunk_gated_delta_rule = _fla_chunk
             module.torch_recurrent_gated_delta_rule = _fla_recurrent
@@ -315,6 +330,9 @@ def warmup(generator: Any) -> float:
     span = max(1, min(vocab - 1, 4096))
     ids = [(7919 * i + 11) % span + 1 for i in range(max(generator._chunk, 64) + 64)]
     counters = (generator.decode_steps, generator.decoded_tokens, generator.largest_batch)
+    if any(module.causal_conv1d_fn is causal_conv1d_fn for module in _installed_modules(model)):
+        state_len = int(model.config.get_text_config().linear_conv_kernel_dim)
+        warm_conv(model, generator._chunk + state_len)
     with torch.inference_mode():
         first = DynamicCache(config=model.config)
         generator.forward(ids[:37], first)  # fresh prefill, no initial state

@@ -8,7 +8,7 @@ Run in the candidate image from the project root: ``python scripts/gdn_bench.py`
    recurrence + engine conv, fla = engine.gdn with fla) for prefill chunks of 900 and 2048
    tokens on top of a state and decode at batch 1 and 8; output and state parity.
 3. Depthwise causal conv on lengths not seen before in this process: first call vs second
-   call, F.conv1d (MIOpen) vs engine.gdn.causal_conv1d_fn.
+   call, F.conv1d (MIOpen) vs engine.gdn.causal_conv1d_fn after its buckets are warmed.
 4. The whole model through engine.Generator on every GCD: load + warmup time, prefill of
    a 2048 + 900 token prompt, decode step time at batch 1 and 8, per mode; greedy parity
    (free-running and teacher-forced top-1 agreement, max logit difference) and greedy
@@ -188,6 +188,12 @@ def conv_section(device) -> None:
     channels, kernel = 8192, 4
     weight = torch.randn(channels, kernel, device=device, dtype=torch.bfloat16)
     torch.backends.cudnn.benchmark = False
+    # What engine.gdn.warm_conv does at startup for the prefill conv: every bucket once.
+    start = time.perf_counter()
+    for padded in range(gdn.BUCKET, gdn.bucket(2048 + kernel) + 1, gdn.BUCKET):
+        gdn.causal_conv1d_fn(torch.zeros(1, channels, padded, device=device, dtype=torch.bfloat16), weight, None, "silu")
+    torch.cuda.synchronize(device)
+    result("conv_bucket_warmup_ms", f"{(time.perf_counter() - start) * 1e3:.1f}")
     for label, fn, lengths in (
         ("F.conv1d", lambda x: F.conv1d(x, weight.unsqueeze(1), padding=kernel - 1, groups=channels)[..., : x.shape[-1]], (1013, 1237, 1499, 1733, 1877)),
         ("engine", lambda x: gdn.causal_conv1d_fn(x, weight, None, "silu"), (611, 777, 1111, 1999, 1301)),

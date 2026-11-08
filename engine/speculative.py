@@ -85,9 +85,27 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
         [g.length for g in generations],
     )
     generator.verify_steps += 1
+    apply(generator, generations, g1, g2, d1, d2, logits)
+
+
+def apply(
+    generator: Generator,
+    generations: list[Generation],
+    g1: list[int],
+    g2: list[int],
+    d1: list[int],
+    d2: list[int],
+    logits: torch.Tensor | None = None,
+) -> None:
+    """Take one verify step's picks: queue each request's next tokens, accept or reject its
+    draft (flipping the slot's state bank on accept), and set its next draft. ``logits``
+    (after each first token) are needed only for requests that do not speculate."""
+    fast = generator.fast
     for i, g in enumerate(generations):
         g.flipped = False
         if not g.speculates:
+            if logits is None:
+                raise RuntimeError("a request that does not speculate needs the step's logits")
             g.logits = logits[i].clone()
             g.length += 1
             g.draft = d1[i]

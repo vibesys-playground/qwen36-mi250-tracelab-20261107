@@ -126,5 +126,28 @@ def test_choose_shapes_only():
     for count in (1, 61, 561, 999, 1000, 1650, 4000):
         cfg = fp.choose(count, 3600 - min(count, 3600), 1, 8, 104)
         assert cfg["split"] >= 1 and cfg["block_r"] * 8 >= 16
-    assert fp.choose(61, 0, 1, 8, 104)["split"] == 1  # one key block: no split
+    assert fp.choose(61, 0, 1, 8, 104) == fp.choose(61, 3000, 1, 8, 104)  # T alone
     assert fp.choose(561, 3040, 1, 8, 104) == fp.choose(561, 3040, 1, 8, 104)
+
+
+@pytest.mark.parametrize("variant", range(len(VARIANTS)))
+@pytest.mark.parametrize("count,start,size", [(1, 0, 16), (5, 3, 16), (37, 0, 64), (40, 100, 64), (300, 70, 320)])
+def test_flash_meta_matches_rows(variant, count, start, size):
+    """Plan 33's device-side [count, start]: a bucket of ``size`` rows, the first ``count``
+    real; the real rows equal a plain call with the same knobs, bit for bit, and padding rows
+    are finite."""
+    dev = _device()
+    q_heads, kv_heads, dim, page = 8, 1, 64, 16
+    q, k_pool, v_pool, table, gate = _inputs(q_heads, kv_heads, dim, page, count, start, dev, garbage=False)
+    scale = dim ** -0.5
+    knobs = dict(VARIANTS[variant]) or fp.choose(size, None, kv_heads, q_heads // kv_heads)
+    knobs.pop("waves_per_eu", None)
+    plain = fp.flash_prefill_attention(q, k_pool, v_pool, table, start, gate, scale, **knobs)
+    qb = torch.zeros((size, q_heads, dim), dtype=q.dtype, device=dev)
+    gb = torch.zeros((size, q_heads * dim), dtype=gate.dtype, device=dev)
+    qb[:count], gb[:count] = q, gate
+    qb[count:] = q[-1]
+    meta = torch.tensor([count, start], dtype=torch.long, device=dev)
+    got = fp.flash_prefill_attention(qb, k_pool, v_pool, table, 999, gb, scale, meta=meta, **knobs)
+    assert torch.equal(got[:count], plain)
+    assert torch.isfinite(got.float()).all()

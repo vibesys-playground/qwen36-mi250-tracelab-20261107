@@ -97,16 +97,24 @@ if triton is not None:
     @triton.jit(do_not_specialize=["T", "start", "nsplit"])
     def _flash_prefill_kernel(
         q_ptr, k_ptr, v_ptr, table_ptr, gate_ptr, out_ptr, ws_acc, ws_ml, T, start, qk_scale,
-        stride_page, stride_head, stride_tok, nsplit,
+        stride_page, stride_head, stride_tok, nsplit, meta_ptr,
         QH: tl.constexpr, GROUP: tl.constexpr, BLOCK_R: tl.constexpr, D: tl.constexpr,
         PAGE: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT: tl.constexpr, KT: tl.constexpr,
-        WIDEN: tl.constexpr,
+        WIDEN: tl.constexpr, HAS_META: tl.constexpr,
     ):
         """SPLIT (constexpr) says whether the keys are split; ``nsplit`` (runtime, so a new
-        split count compiles nothing) how many ways."""
+        split count compiles nothing) how many ways. T rows are computed and stored; with
+        HAS_META the real row count and start come from ``meta_ptr`` ([count, start], int64,
+        on the device: plan 33's captured prefill) and rows >= count attend as row count - 1."""
         tile = tl.program_id(0)
         kvh = tl.program_id(1)
         split = tl.program_id(2)
+        if HAS_META:
+            n_real = tl.load(meta_ptr).to(tl.int32)
+            q0 = tl.load(meta_ptr + 1).to(tl.int32)
+        else:
+            n_real = T
+            q0 = start
         M: tl.constexpr = BLOCK_R * GROUP
         mi = tl.arange(0, M)
         r = tile * BLOCK_R + mi // GROUP
@@ -117,9 +125,9 @@ if triton is not None:
         q = tl.load(q_ptr + qo, mask=r_ok[:, None], other=0.0)
         if WIDEN:
             q = q.to(tl.float32)
-        q_lo = start + tile * BLOCK_R
-        q_pos = start + r
-        end = start + tl.minimum(tile * BLOCK_R + BLOCK_R, T)  # keys [0, end) for this tile
+        q_lo = q0 + tl.minimum(tile * BLOCK_R, n_real - 1)  # the tile's first query position
+        q_pos = q0 + tl.minimum(r, n_real - 1)
+        end = q0 + tl.minimum(tile * BLOCK_R + BLOCK_R, n_real)  # keys [0, end) for this tile
         n_full = q_lo // BLOCK_N  # blocks entirely below the tile's first query: no mask
         n_all = tl.cdiv(end, BLOCK_N)
         m = tl.full([M], float("-inf"), dtype=tl.float32)
@@ -181,8 +189,8 @@ if triton is not None:
 # Tile and split choice from shapes alone (plan 35): the fastest of the tune sweep in job j168
 # (tools/flash_prefill_probe.py --tune, one GCD, 8 query heads x 1 KV head, D=256, on a
 # 3,600-token context, and 2,300 after 5,800), per range of new tokens T. Knobs per row:
-# (rows per program, keys per block, waves_per_eu or None, key splits). The split is capped so
-# that every split holds SPLIT_MIN_BLOCKS key blocks (short contexts run unsplit).
+# (rows per program, keys per block, waves_per_eu or None, key splits). The choice depends on T
+# only (a captured pass knows its start only on the device); a split past the keys is empty.
 _TABLE = (
     # T below   rows  keys  wpe   splits    measured (us/layer)
     (96,        8,    64,   None, 13),    # T=61: 75.5
@@ -194,7 +202,7 @@ _TABLE = (
     (1300,      16,   128,  1,    4),     # T=1200: 569.3
     (None,      16,   64,   None, 2),     # T=1400: 612.8, 1650: 661.7, 2300 (after 5,800): 1875.4
 )
-SPLIT_MIN_BLOCKS = 4
+SPLIT_MIN_BLOCKS = 4  # split_for (the sweeps' explicit tiles)
 
 _CUS: dict = {}
 
@@ -208,16 +216,16 @@ def _cus(device: torch.device) -> int:
     return _CUS[idx]
 
 
-def choose(count: int, start: int, heads: int, group: int, cus: int = 104) -> dict:
-    """Launch knobs for a segment of ``count`` queries after ``start`` cached keys."""
+def choose(count: int, start: int | None, heads: int, group: int, cus: int = 104) -> dict:
+    """Launch knobs for a segment (or a captured bucket) of ``count`` query rows; from
+    ``count`` alone (``start`` is not used)."""
     for below, rows, keys, wpe, splits in _TABLE:
         if below is None or count < below:
             break
     cfg = {"block_r": max(rows, 16 // group), "block_n": keys, "num_warps": 4, "num_stages": 1}
     if wpe is not None:
         cfg["waves_per_eu"] = wpe
-    blocks = -(-(start + count) // keys)
-    cfg["split"] = max(1, min(splits, blocks // SPLIT_MIN_BLOCKS))
+    cfg["split"] = splits
     return cfg
 
 
@@ -234,10 +242,11 @@ def flash_prefill_attention(
     q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
     start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None, *,
     block_r: int | None = None, block_n: int = 64, split: int | None = None, kt: bool = True,
-    num_warps: int = 4, num_stages: int = 1, **launch,
+    num_warps: int = 4, num_stages: int = 1, meta: torch.Tensor | None = None, **launch,
 ) -> torch.Tensor:
-    """As ``prefill_kernels.prefill_attention``. Without ``block_r`` every knob comes from
-    ``choose`` (the engine's path); the knobs are for the plan 35 sweeps."""
+    """As ``prefill_kernels.prefill_attention`` (``meta``: its device-side [count, start]).
+    Without ``block_r`` every knob comes from ``choose`` (the engine's path); the knobs are
+    for the plan 35 sweeps."""
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads
@@ -247,7 +256,9 @@ def flash_prefill_attention(
         num_warps, num_stages = cfg["num_warps"], cfg["num_stages"]
         launch = {k: cfg[k] for k in ("waves_per_eu",) if k in cfg}
     elif split is None:
-        split = split_for(count, start, heads, block_r, block_n, _cus(q.device))
+        split = split_for(count, 0 if meta is not None else start, heads, block_r, block_n, _cus(q.device))
+    if meta is not None:
+        start = 0
     if INTERPRET:
         launch = {}  # AMD-only launch options
     if out is None:
@@ -264,8 +275,10 @@ def flash_prefill_attention(
         _flash_prefill_kernel[(triton.cdiv(count, block_r), heads, split)](
             q, k_pool, v_pool, table, gate, out, ws_acc, ws_ml, count, start, scale * LOG2E,
             k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), split,
+            meta if meta is not None else table,
             QH=q_heads, GROUP=group, BLOCK_R=block_r, D=dim, PAGE=page, BLOCK_N=block_n,
-            SPLIT=split > 1, KT=kt, WIDEN=_WIDEN, num_warps=num_warps, num_stages=num_stages,
+            SPLIT=split > 1, KT=kt, WIDEN=_WIDEN, HAS_META=meta is not None,
+            num_warps=num_warps, num_stages=num_stages,
             **launch,
         )
         if split > 1:
@@ -278,22 +291,23 @@ def flash_prefill_attention(
 
 def warm(k_pool: torch.Tensor, v_pool: torch.Tensor, q_heads: int) -> None:
     """Compile every kernel ``choose`` can launch on this pool's device (each tile of the table,
-    split and unsplit, and the combine), before serving: reads page 0 of the pool, writes
-    nothing to it."""
+    split, with and without a device-side ``meta``, and the combine), before serving: reads
+    page 0 of the pool, writes nothing to it."""
     heads, page, dim = k_pool.shape[1], k_pool.shape[2], k_pool.shape[3]
     dev = k_pool.device
     count, start = 16, 8 * page
     q = torch.zeros((count, q_heads, dim), dtype=k_pool.dtype, device=dev)
     gate = torch.zeros((count, q_heads * dim), dtype=k_pool.dtype, device=dev)
     table = torch.zeros(-(-(start + count) // page), dtype=torch.long, device=dev)
+    meta = torch.tensor([count - 3, start], dtype=torch.long, device=dev)
     seen = set()
     for _, rows, keys, wpe, _ in _TABLE:
         if (rows, keys, wpe) in seen:
             continue
         seen.add((rows, keys, wpe))
         launch = {} if wpe is None else {"waves_per_eu": wpe}
-        for split in (1, 2):
+        for m in (None, meta):
             flash_prefill_attention(
-                q, k_pool, v_pool, table, start, gate, 1.0,
-                block_r=max(rows, 16 // (q_heads // heads)), block_n=keys, split=split, **launch,
+                q, k_pool, v_pool, table, start, gate, 1.0, meta=m,
+                block_r=max(rows, 16 // (q_heads // heads)), block_n=keys, split=2, **launch,
             )

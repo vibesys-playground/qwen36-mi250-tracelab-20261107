@@ -146,6 +146,9 @@ def main() -> None:
             print(f"RESULT identical_greedy_prefix={free_identical} of {args.steps + 1}", flush=True)
             if hasattr(fast, "timeouts"):
                 print(f"RESULT tp_allreduce_timeouts={fast.timeouts()}", flush=True)
+            print(f"RESULT prefill_graphs={len(getattr(fast, 'pg', {}) or {})} "
+                  f"replays={getattr(fast, 'pg_replays', None)} error={getattr(fast, 'pg_error', None)}",
+                  flush=True)
 
         if mode == "ref" and args.mode == "repeat":
             saved = record

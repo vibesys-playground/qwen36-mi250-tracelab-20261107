@@ -54,28 +54,39 @@ if triton is not None:
 
     # ------------------------------------------------------------------------------ attention
 
-    @triton.jit(do_not_specialize=["T", "start"])
+    @triton.jit(do_not_specialize=["T", "start", "NR"])
     def _prefill_attn_kernel(
         q_ptr, k_ptr, v_ptr, table_ptr, gate_ptr, out_ptr, T, start, scale,
-        stride_page, stride_head, stride_tok,
+        stride_page, stride_head, stride_tok, meta_ptr, NR,
         QH: tl.constexpr, GROUP: tl.constexpr, BLOCK_R: tl.constexpr, D: tl.constexpr,
-        PAGE: tl.constexpr, WIDEN: tl.constexpr,
+        PAGE: tl.constexpr, WIDEN: tl.constexpr, HAS_META: tl.constexpr,
     ):
-        """Rows ``[tile * BLOCK_R, +BLOCK_R)`` x the GROUP query heads of one KV head."""
+        """Rows ``[tile * BLOCK_R, +BLOCK_R)`` x the GROUP query heads of one KV head.
+
+        ``NR`` rows are computed and stored. With ``HAS_META`` the real row count and the
+        start position are read from ``meta_ptr`` ([count, start], int64, on the device; see
+        ``prefill_attention``), and rows ``>= count`` (padding) attend as row ``count - 1``:
+        finite, and never read by a real row."""
         tile = tl.program_id(0)
         kvh = tl.program_id(1)
+        if HAS_META:
+            n_real = tl.load(meta_ptr).to(tl.int32)
+            q0 = tl.load(meta_ptr + 1).to(tl.int32)
+        else:
+            n_real = T
+            q0 = start
         M: tl.constexpr = BLOCK_R * GROUP
         mi = tl.arange(0, M)
         r = tile * BLOCK_R + mi // GROUP
         head = kvh * GROUP + mi % GROUP
-        r_ok = r < T
+        r_ok = r < NR
         d = tl.arange(0, D)
         qo = (r.to(tl.int64) * QH + head)[:, None] * D + d[None, :]
         q = tl.load(q_ptr + qo, mask=r_ok[:, None], other=0.0)
         if WIDEN:
             q = q.to(tl.float32)
-        q_pos = start + r
-        end = start + tl.minimum(tile * BLOCK_R + BLOCK_R, T)  # keys [0, end) for this tile
+        q_pos = q0 + tl.minimum(r, n_real - 1)
+        end = q0 + tl.minimum(tile * BLOCK_R + BLOCK_R, n_real)  # keys [0, end) for this tile
         m = tl.full([M], float("-inf"), dtype=tl.float32)
         l = tl.zeros([M], dtype=tl.float32)
         acc = tl.zeros([M, D], dtype=tl.float32)
@@ -236,15 +247,21 @@ if triton is not None:
         tl.store(out_ptr + t.to(tl.int64)[:, None] * C + c[None, :], y.to(tl.bfloat16), mask=ok)
 
     @triton.jit(do_not_specialize=["T"])
-    def _gdn_conv_state_kernel(qkv_ptr, state_ptr, T, C, K: tl.constexpr, BLOCK_C: tl.constexpr):
-        """The conv state after T inputs: the last K of (state ++ inputs)."""
+    def _gdn_conv_state_kernel(qkv_ptr, state_ptr, T, C, meta_ptr, K: tl.constexpr, BLOCK_C: tl.constexpr,
+                               HAS_META: tl.constexpr):
+        """The conv state after T inputs: the last K of (state ++ inputs). With ``HAS_META``,
+        T is the real row count read from ``meta_ptr`` (rows past it are padding)."""
+        if HAS_META:
+            n = tl.load(meta_ptr).to(tl.int32)
+        else:
+            n = T
         c = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
         i = tl.arange(0, K)
-        src = T - K + i  # input row of new column i; < 0: old column T + i
+        src = n - K + i  # input row of new column i; < 0: old column n + i
         c_ok = (c < C)[:, None]
         from_x = (src >= 0)[None, :]
         xv = tl.load(qkv_ptr + src.to(tl.int64)[None, :] * C + c[:, None], mask=c_ok & from_x, other=0.0)
-        sv = tl.load(state_ptr + c[:, None] * K + (T + i)[None, :], mask=c_ok & (~from_x), other=0.0)
+        sv = tl.load(state_ptr + c[:, None] * K + (n + i)[None, :], mask=c_ok & (~from_x), other=0.0)
         tl.store(state_ptr + c[:, None] * K + i[None, :], tl.where(from_x, xv, sv), mask=c_ok)
 
     @triton.jit(do_not_specialize=["NUMEL"])
@@ -324,24 +341,44 @@ def attention_supported(q: torch.Tensor, k_pool: torch.Tensor) -> bool:
 def prefill_attention(
     q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
     start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None,
+    meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gated causal attention of ``q`` [T, q_heads, dim] at positions ``start``... over the
     first ``start + T`` cached tokens, whose pages are ``table`` (the slot's page list, its
-    KV already written): [T, q_heads * dim] BF16, as ``prefill_attention_reference``."""
+    KV already written): [T, q_heads * dim] BF16, as ``prefill_attention_reference``.
+
+    Device-side count and start (plan 33, for a captured pass of a fixed padded size): with
+    ``meta``, an int64 tensor ``[count, start]`` on ``q``'s device, ``start`` is ignored and
+    ``q``'s T rows are a bucket whose first ``count`` rows are real, at positions
+    ``start .. start + count - 1``. Real rows give the same bits as a call over those rows
+    alone with the same kernel and launch knobs. Padding rows (``>= count``) are computed as if
+    at position ``start + count - 1`` (finite values, to be discarded); keys past
+    ``start + count`` are never read.
+
+    With ``ENGINE_PREFILL_FLASH`` (default on) this is the flash kernel of
+    ``engine.fast.flash_prefill`` (plan 35), whose tile and key split come from T alone (the
+    bucket size under ``meta``); its per-row bits depend on that choice (the summation order
+    over keys), so a captured pass and an eager one of the same rows agree bitwise only when
+    their T choose the same knobs, as the GEMMs at M = size and M = count."""
     if _FLASH:
-        return flash_prefill.flash_prefill_attention(q, k_pool, v_pool, table, start, gate, scale, out)
-    return prefill_attention_rows(q, k_pool, v_pool, table, start, gate, scale, out)
+        return flash_prefill.flash_prefill_attention(
+            q, k_pool, v_pool, table, start, gate, scale, out, meta=meta
+        )
+    return prefill_attention_rows(q, k_pool, v_pool, table, start, gate, scale, out, meta)
 
 
 def prefill_attention_rows(
     q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
     start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None,
+    meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``_prefill_attn_kernel`` (the path before plan 35, ``ENGINE_PREFILL_FLASH=0``)."""
+    """``_prefill_attn_kernel`` (the path before plan 35, ``ENGINE_PREFILL_FLASH=0``); its
+    per-row results do not depend on T."""
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads
     # Rows per program: enough programs for the GPU at a few rows, M = rows x group >= 16.
+    # (Per-row results do not depend on it: a tile's extra keys are masked to exact zeros.)
     rows = 2 if count < 256 else 4
     rows = max(rows, 16 // group)
     if out is None:
@@ -353,8 +390,9 @@ def prefill_attention_rows(
         _prefill_attn_kernel[(triton.cdiv(count, rows), heads)](
             q, k_pool, v_pool, table, gate, out, count, start, scale,
             k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+            meta if meta is not None else table, count,
             QH=q_heads, GROUP=group, BLOCK_R=rows, D=dim, PAGE=page, WIDEN=_WIDEN,
-            num_warps=4,
+            HAS_META=meta is not None, num_warps=4,
         )
     return out
 
@@ -509,9 +547,14 @@ def gdn_conv_reference(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Ten
     return F.silu(mixed.to(qkv.dtype)).transpose(0, 1), window[:, -state.shape[-1]:].clone()
 
 
-def gdn_conv_(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def gdn_conv_(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor,
+              meta: torch.Tensor | None = None) -> torch.Tensor:
     """silu(causal conv) of ``qkv`` [T, C] after ``state`` [C, K] (a slot's conv state, updated
-    in place to its last K inputs); weight [C, 1, K]. [T, C] BF16, two launches."""
+    in place to its last K inputs); weight [C, 1, K]. [T, C] BF16, two launches.
+
+    With ``meta`` (int64 ``[count, ...]`` on the device, as ``prefill_attention``) only the
+    first ``count`` rows are real: the state becomes the last K of (state ++ real rows), and
+    the real rows' outputs are the same bits (a row reads only earlier rows)."""
     count, channels = qkv.shape
     kernel = state.shape[-1]
     assert state.stride(-1) == 1 and state.stride(-2) == kernel and kernel & (kernel - 1) == 0
@@ -523,7 +566,8 @@ def gdn_conv_(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor) -> t
             BLOCK_C=128, WIDEN=_WIDEN,
         )
         _gdn_conv_state_kernel[(triton.cdiv(channels, 256),)](
-            qkv, state, count, channels, K=kernel, BLOCK_C=256,
+            qkv, state, count, channels, meta if meta is not None else state, K=kernel, BLOCK_C=256,
+            HAS_META=meta is not None,
         )
     return out
 

@@ -161,6 +161,8 @@ def main() -> int:
     ap.add_argument("--capacity-log2", type=int, default=22)
     ap.add_argument("--ll-rows", default="64,561,1650,2600")
     ap.add_argument("--ll-calls", type=int, default=20)
+    ap.add_argument("--only", choices=("all", "padding"), default="all",
+                    help="padding: skip the graph cases and the all-reduce bench")
     args = ap.parse_args()
     news = [int(n) for n in args.news.split(",")]
     start = args.start
@@ -296,7 +298,7 @@ def main() -> int:
         return run
 
     summary = {}
-    for n in news:
+    for n in (news if args.only == "all" else []):
         ids = pool[start + 7 * n: start + 8 * n]  # new tokens (not a repeat of the context)
         ids = pool[start: start + n] if len(ids) < n else ids
         rec: dict = {"new": n, "start": start}
@@ -425,6 +427,8 @@ def main() -> int:
 
     # ------------------------------------------------------------ LL all-reduce alone
     ll = {}
+    if args.only == "padding":
+        return 0
     try:
         ll = ll_bench(torch, fast, [int(x) for x in args.ll_rows.split(",")], args.ll_calls)
     except Exception as exc:  # noqa: BLE001
@@ -482,20 +486,21 @@ def padding_tests(torch, F, fm, pk, m, slot, start, news, cfg) -> dict:
     gdn_i = next(i for i, t in enumerate(m.layer_types) if t == "linear_attention")
     attn_i = next(i for i, t in enumerate(m.layer_types) if t != "linear_attention")
     weights = {}
-    for name, p in m.layers[gdn_i].linear_attn.named_parameters():
-        if p.dim() == 2:
-            weights[f"gdn.{name}"] = p
-    for name, p in m.layers[attn_i].self_attn.named_parameters():
-        if p.dim() == 2:
-            weights[f"attn.{name}"] = p
+    # The rank's layers are SimpleNamespace shards (``tp.shard_model``): each child's weight.
+    for prefix, mod in (("gdn", m.layers[gdn_i].linear_attn), ("attn", m.layers[attn_i].self_attn)):
+        for name, child in vars(mod).items():
+            w = getattr(child, "weight", None)
+            if isinstance(w, torch.Tensor) and w.dim() == 2:
+                weights[f"{prefix}.{name}"] = w
     mlp = m.layers[0].mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
         weights[f"shared.{name}"] = getattr(mlp.shared_expert, name).weight
     weights["router"] = mlp.gate.weight
     weights["shared_gate"] = mlp.shared_expert_gate.weight
     weights["lm_head_shard"] = m.lm_head
-    if m.mtp is not None:
-        weights["mtp.fc"] = m.mtp.fc.weight
+    fc = getattr(getattr(m.mtp, "fc", None), "weight", None) if m.mtp is not None else None
+    if isinstance(fc, torch.Tensor):
+        weights["mtp.fc"] = fc
     with torch.inference_mode():
         for n in news:
             b = BUCKET.get(n, ((n + 63) // 64) * 64)

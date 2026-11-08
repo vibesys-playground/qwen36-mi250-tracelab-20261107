@@ -585,6 +585,15 @@ class Generator:
             except FastPathUnavailable as exc:
                 print(f"engine: fast path unavailable ({exc}); using Transformers", flush=True)
             else:
+                if head is not None:
+                    # ENGINE_MTP_VOCAB: the head drafts over a static subset of the vocabulary
+                    # (``engine.fast.draft_vocab``); verify stays the full-vocabulary argmax.
+                    from engine.fast import draft_vocab
+
+                    ids = draft_vocab.build(tokenizer, draft_vocab.size_from_env(), fast.vocab)
+                    fast.set_draft_vocab(ids)
+                    if ids is not None:
+                        print(f"engine: MTP draft vocabulary {len(ids)} of {fast.vocab}", flush=True)
                 # With the MTP head every step is a verify step: capture those, not plain decode.
                 fast.capture_all(decode=head is None)
                 print(

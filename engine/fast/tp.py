@@ -290,15 +290,19 @@ class Group:
         out = (x.float() + theirs.float()).to(x.dtype)
         return out if residual is None else residual + out
 
-    def argmax(self, rank: int, logits: torch.Tensor, offset: int) -> torch.Tensor:
+    def argmax(
+        self, rank: int, logits: torch.Tensor, offset: int, ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """The greedy pick per row over both ranks' vocabulary shards (``logits`` is this
-        rank's, its first row ``offset``): the larger max, ties to rank 0 (the lower index)."""
+        rank's, its first row ``offset``): the larger max, ties to rank 0 (the lower index).
+        With ``ids``, column ``j`` of ``logits`` is vocabulary id ``ids[j]`` (a draft
+        vocabulary, sorted, rank 0's ids below rank 1's), and ``offset`` is unused."""
         logits = logits.float()
         index = logits.argmax(-1)
         best = logits.gather(-1, index[:, None])[:, 0]
         both = torch.zeros((logits.shape[0], 4), dtype=torch.float32, device=logits.device)
         both[:, 2 * rank] = best
-        both[:, 2 * rank + 1] = (index + offset).float()
+        both[:, 2 * rank + 1] = (index + offset if ids is None else ids[index]).float()
         both = self.allreduce(rank, both)
         return torch.where(both[:, 0] >= both[:, 2], both[:, 1], both[:, 3]).long()
 
@@ -549,6 +553,31 @@ class TPModel:
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tp-rank1")
+
+    def set_draft_vocab(self, ids: Sequence[int] | None) -> None:
+        """``FastModel.set_draft_vocab`` over both ranks. The sorted ids are split in two
+        halves, rank 0 the lower, whatever shard owns them, so both ranks read the same number
+        of rows (the low ids, which a frequency-ranked set is full of, all sit in rank 0's
+        lm_head shard). Rows another rank owns are copied once, at load."""
+        if ids is None:
+            for m in self.ranks:
+                m.set_draft_vocab(None)
+            return
+        ids = sorted(ids)
+        half = (len(ids) + 1) // 2
+        for r, (m, part) in enumerate(zip(self.ranks, (ids[:half], ids[half:]), strict=True)):
+            dev = m.lm_head.device
+            rows = []
+            for owner in self.ranks:
+                lo, hi = owner.vocab_offset, owner.vocab_offset + owner.vocab
+                local = [i - lo for i in part if lo <= i < hi]
+                if local:
+                    index = torch.tensor(local, dtype=torch.long, device=owner.lm_head.device)
+                    rows.append(owner.lm_head.index_select(0, index).to(dev))
+            m.mtp_head_w = torch.cat(rows).contiguous()
+            m.mtp_ids = torch.tensor(part, dtype=torch.long, device=dev)
+            if m.mtp_head_w.shape[0] != len(part):
+                raise RuntimeError(f"rank {r}: {m.mtp_head_w.shape[0]} draft rows for {len(part)} ids")
 
     # ------------------------------------------------------------ shared attributes
 

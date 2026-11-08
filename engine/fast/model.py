@@ -340,6 +340,10 @@ class FastModel:
         # device, whose KV lives in the same pages as the model's (one more pool).
         self.mtp = mtp
         self.mtp_index = len(self.layers)
+        # The MTP head's draft vocabulary (``set_draft_vocab``): its lm_head rows and their
+        # global ids, sorted; None drafts over this rank's whole lm_head shard.
+        self.mtp_head_w: torch.Tensor | None = None
+        self.mtp_ids: torch.Tensor | None = None
         if mtp is not None:
             mdev = mtp.fc.weight.device
             if mdev != self.lm_head.device:
@@ -1268,7 +1272,29 @@ class FastModel:
         return F.linear(torch.cat((e, h), dim=-1), m.fc.weight)
 
     def _mtp_logits(self, z: torch.Tensor) -> torch.Tensor:
-        return F.linear(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
+        weight = self.lm_head if self.mtp_head_w is None else self.mtp_head_w
+        return F.linear(_rms(z, self.mtp.norm.weight, self.eps), weight)
+
+    def _mtp_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """The head's draft per row: the argmax over its draft vocabulary (global ids, ties to
+        the lowest id), or ``_argmax`` over the whole vocabulary."""
+        if self.mtp_ids is None:
+            return self._argmax(logits)
+        if self.tp is None:
+            return self.mtp_ids[logits.argmax(-1)]
+        return self.tp.argmax(self.rank, logits, 0, ids=self.mtp_ids)
+
+    def set_draft_vocab(self, ids: Sequence[int] | None) -> None:
+        """Draft over the sorted global ``ids`` only (None: the whole vocabulary). Drafts only:
+        verify's picks stay the full-vocabulary argmax. Call before capturing verify graphs
+        (or drop them first): the graphs hold these tensors."""
+        if ids is None or self.mtp is None:
+            self.mtp_head_w = self.mtp_ids = None
+            return
+        dev = self.lm_head.device
+        index = torch.tensor(list(ids), dtype=torch.long, device=dev)
+        self.mtp_head_w = self.lm_head.index_select(0, index).contiguous()
+        self.mtp_ids = index
 
     def _mtp_prefill(
         self,
@@ -1302,7 +1328,7 @@ class FastModel:
             lambda h: self._attn_prefill_packed(self.mtp_index, h, on),
             decode=False,
         )
-        self.last_drafts = self._argmax(self._mtp_logits(z.index_select(0, on.last)))
+        self.last_drafts = self._mtp_argmax(self._mtp_logits(z.index_select(0, on.last)))
 
     def _mtp_decode(self, hidden: torch.Tensor, tokens: torch.Tensor, meta: _Device) -> torch.Tensor:
         """The head on one pair per row at the rows' positions; its greedy guess per row."""
@@ -1310,13 +1336,13 @@ class FastModel:
         slots, positions = meta.slots[:n], meta.positions[:n]
         if self._fused_rows(n, verify=True):  # the head's layer through the fused kernels
             z = self._fused_layer(self.mtp_index, self._mtp_in(hidden, tokens), slots, positions, meta)
-            return self._argmax(self._mtp_logits(z))
+            return self._mtp_argmax(self._mtp_logits(z))
         z = self._mtp_layer(
             self._mtp_in(hidden, tokens),
             lambda h: self._attn_decode(self.mtp_index, h, slots, positions, meta),
             decode=True,
         )
-        return self._argmax(self._mtp_logits(z))
+        return self._mtp_argmax(self._mtp_logits(z))
 
     def _verify_head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         """The verify step's last op: logits from the normed hidden ``x``, each row's greedy

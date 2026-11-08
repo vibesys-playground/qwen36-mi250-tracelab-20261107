@@ -40,7 +40,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import fla_pin, kernels, moe_prefill, prefill_kernels
+from engine.fast import fla_pin, kernels, mfma, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -353,8 +353,12 @@ class FastModel:
                 raise ValueError(f"the MTP head must sit on the lm_head's device {self.lm_head.device}")
             # The head embeds its input token on its own device (a copy of the same table).
             self.mtp_embed = self.embed if self.embed.device == mdev else self.embed.to(mdev)
+        # Plan 31's chained verify (``engine.fast.mfma``; it needs the Triton kernels).
+        self.chain = mtp is not None and mfma.CHAIN and self.use_triton
         # A verify step runs two rows per slot; any batch has at most one (two) rows per slot.
         self._rows = max(max(self.buckets) * (2 if mtp is not None else 1), slots)
+        if self.chain:  # a chained verify step: up to RING rows per slot
+            self._rows = max(self._rows, max(self.buckets) * mfma.RING)
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
 
         # Per-layer state, allocated once on the layer's device.
@@ -366,6 +370,11 @@ class FastModel:
         self.gdn_rows = rows
         self.bank = [0] * rows
         banks = 2 if mtp is not None else 1
+        if self.chain:
+            # Plan 31's chained verify: a ring of ``mfma.RING`` states per slot, entry j the
+            # state after the step's j-th row; accepting a drafts advances ``bank`` by a.
+            banks = mfma.RING
+        self.ring = banks
         self.devices: dict[torch.device, _Device] = {}
         self.inv_freq: dict[torch.device, torch.Tensor] = {}
         self.gdn_state: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -481,18 +490,41 @@ class FastModel:
             return self.mtp.layers[0].self_attn
         return self.layers[i].self_attn
 
-    def _segments(self, verify: bool = False) -> list[_Segment]:
+    def _segments(self, verify: bool = False, chain: int = 0) -> list[_Segment]:
+        mode = chain if chain else verify
         ops: list[tuple[torch.device, Callable]] = [(self.embed.device, self._embed_op)]
         for i in range(len(self.layers)):
-            ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i, verify)))
-        ops.append((self.final_norm.device, self._norm_op_for(verify)))
-        ops.append((self.lm_head.device, self._verify_head_op if verify else self._head_op))
+            ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i, mode)))
+        ops.append((self.final_norm.device, self._norm_op_for(mode)))
+        if chain:
+            head = self._chain_head_op(chain)
+        else:
+            head = self._verify_head_op if verify else self._head_op
+        ops.append((self.lm_head.device, head))
         segments: list[_Segment] = []
         for dev, op in ops:
             if not segments or segments[-1].device != dev:
                 segments.append(_Segment(device=dev, ops=[]))
             segments[-1].ops.append(op)
         return segments
+
+    def chain_segments(self, groups: int) -> list[_Segment]:
+        """The segments of a chained verify step with ``groups`` rows per slot (plan 31)."""
+        cache = self.__dict__.setdefault("_csegments", {})
+        if groups not in cache:
+            cache[groups] = self._segments(chain=groups)
+        return cache[groups]
+
+    def _segs(self, verify: bool = False, chain: int = 0) -> list[_Segment]:
+        if chain:
+            return self.chain_segments(chain)
+        return self.vsegments if verify else self.segments
+
+    def _all_segments(self) -> list[_Segment]:
+        out = self.segments + self.vsegments
+        for segs in self.__dict__.get("_csegments", {}).values():
+            out = out + segs
+        return out
 
     # ---------------------------------------------------------------- slots and pages
 
@@ -524,10 +556,20 @@ class FastModel:
 
     def flip(self, slot: int) -> None:
         """Make ``slot``'s other bank current: after ``verify`` accepted its draft, or to undo
-        that (the bank left behind still holds the state one token earlier)."""
+        that (the bank left behind still holds the state one token earlier). With the chained
+        verify's ring (``ring`` > 2) this advances by one; undo with ``advance(slot, -1)``."""
         if self.mtp is None:
             raise RuntimeError("only a model with the MTP head has two state banks")
-        self.bank[slot] ^= 1
+        self.advance(slot, 1)
+
+    def advance(self, slot: int, n: int) -> None:
+        """Make ring entry ``n`` (relative to the current one) ``slot``'s current state: after
+        a chained verify accepted ``n`` drafts, or (negative) to undo that."""
+        self.bank[slot] = (self.bank[slot] + n) % self.ring
+
+    def _ring_row(self, slot: int, j: int) -> int:
+        """The Gated DeltaNet state row of ``slot``'s ring entry ``j`` (0: the current)."""
+        return slot + ((self.bank[slot] + j) % self.ring) * self.gdn_rows
 
     def reset(self, slot: int) -> None:
         """Release ``slot``'s pages and zero its recurrent and convolution state."""
@@ -831,7 +873,8 @@ class FastModel:
             else:
                 _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
             if fused._is_gdn(i):
-                h = fused._gdn_verify(i, h, states) if verify else fused._gdn(i, h, states)
+                h = (fused._gdn_verify(i, h, states, groups=mfma.groups_of(verify)) if verify
+                     else fused._gdn(i, h, states))
             else:
                 h = fused._attn(i, h, slots, positions, meta)
             if arrms:
@@ -1599,6 +1642,105 @@ class FastModel:
         self._verify_out = torch.stack((picks, self._mtp_decode(x, picks, meta)))
         return logits
 
+    def _chain_head_op(self, groups: int) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
+        """A chained verify step's last op (plan 31). Rows ``j * B + b`` hold slot b's j-th
+        token (its last token, then ``groups - 1`` drafts). From the normed hidden ``x``: the
+        logits and greedy pick of every row; the MTP head on (hidden, pick) of every row (its
+        KV at each row's position, as ``_verify_head_op``); then, per slot, the accepted
+        count ``a`` (leading drafts equal to the pick before them), and from the head's output
+        at row ``a`` the chain of ``groups - 1`` drafts: link 1 is that row's head pick, link j
+        the head on (its own previous normed output, link j - 1) at position ``p + a + j - 1``.
+        Leaves ``[picks (R), a (B), drafts (groups - 1, B)]`` in ``_chain_out``; returns the
+        logits."""
+        k = groups - 1
+
+        def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
+            rows = x.shape[0]
+            b = rows // groups
+            logits = self._logits(x, verify=True)
+            picks = self._argmax(logits)
+            slots, positions = meta.slots[:rows], meta.positions[:rows]
+            z = self._fused_layer(self.mtp_index, self._mtp_in(x, picks, True), slots, positions, meta)
+            y = _rms(z, self.mtp.norm.weight, self.eps)
+            d = self._argmax(self.fused.gemv(y, self.lm_head))
+            tokens = meta.tokens[:rows].view(groups, b)
+            match = (tokens[1:] == picks.view(groups, b)[:-1]).long()
+            a = torch.cumprod(match, dim=0).sum(dim=0)
+            sel = a * b + torch.arange(b, device=a.device)
+            h = y.index_select(0, sel)
+            d = d.index_select(0, sel)
+            base = positions[:b] + a
+            drafts = [d]
+            for j in range(1, k):
+                z = self._fused_layer(self.mtp_index, self._mtp_in(h, d, True), slots[:b], base + j, meta)
+                h = _rms(z, self.mtp.norm.weight, self.eps)
+                d = self._argmax(self.fused.gemv(h, self.lm_head))
+                drafts.append(d)
+            self._chain_out = torch.cat((picks, a, torch.stack(drafts).flatten()))
+            return logits
+
+        return op
+
+    def _chain_host(self, tokens, drafts, slots, positions, groups: int, size: int) -> torch.Tensor:
+        """The packed inputs of a chained verify step (rows ``j * size + b``)."""
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            self._ensure_pages(slot, position + 2 * groups)
+        rows = groups * size
+        host = torch.zeros((4, self._rows), dtype=torch.long)
+        host[1].fill_(self.dummy)
+        for j in range(groups):
+            host[3, j * size : (j + 1) * size] = self._ring_row(self.dummy, j)
+            toks = list(tokens) if j == 0 else [ds[j - 1] for ds in drafts]
+            host[0, j * size : j * size + batch] = torch.tensor(toks, dtype=torch.long)
+            host[1, j * size : j * size + batch] = torch.tensor(list(slots), dtype=torch.long)
+            host[2, j * size : j * size + batch] = torch.tensor([p + j for p in positions], dtype=torch.long)
+            host[3, j * size : j * size + batch] = torch.tensor([self._ring_row(s, j) for s in slots],
+                                                               dtype=torch.long)
+        host[3, rows:] = self.dummy
+        return host
+
+    @staticmethod
+    def _chain_parse(out: torch.Tensor, batch: int, size: int, groups: int):
+        vals = out.cpu().tolist()
+        rows = groups * size
+        picks = [[vals[j * size + b] for j in range(groups)] for b in range(batch)]
+        acc = vals[rows : rows + batch]
+        base = rows + size
+        drafts = [[vals[base + j * size + b] for j in range(groups - 1)] for b in range(batch)]
+        return picks, acc, drafts
+
+    @torch.inference_mode()
+    def verify_chain(
+        self,
+        tokens: Sequence[int],
+        drafts: Sequence[Sequence[int]],
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> tuple[torch.Tensor, list[list[int]], list[int], list[list[int]]]:
+        """One chained self-speculative step (plan 31): each slot's last token at its position
+        and its ``k = len(drafts[b])`` drafts after it (the same k for every slot), in one
+        forward of ``k + 1`` rows per slot, then the MTP head's next chain.
+
+        Returns (fp32 logits after each last token ``[batch, vocab]``, per slot the greedy pick
+        after each of its ``k + 1`` rows, per slot the accepted count ``a`` (its first ``a``
+        drafts equal the picks before them), per slot the head's ``k`` next drafts for the
+        position after pick ``a``). The slot's ring entry j holds the state after row j:
+        ``advance(slot, n)`` makes the state after row n current (n <= a). Attention KV is
+        written at every row's position; entries past the slot's new length are overwritten by
+        later steps."""
+        if not self.chain:
+            raise RuntimeError("the chained verify needs the MTP head, Triton and ENGINE_SPEC_CHAIN=1")
+        batch = len(tokens)
+        groups = len(drafts[0]) + 1
+        size = self.bucket(batch) if self.use_graphs else batch
+        host = self._chain_host(tokens, drafts, slots, positions, groups, size)
+        for meta in self.devices.values():
+            meta.packed.copy_(host)
+        logits, out = self._run(self.chain_segments(groups), size, groups * size, chain=groups)
+        picks, acc, nxt = self._chain_parse(out, batch, size, groups)
+        return logits[:batch], picks, acc, nxt
+
     @torch.inference_mode()
     def verify(
         self,
@@ -1630,7 +1772,7 @@ class FastModel:
         host[3].fill_(self.dummy)
         host[3, size:rows] = self.dummy + self.gdn_rows
         cur = [self._g(s) for s in slots]
-        other = [s + (1 - self.bank[s]) * self.gdn_rows for s in slots]
+        other = [self._ring_row(s, 1) for s in slots]
         for half, toks, pos, states in (
             (0, tokens, positions, cur),
             (size, drafts, [p + 1 for p in positions], other),
@@ -1653,13 +1795,17 @@ class FastModel:
         )
 
     def _run(
-        self, segments: list[_Segment], size: int, rows: int, verify: bool = False
+        self, segments: list[_Segment], size: int, rows: int, verify: bool = False, chain: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Replay ``segments``' graphs for bucket ``size`` (capturing them first), or run them
         eagerly over ``rows`` rows; the last segment's output (and a verify's picks)."""
         if self.use_graphs and self.graph_error is None:
             if size not in segments[0].graphs:
-                self.capture(size, verify)
+                # Capturing fills the step inputs with the dummy slot: keep the caller's.
+                saved = [(meta, meta.packed.clone()) for meta in self.devices.values()]
+                self.capture(size, verify, chain)
+                for meta, packed in saved:
+                    meta.packed.copy_(packed)
             if self.graph_error is None:
                 x = None
                 for seg in segments:
@@ -1668,10 +1814,14 @@ class FastModel:
                             seg.inputs[size].copy_(x)
                         seg.graphs[size].replay()
                         x = seg.outputs[size]
+                if chain:
+                    return x, self._chain_static[(size, chain)]
                 return x, (self._verify_static[size] if verify else None)
         x = self.devices[self.embed.device].tokens[:rows]
         for seg in segments:
             x = seg.run(x.to(seg.device), self.devices[seg.device])
+        if chain:
+            return x, self._chain_out
         return x, (self._verify_out if verify else None)
 
     # ---------------------------------------------------------------- decode
@@ -1706,7 +1856,7 @@ class FastModel:
         x, _ = self._run(self.segments, size, size)
         return x[:batch]
 
-    def capture(self, size: int, verify: bool = False) -> None:
+    def capture(self, size: int, verify: bool = False, chain: int = 0) -> None:
         """Capture every segment's graph for batch ``size``; on failure record why and run eagerly.
 
         Capture modes are tried in turn (``ENGINE_CAPTURE_MODES``): "global"
@@ -1719,7 +1869,7 @@ class FastModel:
             modes = os.environ.get("ENGINE_CAPTURE_MODES", "global,thread_local,relaxed").split(",")
         errors = []
         for mode in modes:
-            error = self._capture(size, mode, verify)
+            error = self._capture(size, mode, verify, chain)
             if error is None:
                 self._capture_modes = [mode]
                 self.capture_mode = mode
@@ -1728,17 +1878,13 @@ class FastModel:
             errors.append(f"{mode}: {error}")
         self.graph_error = " | ".join(errors)
 
-    def _capture(self, size: int, mode: str, verify: bool = False) -> str | None:
-        segments = self.vsegments if verify else self.segments
-        rows = 2 * size if verify else size
+    def _capture(self, size: int, mode: str, verify: bool = False, chain: int = 0) -> str | None:
+        segments = self._segs(verify, chain)
+        rows = chain * size if chain else (2 * size if verify else size)
         try:
             meta0 = self.devices[self.embed.device]
             for meta in self.devices.values():
-                meta.slots[:rows].fill_(self.dummy)
-                meta.positions[:rows].zero_()
-                meta.gdn[:rows].fill_(self.dummy)
-                if verify:
-                    meta.gdn[size:rows].fill_(self.dummy + self.gdn_rows)
+                self._fill_dummy(meta, size, rows, verify, chain)
             x = meta0.tokens[:rows]
             for seg in segments:
                 with torch.cuda.device(seg.device):
@@ -1768,12 +1914,14 @@ class FastModel:
                         out = seg.run(static_in, meta)
                     seg.inputs[size], seg.outputs[size], seg.graphs[size] = static_in, out, graph
                     x = out
-            if verify:
+            if chain:
+                self.__dict__.setdefault("_chain_static", {})[(size, chain)] = self._chain_out
+            elif verify:
                 self.__dict__.setdefault("_verify_static", {})[size] = self._verify_out
             for dev in self.devices:
                 torch.cuda.synchronize(dev)
         except Exception as exc:  # noqa: BLE001 - any capture failure falls back to eager
-            for seg in self.segments + self.vsegments:
+            for seg in self._all_segments():
                 seg.graphs.clear()
                 seg.inputs.clear()
                 seg.outputs.clear()
@@ -1791,6 +1939,17 @@ class FastModel:
                 pass
             return f"{type(exc).__name__}: {first} at {where[-1] if where else '?'}"
         return None
+
+    def _fill_dummy(self, meta: _Device, size: int, rows: int, verify, chain: int) -> None:
+        """Step inputs for warm-up and capture: every row the dummy slot (its ring rows)."""
+        meta.slots[:rows].fill_(self.dummy)
+        meta.positions[:rows].zero_()
+        meta.gdn[:rows].fill_(self.dummy)
+        if chain:
+            for j in range(chain):
+                meta.gdn[j * size : (j + 1) * size].fill_(self._ring_row(self.dummy, j))
+        elif verify:
+            meta.gdn[size:rows].fill_(self._ring_row(self.dummy, 1))
 
     def _pool(self, dev: torch.device):
         pools = self.__dict__.setdefault("_pools", {})

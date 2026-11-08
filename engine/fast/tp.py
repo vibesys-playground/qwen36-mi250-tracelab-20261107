@@ -892,6 +892,7 @@ class TPModel:
     # ------------------------------------------------------------ decode and verify
 
     def _load_inputs(self, host: torch.Tensor) -> None:
+        self._host = host  # loaded again after a capture inside the step (``_run``)
         for model in self.ranks:
             for meta in model.devices.values():
                 meta.packed.copy_(host)
@@ -903,6 +904,9 @@ class TPModel:
             segs = [m.vsegments if verify else m.segments for m in self.ranks]
             if size not in segs[0][0].graphs:
                 self.capture(size, verify)
+                # The capture's warm-up ran on the dummy slot through the step's input
+                # buffers: load this step's inputs again (graph or eager fallback alike).
+                self._load_inputs(self._host)
             if self.graph_error is None:
                 outs = []
                 for model, seg in zip(self.ranks, segs, strict=True):

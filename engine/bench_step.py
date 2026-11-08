@@ -203,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         total += 1
         agree += int(int(logits.argmax()) == reference[slot][0][0])
     rows = list(range(len(prompts)))
+    step_diff = []
     for step in range(args.steps - 1):
         tokens = [reference[r][0][step] for r in rows]
         out = fast.decode(tokens, rows, [len(prompts[r]) + step for r in rows]).float().cpu()
@@ -212,7 +213,37 @@ def main(argv: list[str] | None = None) -> int:
             agree += int(int(out[r].argmax()) == reference[r][0][step + 1])
             nan |= bool(torch.isnan(out[r]).any())
             max_diff = max(max_diff, float((out[r] - ref).abs().max()))
+        step_diff.append(max(float((out[r] - reference[r][1][step + 1]).abs().max()) for r in rows))
     agree_pct = 100.0 * agree / total
+    print(
+        "RESULT decode_logit_diff_by_step first4="
+        f"{[round(d, 3) for d in step_diff[:4]]} last4={[round(d, 3) for d in step_diff[-4:]]}"
+    )
+    # The decode attention kernel alone, on the slots the parity run filled (1k-4k tokens).
+    try:
+        from engine.fast import kernels
+
+        attn = next(i for i, t in enumerate(fast.layer_types) if t == "full_attention")
+        k_pool, v_pool = fast.kv[attn]
+        meta = fast.devices[k_pool.device]
+        m = fast.layers[attn].self_attn
+        q = torch.randn(len(rows), m.config.num_attention_heads, m.head_dim, device=k_pool.device)
+        q = q.to(torch.bfloat16)
+        slots_t = torch.tensor(rows, device=k_pool.device)
+        lens_t = torch.tensor(
+            [len(prompts[r]) + args.steps - 1 for r in rows], dtype=torch.int32, device=k_pool.device
+        )
+        with torch.inference_mode():
+            a = kernels.paged_decode_attention(
+                q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=True
+            )
+            b = kernels.paged_decode_attention(
+                q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=False
+            )
+        err = float((a.float() - b.float()).abs().max() / b.float().abs().max())
+        print(f"RESULT attn_kernel_vs_sdpa rel_err={err:.4f} lengths={lens_t.tolist()}")
+    except Exception as exc:  # noqa: BLE001 - informational only
+        print(f"RESULT attn_kernel_vs_sdpa error={type(exc).__name__}: {exc}")
     print(f"RESULT parity_top1_pct={agree_pct:.2f} ({agree}/{total} tokens) nan={nan} "
           f"max_abs_logit_diff_decode={max_diff:.3f} max_abs_logit_diff_prefill={prefill_diff:.3f}")
 

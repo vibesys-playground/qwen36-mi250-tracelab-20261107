@@ -318,7 +318,11 @@ class Replica:
 def start_replicas(
     argv: Sequence[str], layout: list[tuple[int, ...]], hip: bool
 ) -> list[Replica]:
-    """Launch one ``engine.server`` process per device group, all loading at once."""
+    """Launch one ``engine.server`` process per device group, all loading at once, each on its
+    own slice of host cores (``engine.cpu_place``) when the topology allows."""
+    from engine import cpu_place
+
+    placed = cpu_place.replica_slices(layout) if layout and any(layout) else None
     replicas = []
     for index, devices in enumerate(layout):
         port = _free_port()
@@ -338,11 +342,29 @@ def start_replicas(
         ]
         env = device_env(dict(os.environ), devices, hip)
         env["ENGINE_REPLICA_INDEX"] = str(index)
+        preexec = _die_with_parent
+        if placed is not None:
+            piece = placed[0][index]
+            env = cpu_place.child_env(env, piece)
+            preexec = _chain(cpu_place.preexec(piece), _die_with_parent)
+        else:
+            env.pop("ENGINE_CPUS", None)
+            env.pop("ENGINE_RANK_CPUS", None)
         where = ",".join(map(str, devices)) or "cpu"
         print(f"router: starting replica {index} on devices {where}, port {port}", flush=True)
-        process = subprocess.Popen(command, env=env, preexec_fn=_die_with_parent)  # noqa: PLW1509
+        process = subprocess.Popen(command, env=env, preexec_fn=preexec)  # noqa: PLW1509
         replicas.append(Replica(index, devices, port, process))
+    if placed is not None:
+        cpu_place.pin_router(placed[1])
     return replicas
+
+
+def _chain(*fns):
+    def run() -> None:
+        for fn in fns:
+            fn()
+
+    return run
 
 
 def stop_replicas(replicas: list[Replica]) -> None:

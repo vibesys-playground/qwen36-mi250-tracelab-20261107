@@ -55,6 +55,7 @@ from typing import Any
 import torch
 from torch.nn import functional as F
 
+from engine import cpu_place
 from engine.fast import kernels
 from engine.fast.model import PAGE, FastModel, Snapshot, _PackPlan, _rms
 
@@ -711,7 +712,9 @@ class TPModel:
         self.last_drafts: torch.Tensor | None = None
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
-        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tp-rank1")
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tp-rank1", initializer=cpu_place.pin_rank, initargs=(1,)
+        )
 
     # ------------------------------------------------------------ shared attributes
 

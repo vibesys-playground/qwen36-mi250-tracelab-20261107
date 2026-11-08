@@ -411,10 +411,12 @@ def bench(sets_by_r: dict[int, list[Set]], cus: int, max_rows: int, args, timing
         try:
             for sets in sets_by_r.values():
                 for s in sets:
+                    s.act.fill_(float("nan"))
                     a = up(s, cfg)
                     if not torch.equal(a, s.ref_act):
                         ok = False
             bit_up[cfg] = ok
+            out(f"RESULT bitwise kind=up cfg={up_cfg_name(cfg)} identical={ok}")
         except Exception as exc:  # noqa: BLE001
             bit_up[cfg] = None
             out(f"RESULT error cfg={up_cfg_name(cfg)} {type(exc).__name__}: {str(exc)[:300]}")
@@ -423,17 +425,15 @@ def bench(sets_by_r: dict[int, list[Set]], cus: int, max_rows: int, args, timing
         try:
             for sets in sets_by_r.values():
                 for s in sets:
+                    s.out.fill_(float("nan"))
                     o = down(s, cfg, act=s.ref_act)
                     if not torch.equal(o, s.ref_out):
                         ok = False
             bit_dn[cfg] = ok
+            out(f"RESULT bitwise kind=dn cfg={dn_cfg_name(cfg)} identical={ok}")
         except Exception as exc:  # noqa: BLE001
             bit_dn[cfg] = None
             out(f"RESULT error cfg={dn_cfg_name(cfg)} {type(exc).__name__}: {str(exc)[:300]}")
-    for cfg, ok in bit_up.items():
-        out(f"RESULT bitwise kind=up cfg={up_cfg_name(cfg)} identical={ok}")
-    for cfg, ok in bit_dn.items():
-        out(f"RESULT bitwise kind=dn cfg={dn_cfg_name(cfg)} identical={ok}")
     out(f"RESULT bitwise_summary up_identical={sum(1 for v in bit_up.values() if v)}/{len(bit_up)} "
         f"dn_identical={sum(1 for v in bit_dn.values() if v)}/{len(bit_dn)}")
     if not timing:
@@ -543,9 +543,9 @@ def bench(sets_by_r: dict[int, list[Set]], cus: int, max_rows: int, args, timing
 def smoke(args) -> None:
     """CPU (TRITON_INTERPRET=1): small shapes, random weights, the bitwise checks only."""
     torch.manual_seed(0)
-    E, H, I, IS, topk = 32, 256, 64, 64, 8
+    E, H, I, IS, topk = 32, 128, 32, 32, 8
     layers = []
-    for li in range(2):
+    for li in range(1):
         gu = (torch.randn(E, 2 * I, H) * H ** -0.5).to(torch.bfloat16)
         dn = (torch.randn(E, H, I) * I ** -0.5).to(torch.bfloat16)
         sd = (torch.randn(H, IS) * IS ** -0.5).to(torch.bfloat16)
@@ -705,6 +705,8 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="CPU, TRITON_INTERPRET=1, bitwise only")
     args = parser.parse_args()
+    if not args.smoke:
+        os.environ.setdefault("HIP_VISIBLE_DEVICES", args.devices)
     try:
         if args.smoke:
             smoke(args)

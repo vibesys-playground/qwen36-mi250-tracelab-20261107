@@ -84,7 +84,49 @@ def test_packed_prefill_matches_serial(generator: Generator) -> None:
         assert int(packed_next[row].argmax()) == int(serial_next[row].argmax())
 
 
-def test_start_many_matches_start(generator: Generator, monkeypatch: pytest.MonkeyPatch) -> None:
+def _expected_reuse(n: int, one_pass_max: int) -> int:
+    """Tokens a repeat of an ``n``-token prompt reuses from the snapshots its first run stored."""
+    if one_pass_max == 0:  # chunk-aligned passes, then the last token alone
+        return max(n - 1, 0)
+    if n <= one_pass_max:  # one pass, no snapshot
+        return 0
+    return ((n - 1) // CHUNK) * CHUNK  # the last chunk boundary before the end
+
+
+@pytest.mark.parametrize("one_pass_max", [0, 16, 4096])
+def test_chunks_cover_the_prompt_once(generator: Generator, one_pass_max: int) -> None:
+    """Spans tile [start, len) in order; one pass up to the limit; no one-token tail pass."""
+    saved = generator._one_pass_max
+    generator._one_pass_max = one_pass_max
+    try:
+        for n in [1, 2, 7, 8, 9, 16, 17, 21, 40, 41]:
+            for start in sorted({0, 1, 5, 8, n - 1}):
+                if not 0 <= start < n:
+                    continue
+                spans = generator._chunks(tuple(range(n)), start)
+                assert spans[0][0] == start and spans[-1][1] == n
+                assert all(a[1] == b[0] for a, b in zip(spans, spans[1:]))
+                assert all(b < e for b, e, _ in spans)
+                if one_pass_max == 0:
+                    assert spans[-1][:2] == (n - 1, n)
+                    continue
+                if n - start <= one_pass_max:
+                    assert spans == [(start, n, False)]
+                else:
+                    assert all(e % CHUNK == 0 for _, e, _ in spans[:-1])
+                    stored = [e for _, e, store in spans if store]
+                    assert stored == [((n - 1) // CHUNK) * CHUNK] or (
+                        not stored and ((n - 1) // CHUNK) * CHUNK <= start
+                    )
+    finally:
+        generator._one_pass_max = saved
+
+
+@pytest.mark.parametrize("one_pass_max", [0, 16, 4096])
+def test_start_many_matches_start(
+    generator: Generator, monkeypatch: pytest.MonkeyPatch, one_pass_max: int
+) -> None:
+    monkeypatch.setattr(generator, "_one_pass_max", one_pass_max)
     fast = _fast(generator)
     generator.fast = fast
     generator._free_slots = list(range(fast.slots - 1, -1, -1))
@@ -109,9 +151,7 @@ def test_start_many_matches_start(generator: Generator, monkeypatch: pytest.Monk
             assert not isinstance(g, Exception), g
             assert _close(g.logits, logits) < 2e-2
             assert int(g.logits.argmax()) == int(logits.argmax())
-            body = len(p) - 1
-            expect = body if body > 0 else 0
-            assert g.cached_tokens == expect, (len(p), g.cached_tokens)
+            assert g.cached_tokens == _expected_reuse(len(p), one_pass_max), (len(p), g.cached_tokens)
             generator.finished(g)
         generator._reclaim()
         # Cold, packed, then decode a few greedy tokens: equal to the serial path's tokens.

@@ -1,16 +1,18 @@
-"""Served A/B of engine settings: the same workload with ENGINE_FAST=0, then the default.
+"""Served A/B of engine settings: by default the replica layouts 4x2, 2x4 and 1x8 GCDs.
 
     python tools/serve_probe.py [--sessions 8] [--rounds 3] [--first 2000] [--grow 300] [--max-new 128]
+        [--concurrency N] [--settings ENGINE_REPLICAS=4,ENGINE_FAST=0,KEY=V+KEY=V,...]
 
 For each setting it starts ``python -m engine.server`` exactly as the task does,
-waits for /health, and runs ``--sessions`` concurrent multi-round sessions:
+waits for /health, and runs ``--sessions`` multi-round sessions, ``--concurrency``
+at a time (all by default), ``--rounds`` each (fractional: some one more):
 streaming /v1/completions with token ids, temperature 0, ignore_eos and exact
 max_tokens; round r+1's prompt is round r's prompt, its output and ``--grow``
 new tokens, so the prefix cache is exercised. Prompt text is the source of the
 installed Transformers package (nothing from the benchmark). It prints, per
 setting, output tokens/s over the wall time, TPOT and TTFT percentiles, cached
-prompt tokens and /health, then how many requests produced identical tokens in
-both settings. A hint for the lead, not the task's metric.
+prompt tokens and /health, then (for two settings) how many requests produced
+identical tokens in both. A hint for the lead, not the task's metric.
 """
 
 from __future__ import annotations
@@ -177,7 +179,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18431)
     parser.add_argument(
         "--settings",
-        default="0,default",
+        default="ENGINE_REPLICAS=4,ENGINE_REPLICAS=2,ENGINE_REPLICAS=1",
         help="comma-separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
     )
     args = parser.parse_args()

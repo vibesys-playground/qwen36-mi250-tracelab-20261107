@@ -1113,7 +1113,12 @@ class FastModel:
         peer = None
         if self.tp is not None and not self.tp.solo:
             h = h.contiguous()
-            peer = self.tp._exchange(self.rank, h)
+            if getattr(self.tp, "sums_only", False):
+                # Ranks in two processes (``tp_proc``) exchange only sums: the all-reduce's
+                # (mine + theirs) in fp32 rounded to BF16 is the kernel's peer add, bit for bit.
+                h = self.tp.allreduce(self.rank, h)
+            else:
+                peer = self.tp._exchange(self.rank, h)
         return prefill_kernels.reduce_rms(residual, h, peer, weight, self.eps)
 
     def _gdn_prefill(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:

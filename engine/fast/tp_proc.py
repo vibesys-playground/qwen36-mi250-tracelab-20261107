@@ -280,6 +280,13 @@ def _from_wire(w: tuple[str, tuple[int, ...], bytes]) -> torch.Tensor:
 class ProcGroup(tpm.Group):
     """``Group`` for one rank of a pair of processes (same ``allreduce`` and ``argmax``)."""
 
+    # No ``_exchange`` (the peer's own tensor) across processes: callers that would add the
+    # peer's partial themselves (``FastModel._reduce_rms``) take the all-reduce's sum instead.
+    sums_only = True
+
+    def _exchange(self, rank: int, x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("tensor-parallel ranks in two processes exchange sums only")
+
     def __init__(self, rank: int, devices: Sequence[torch.device], ll: _LLProc | None, data: Any) -> None:  # noqa: D107
         self.devices = list(devices)
         self.rank = rank
@@ -405,6 +412,8 @@ class _Rank1:
             "vocab": model.vocab,
             "row_bytes": _row_bytes(model),
             "pid": os.getpid(),
+            "fla_pins": model.fla_pins,
+            "kernels": dict(model.triton_kernels),
         }
 
     def _weights(self) -> dict[int, torch.Tensor]:
@@ -720,7 +729,12 @@ class ProcTPModel(tpm.TPModel):
         self.last_drafts: torch.Tensor | None = None
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
+        if ready["fla_pins"] != r0.fla_pins:  # both ranks must run fla with the same configs
+            raise RuntimeError(f"fla pins differ: rank 0 {r0.fla_pins}, rank 1 {ready['fla_pins']}")
+        if ready["kernels"] != dict(r0.triton_kernels):  # and the same kernel paths
+            raise RuntimeError(f"kernel paths differ: rank 0 {r0.triton_kernels}, rank 1 {ready['kernels']}")
         print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1), "
+              f"fla pins {ready['fla_pins']}, prefill_fused {r0.triton_kernels.get('prefill_fused')}, "
               f"{moved / 2**30:.1f} GiB of weights handed over", flush=True)
 
     def _shard(self, lm: Any, mtp: Any) -> list:

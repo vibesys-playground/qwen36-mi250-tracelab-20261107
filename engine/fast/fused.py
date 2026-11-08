@@ -5,16 +5,16 @@ them tiny: four separate input projections, a 1-row ``shared_expert_gate`` GEMV,
 top-k sorts, rotary elementwise ops, the split-K attention combine in PyTorch. Each costs
 10-50 us on gfx90a whatever its size. Here a layer is:
 
-GDN layer (8 launches)
+GDN layer (9 launches)
     add_rms -> GEMV of ``in_proj_qkv|z|b|a`` with the short convolution in its epilogue
-    -> delta-rule step + gated norm -> ``out_proj`` GEMV -> add_rms -> MoE (3 launches)
-Attention layer (10 launches)
+    -> delta-rule step + gated norm -> ``out_proj`` GEMV -> add_rms -> MoE (4 launches)
+Attention layer (11 launches)
     add_rms -> GEMV of ``q|k|v`` -> q/k RMSNorm + rotary + KV-cache write -> paged attention
     (``kernels._paged_attn_kernel``) -> split combine + sigmoid gate -> ``o_proj`` GEMV
-    -> add_rms -> MoE (3 launches)
-MoE (3 launches)
-    GEMV of ``router|shared gate|shared up|shared_expert_gate`` -> routed gate_up (each
-    program recomputes its row's softmax top-k) -> routed down + combine + shared expert +
+    -> add_rms -> MoE (4 launches)
+MoE (4 launches)
+    GEMV of ``router|shared gate|shared up|shared_expert_gate`` -> softmax top-k per row
+    -> routed gate_up -> routed down + combine + shared expert +
     its sigmoid gate + the residual add.
 
 Every rounding point of the per-op path is kept (BF16 after each projection, activation and
@@ -39,6 +39,8 @@ from engine.fast import kernels
 triton, tl = kernels.triton, kernels.tl
 
 MAX_ROWS = int(os.environ.get("ENGINE_FUSED_MAX_ROWS", "8"))
+# Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
+TILES = {"bn": 8, "bk4": 1024, "bk8": 512, "moe_bn": 8}
 
 
 def enabled() -> bool:
@@ -231,23 +233,30 @@ if triton is not None:
         return sel_i, sel_w.to(tl.bfloat16).to(tl.float32)
 
     @triton.jit
+    def _topk_kernel(r_ptr, idx_ptr, wt_ptr, N3, E: tl.constexpr, TOPK: tl.constexpr,
+                     TOPKP: tl.constexpr):
+        row = tl.program_id(0)
+        sel_i, sel_w = _topk(r_ptr + row * N3, E, TOPK, TOPKP)
+        kk = tl.arange(0, TOPKP)
+        tl.store(idx_ptr + row * TOPK + kk, sel_i, mask=kk < TOPK)
+        tl.store(wt_ptr + row * TOPK + kk, sel_w, mask=kk < TOPK)
+
+    @triton.jit
     def _moe_up_kernel(
-        h_ptr, r_ptr, w_ptr, act_ptr, R, stride_we, N3,
-        H: tl.constexpr, I: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
-        TOPKP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+        h_ptr, idx_ptr, w_ptr, act_ptr, R, stride_we,
+        H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr, BN: tl.constexpr,
+        BK: tl.constexpr,
     ):
         """act[p, n] = bf16(silu(bf16(Wg[e_p, n] . h)) * bf16(Wu[e_p, n] . h)) over work items
-        (pair p = row * TOPK + j, tile of BN rows); e_p from the row's top-k."""
+        (pair p = row * TOPK + j, tile of BN rows); e_p from ``_topk_kernel``."""
         pid = tl.program_id(0)
         nprog = tl.num_programs(0)
         ntile = tl.cdiv(I, BN)
-        kk = tl.arange(0, TOPKP)
         for t in range(pid, R * TOPK * ntile, nprog):
             pair = t // ntile
             tile = t % ntile
             row = pair // TOPK
-            sel_i, _ = _topk(r_ptr + row * N3, E, TOPK, TOPKP)
-            expert = tl.sum(tl.where(kk == pair % TOPK, sel_i, 0), axis=0).to(tl.int64)
+            expert = tl.load(idx_ptr + pair).to(tl.int64)
             rows = tile * BN + tl.arange(0, BN)
             rok = rows < I
             wbase = w_ptr + expert * stride_we
@@ -269,10 +278,9 @@ if triton is not None:
 
     @triton.jit
     def _moe_down_kernel(
-        act_ptr, r_ptr, w_ptr, sd_ptr, res_ptr, out_ptr, R, stride_we, N3,
+        act_ptr, r_ptr, idx_ptr, wt_ptr, w_ptr, sd_ptr, res_ptr, out_ptr, R, stride_we, N3,
         H: tl.constexpr, I: tl.constexpr, IS: tl.constexpr, E: tl.constexpr,
-        TOPK: tl.constexpr, TOPKP: tl.constexpr, BN: tl.constexpr, BKI: tl.constexpr,
-        BKS: tl.constexpr,
+        TOPK: tl.constexpr, BN: tl.constexpr, BKI: tl.constexpr, BKS: tl.constexpr,
     ):
         """out = bf16(res + bf16(routed + bf16(bf16(sigmoid(seg)) * shared))): the routed down
         projection with its weighted combine (``_moe_down_kernel``), the shared expert's down
@@ -280,18 +288,16 @@ if triton is not None:
         pid = tl.program_id(0)
         nprog = tl.num_programs(0)
         ntile = tl.cdiv(H, BN)
-        kk = tl.arange(0, TOPKP)
         for t in range(pid, R * ntile, nprog):
             row = t // ntile
             rows = (t % ntile) * BN + tl.arange(0, BN)
             rok = rows < H
             rbase = r_ptr + row * N3
-            sel_i, sel_w = _topk(rbase, E, TOPK, TOPKP)
             acc = tl.zeros([BN], dtype=tl.float32)
             for j in tl.static_range(TOPK):
                 pair = row * TOPK + j
-                expert = tl.sum(tl.where(kk == j, sel_i, 0), axis=0).to(tl.int64)
-                weight = tl.sum(tl.where(kk == j, sel_w, 0.0), axis=0)
+                expert = tl.load(idx_ptr + pair).to(tl.int64)
+                weight = tl.load(wt_ptr + pair)
                 wbase = w_ptr + expert * stride_we
                 part = tl.zeros([BN], dtype=tl.float32)
                 for k0 in range(0, I, BKI):
@@ -383,8 +389,8 @@ class FusedDecode:
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
         bp = max(2, _pow2(rows))
-        bk = min(1024 if bp <= 4 else 512, _pow2(k))
-        bn = 8
+        bk = min(TILES["bk4"] if bp <= 4 else TILES["bk8"], _pow2(k))
+        bn = TILES["bn"]
         grid = min(triton.cdiv(n, bn), 2 * self.cus[x.device])
         if conv is None:
             state, slots, cw, conv_n, kc = out, out, out, 0, 2
@@ -413,21 +419,24 @@ class FusedDecode:
         sd = mlp.shared_expert.down_proj.weight
         shared = sd.shape[1]
         top_k = fast.top_k
-        bn = 8
+        bn = TILES["moe_bn"]
         bk = min(1024, _pow2(hidden))
         cus = 2 * self.cus[h.device]
+        idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
+        wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
+        _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
+                              TOPKP=_pow2(top_k), num_warps=4)
         act = torch.empty((rows * top_k, inter), dtype=h.dtype, device=h.device)
         items = rows * top_k * triton.cdiv(inter, bn)
         _moe_up_kernel[(min(items, cus),)](
-            h, r, gu, act, rows, gu.stride(0), w3.shape[0],
-            H=hidden, I=inter, E=experts, TOPK=top_k, TOPKP=_pow2(top_k), BN=bn, BK=bk,
-            num_warps=4,
+            h, idx, gu, act, rows, gu.stride(0),
+            H=hidden, I=inter, TOPK=top_k, BN=bn, BK=bk, num_warps=4,
         )
         out = torch.empty_like(x)
         items = rows * triton.cdiv(hidden, bn)
         _moe_down_kernel[(min(items, cus),)](
-            act, r, dn, sd, x, out, rows, dn.stride(0), w3.shape[0],
-            H=hidden, I=inter, IS=shared, E=experts, TOPK=top_k, TOPKP=_pow2(top_k), BN=bn,
+            act, r, idx, wt, dn, sd, x, out, rows, dn.stride(0), w3.shape[0],
+            H=hidden, I=inter, IS=shared, E=experts, TOPK=top_k, BN=bn,
             BKI=min(1024, _pow2(inter)), BKS=min(1024, _pow2(shared)), num_warps=4,
         )
         return out

@@ -294,7 +294,7 @@ def main() -> int:
             meta = fast.devices[dev]
             with torch.cuda.device(dev):
                 for R in rows_list:
-                    x = torch.randn(R, fast.embed.shape[1], device=dev).to(torch.bfloat16)
+                    x = torch.randn(R, fast.embed.shape[1]).to(dev, torch.bfloat16)
                     st = torch.arange(R, device=dev)
                     pt = torch.full((R,), 2048, device=dev)
                     res = {}
@@ -308,11 +308,31 @@ def main() -> int:
                             res[flag] = ms.graph_ms(call)
                     print(f"RESULT layer_ms kind={kind} R={R} per_op={res[False]:.4f} fused={res[True]:.4f} "
                           f"speedup={res[False] / res[True]:.2f}x")
+                    if R >= 4:  # tile variants of the fused path
+                        from engine.fast import fused as fused_mod
+
+                        base = dict(fused_mod.TILES)
+                        toggle(True)
+                        for variant in ({"bn": 16, "bk4": 512, "bk8": 256},
+                                        {"bn": 4, "bk4": 2048, "bk8": 1024},
+                                        {"moe_bn": 16}, {"moe_bn": 4}):
+                            fused_mod.TILES.update(variant)
+                            try:
+                                with torch.inference_mode():
+                                    t = ms.graph_ms(lambda: fast.layer_decode(i, x, st, pt, meta))
+                                print(f"RESULT layer_tiles kind={kind} R={R} tiles={fused_mod.TILES} ms={t:.4f}")
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"RESULT layer_tiles kind={kind} R={R} tiles={variant} error={exc}")
+                            fused_mod.TILES.clear()
+                            fused_mod.TILES.update(base)
         # The whole decode step through FastModel.decode (captured graphs per bucket).
         pos = [len(p) for p in tp]
         fast.use_graphs = graphs_wanted
+        kept = []  # graphs of an earlier capture stay alive: freeing their pool mid-run asserts
         for flag in (False, True):
             toggle(flag)
+            kept.append([(dict(seg.graphs), dict(seg.inputs), dict(seg.outputs)) for seg in fast.segments])
+            fast.__dict__["_pools"] = {}  # a fresh private pool per capture
             for seg in fast.segments:
                 seg.graphs.clear()
                 seg.inputs.clear()
@@ -353,7 +373,7 @@ def main() -> int:
             dev = fast.layers[i].input_layernorm.weight.device
             meta = fast.devices[dev]
             with torch.cuda.device(dev):
-                x = torch.randn(2, fast.embed.shape[1], device=dev).to(torch.bfloat16)
+                x = torch.randn(2, fast.embed.shape[1]).to(dev, torch.bfloat16)
                 st = torch.arange(2, device=dev)
                 pt = torch.full((2,), 2048, device=dev)
                 with torch.inference_mode():

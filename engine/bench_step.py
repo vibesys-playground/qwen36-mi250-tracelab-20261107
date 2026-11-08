@@ -298,6 +298,24 @@ def main(argv: list[str] | None = None) -> int:
         same_prefix.append(n)
     print(f"RESULT free_running_identical_prefix={same_prefix} of {args.steps}")
 
+    # ---------------------------------------------------------------- step time
+    timing_prompts = _prompts(generator, [args.timing_length] * 8)
+    sampling = Sampling(max_tokens=1024, temperature=0.0, ignore_eos=True)
+    hf_gens = []
+    for prompt in timing_prompts:
+        g = generator.start(tuple(prompt), sampling)
+        g.next_step()
+        hf_gens.append(g)
+    fast_pos = []
+    for slot, prompt in enumerate(timing_prompts):
+        fast.reset(slot)
+        _fast_prefill(fast, slot, prompt, args.chunk)
+        fast_pos.append(len(prompt))
+    results = {}
+    for batch in (1, 2, 8):  # the reference first: a failed capture must not affect it
+        gens = hf_gens[:batch]
+        results[f"hf_b{batch}"] = _time(lambda: generator.decode(gens), args.hf_timing_steps, 2)
+
     # ---------------------------------------------------------------- graph capture
     fast.use_graphs = graphs_wanted
     t0 = time.perf_counter()
@@ -323,23 +341,11 @@ def main(argv: list[str] | None = None) -> int:
         fast.use_graphs = True
         print(f"RESULT graph_vs_eager max_abs_diff={float((replayed - eager).abs().max()):.4f}")
 
-    # ---------------------------------------------------------------- step time
-    timing_prompts = _prompts(generator, [args.timing_length] * 8)
-    sampling = Sampling(max_tokens=1024, temperature=0.0, ignore_eos=True)
-    hf_gens = []
-    for prompt in timing_prompts:
-        g = generator.start(tuple(prompt), sampling)
-        g.next_step()
-        hf_gens.append(g)
-    fast_pos = []
-    for slot, prompt in enumerate(timing_prompts):
+    for slot, prompt in enumerate(timing_prompts):  # the graph check reset slots 0-3
         fast.reset(slot)
         _fast_prefill(fast, slot, prompt, args.chunk)
-        fast_pos.append(len(prompt))
-    results = {}
+        fast_pos[slot] = len(prompt)
     for batch in (1, 2, 8):
-        gens = hf_gens[:batch]
-        results[f"hf_b{batch}"] = _time(lambda: generator.decode(gens), args.hf_timing_steps, 2)
 
         def fast_step(batch=batch):
             slots = list(range(batch))

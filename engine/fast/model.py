@@ -719,7 +719,13 @@ class FastModel:
                 with torch.cuda.device(seg.device):
                     meta = self.devices[seg.device]
                     static_in = x if seg is self.segments[0] else x.to(seg.device).clone()
-                    stream = torch.cuda.Stream(seg.device)
+                    # One side stream per device, also passed to torch.cuda.graph: its default
+                    # capture stream is a process-wide singleton made on the first device, so
+                    # a segment on another GPU would be captured on a foreign stream.
+                    streams = self.__dict__.setdefault("_capture_streams", {})
+                    if seg.device not in streams:
+                        streams[seg.device] = torch.cuda.Stream(seg.device)
+                    stream = streams[seg.device]
                     stream.wait_stream(torch.cuda.current_stream(seg.device))
                     with torch.cuda.stream(stream):
                         for _ in range(2):  # compile the Triton kernels, warm the BLAS handles
@@ -728,7 +734,10 @@ class FastModel:
                     torch.cuda.synchronize(seg.device)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(
-                        graph, pool=self._pool(seg.device), capture_error_mode=mode
+                        graph,
+                        pool=self._pool(seg.device),
+                        stream=stream,
+                        capture_error_mode=mode,
                     ):
                         out = seg.run(static_in, meta)
                     seg.inputs[size], seg.outputs[size], seg.graphs[size] = static_in, out, graph

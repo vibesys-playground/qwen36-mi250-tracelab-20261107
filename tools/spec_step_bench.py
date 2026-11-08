@@ -83,6 +83,7 @@ def main() -> None:
     fast = g.fast
     print(
         f"RESULT load_s={time.perf_counter() - started:.0f} gpus={torch.cuda.device_count()} "
+        f"tp={os.environ.get('ENGINE_TP', '1')} "
         f"mtp={fast.mtp is not None} graphs={fast.use_graphs} graph_error={fast.graph_error} "
         f"kv_pages={fast.pool.pages}",
         flush=True,
@@ -93,14 +94,15 @@ def main() -> None:
     chunk = args.chunk
 
     def prefill(slot: int, prompt: list[int]) -> torch.Tensor:
+        """The prompt in the generator's own passes (``Generator._chunks``: one pass up to
+        ENGINE_PREFILL_ONE_PASS_MAX tokens), so plain decode starts from the same state as
+        the speculative ``Generator`` path it is compared with."""
         fast.reset(slot)
-        body = len(prompt) - 1
-        position = 0
-        while position < body:
-            end = min((position // chunk + 1) * chunk, body)
-            fast.prefill(slot, prompt[position:end], position, prompt[end])
-            position = end
-        return fast.prefill(slot, prompt[body:], body)
+        logits = None
+        for begin, end, _ in g._chunks(tuple(prompt), 0):
+            follow = prompt[end] if end < len(prompt) else None
+            logits = fast.prefill(slot, prompt[begin:end], begin, follow)
+        return logits
 
     # Replay-like pool: Request Factory's synthetic corpus lines (see tools/spec_serve_probe.py).
     def pool(limit: int, nonce: str = "5f0c2a9e1b7d4c3a8e6f0b2d4a6c8e0f") -> list[int]:
@@ -127,8 +129,12 @@ def main() -> None:
         )
         ver = median_ms(lambda: fast.verify(lasts[:batch], drafts[:batch], s, [length] * batch), args.iters)
         # The MTP head alone on 2B rows (the layout the last verify left in the step inputs).
-        if not torch.cuda.is_available():
-            print(f"RESULT step B={batch} decode_ms={dec:.2f} verify_ms={ver:.2f}", flush=True)
+        if not torch.cuda.is_available() or hasattr(fast, "ranks"):
+            # (Under ENGINE_TP=2 the head alone would wait for rank 1 inside its all-reduces.)
+            print(f"RESULT step B={batch} decode_ms={dec:.2f} verify_ms={ver:.2f} "
+                  f"verify/decode={ver / dec:.3f}", flush=True)
+            if batch == 2:
+                print(f"RESULT kill_test B=2 verify_incl_mtp/decode={ver / dec:.3f}", flush=True)
             continue
         size = fast.bucket(batch)
         rows = 2 * size
@@ -253,6 +259,8 @@ def main() -> None:
             f"tokens_per_slot_step={(n - 1) / max(1, steps):.2f}",
             flush=True,
         )
+    if hasattr(fast, "timeouts"):
+        print(f"RESULT tp_allreduce_timeouts={fast.timeouts()}", flush=True)
 
 
 if __name__ == "__main__":

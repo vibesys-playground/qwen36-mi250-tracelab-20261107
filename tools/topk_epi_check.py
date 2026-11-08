@@ -9,16 +9,14 @@ first, the last, the MTP head's). Per layer and row count R it captures one grap
 on the same input h [R, hidden]:
 
 - today's path: ``mfma.gemv(h, w3)`` then ``fused._topk_kernel`` -> r, idx, wt;
-- ``mfma.gemv_topk`` mode 1 (last program by atomic counter) and mode 2 (one extra program
-  per row), each into idx/wt buffers first filled with -1 / NaN inside the graph, so a missing
-  or stale write shows as a mismatch.
+- ``mfma.gemv_topk`` (one extra K-sum program per row), into idx/wt buffers first filled
+  with -1 / NaN inside the graph, so a missing or stale write shows as a mismatch.
 
 Each of ``--replays`` replays draws a fresh h (``torch.randn`` scaled like a post-RMSNorm
 hidden state, written into the graph's static input outside it) and compares r, idx and wt
-of both modes bitwise with today's, accumulating mismatch counts on the GPU. Also counts how
-many distinct expert sets appeared (the inputs do move the routing) and checks the counter is
-back to 0. Ends with an eager (no graph) pass at the same sizes, and the kernel timings of
-the three paths (graph of 200 back-to-back calls, R = 4 and 8).
+bitwise with today's, accumulating mismatch counts on the GPU. Also counts how many distinct
+expert sets appeared (the inputs do move the routing). Ends with an eager (no graph) pass at
+the same sizes, and the kernel timings of both paths (graph of 200 back-to-back calls).
 
 Prints ``RESULT`` lines; ``RESULT bitwise_summary`` has the verdict. A plan hint, not the
 task's metric.
@@ -78,13 +76,12 @@ def main() -> None:
             n, hidden = w3.shape
             tiles = mfma.tiles_for(n, hidden)
             with torch.cuda.device(dev):
-                cnt = torch.zeros(1, dtype=torch.int32, device=dev)
                 stream = torch.cuda.Stream(dev)
                 for rows in rows_list:
                     h = torch.zeros((rows, hidden), dtype=torch.bfloat16, device=dev)
                     bufs = {name: (torch.empty((rows, top_k), dtype=torch.int32, device=dev),
                                    torch.empty((rows, top_k), dtype=torch.float32, device=dev))
-                            for name in ("ref", "m1", "m2")}
+                            for name in ("ref", "m2")}
                     res = {}
 
                     def step():
@@ -95,12 +92,10 @@ def main() -> None:
                         fused._topk_kernel[(rows,)](r, idx, wt, n, E=experts, TOPK=top_k,
                                                     TOPKP=fused._pow2(top_k), num_warps=1)
                         res["ref"] = r
-                        for mode in (1, 2):
-                            idx, wt = bufs[f"m{mode}"]
-                            idx.fill_(-1)
-                            wt.fill_(float("nan"))
-                            res[f"m{mode}"] = mfma.gemv_topk(h, w3, idx, wt, experts, top_k, cnt,
-                                                             mode=mode)
+                        idx, wt = bufs["m2"]
+                        idx.fill_(-1)
+                        wt.fill_(float("nan"))
+                        res["m2"] = mfma.gemv_topk(h, w3, idx, wt, experts, top_k)
 
                     torch.manual_seed(1000 * li + rows)
                     h.copy_(torch.randn_like(h, dtype=torch.float32) * 1.0)
@@ -110,7 +105,7 @@ def main() -> None:
                         step()
                     torch.cuda.current_stream(dev).wait_stream(stream)
                     torch.cuda.synchronize(dev)
-                    if res["m1"] is None or res["m2"] is None:
+                    if res["m2"] is None:
                         out("bitwise", layer=li, rows=rows, error="gemv_topk returned None",
                             tiles=tiles)
                         all_ok = False
@@ -118,7 +113,7 @@ def main() -> None:
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=stream):
                         step()
-                    mism = torch.zeros(6, dtype=torch.int64, device=dev)
+                    mism = torch.zeros(3, dtype=torch.int64, device=dev)
                     sets = set()
                     eager_bad = 0
                     for rep in range(args.replays):
@@ -132,32 +127,27 @@ def main() -> None:
                         graph.replay()
                         ref_r = res["ref"]
                         ref_i, ref_w = bufs["ref"]
-                        for j, mode in enumerate((1, 2)):
-                            mi, mw = bufs[f"m{mode}"]
-                            mism[3 * j] += (mi != ref_i).any(dim=1).sum()
-                            mism[3 * j + 1] += (mw.view(torch.int32) != ref_w.view(torch.int32)).any(dim=1).sum()
-                            mism[3 * j + 2] += (res[f"m{mode}"].view(torch.int16)
-                                                != ref_r.view(torch.int16)).any(dim=1).sum()
+                        mi, mw = bufs["m2"]
+                        mism[0] += (mi != ref_i).any(dim=1).sum()
+                        mism[1] += (mw.view(torch.int32) != ref_w.view(torch.int32)).any(dim=1).sum()
+                        mism[2] += (res["m2"].view(torch.int16) != ref_r.view(torch.int16)).any(dim=1).sum()
                         if rep % 100 == 0:
                             sets.update(tuple(v) for v in ref_i.sort(dim=1).values.cpu().tolist())
                     # The eager path (no graph) at the same size, a few fresh inputs.
                     for rep in range(20):
                         h.copy_(torch.randn((rows, hidden), device=dev))
                         step()
-                        for mode in (1, 2):
-                            mi, mw = bufs[f"m{mode}"]
-                            ri, rw = bufs["ref"]
-                            if not (torch.equal(mi, ri) and torch.equal(mw.view(torch.int32), rw.view(torch.int32))
-                                    and torch.equal(res[f"m{mode}"], res["ref"])):
-                                eager_bad += 1
+                        mi, mw = bufs["m2"]
+                        ri, rw = bufs["ref"]
+                        if not (torch.equal(mi, ri) and torch.equal(mw.view(torch.int32), rw.view(torch.int32))
+                                and torch.equal(res["m2"], res["ref"])):
+                            eager_bad += 1
                     torch.cuda.synchronize(dev)
                     m = mism.cpu().tolist()
-                    ok = sum(m) == 0 and eager_bad == 0 and int(cnt.item()) == 0
+                    ok = sum(m) == 0 and eager_bad == 0
                     all_ok = all_ok and ok
                     out("bitwise", layer=li, rows=rows, replays=args.replays, ok=ok,
-                        m1_rows_bad={"idx": m[0], "wt": m[1], "logits": m[2]},
-                        m2_rows_bad={"idx": m[3], "wt": m[4], "logits": m[5]},
-                        eager_bad=eager_bad, counter_after=int(cnt.item()),
+                        rows_bad={"idx": m[0], "wt": m[1], "logits": m[2]}, eager_bad=eager_bad,
                         distinct_expert_sets_sampled=len(sets), tiles=tiles)
                     del graph
 
@@ -170,15 +160,14 @@ def main() -> None:
                     idx = torch.empty((rows, top_k), dtype=torch.int32, device=dev)
                     wt = torch.empty((rows, top_k), dtype=torch.float32, device=dev)
                     timings = {}
-                    for name in ("ref", "m1", "m2"):
+                    for name in ("ref", "m2"):
                         def call():
                             if name == "ref":
                                 r = mfma.gemv(h, w3)
                                 fused._topk_kernel[(rows,)](r, idx, wt, n, E=experts, TOPK=top_k,
                                                             TOPKP=fused._pow2(top_k), num_warps=1)
                             else:
-                                mfma.gemv_topk(h, w3, idx, wt, experts, top_k, cnt,
-                                               mode=int(name[1]))
+                                mfma.gemv_topk(h, w3, idx, wt, experts, top_k)
                         stream.wait_stream(torch.cuda.current_stream(dev))
                         with torch.cuda.stream(stream):
                             call()
@@ -201,9 +190,7 @@ def main() -> None:
                         timings[name] = round(sorted(times)[3], 2)
                         del graph
                     out("router_topk_us", rows=rows, per_call_us=timings,
-                        saved_m1_us=round(timings["ref"] - timings["m1"], 2),
-                        saved_m2_us=round(timings["ref"] - timings["m2"], 2),
-                        counter_after=int(cnt.item()))
+                        saved_us=round(timings["ref"] - timings["m2"], 2))
     out("bitwise_summary", all_ok=all_ok, verdict="PASS" if all_ok else "FAIL")
     if hasattr(fast, "timeouts"):
         out("tp_allreduce_timeouts", n=fast.timeouts())

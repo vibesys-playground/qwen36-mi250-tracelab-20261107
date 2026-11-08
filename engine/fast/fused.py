@@ -719,9 +719,6 @@ class FusedDecode:
         self.w_moe: dict[int, torch.Tensor] = {}
         self.rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cus: dict[torch.device, int] = {}
-        # Plan 37 (``mfma.TOPK_EPI`` 1): one zeroed int32 tile counter per MoE layer, made
-        # before any graph capture; the K-sum kernel's last program resets it.
-        self.topk_cnt: dict[int, torch.Tensor] = {}
         indices = list(range(len(fast.layers)))
         if getattr(fast, "mtp", None) is not None:
             indices.append(fast.mtp_index)  # the MTP head's decoder layer (full attention)
@@ -741,8 +738,6 @@ class FusedDecode:
                     self.rope[dev] = (freqs.cos().to(fast.embed.dtype).contiguous(),
                                       freqs.sin().to(fast.embed.dtype).contiguous())
             mlp = layer.mlp
-            self.topk_cnt[i] = torch.zeros(1, dtype=torch.int32,
-                                           device=layer.input_layernorm.weight.device)
             sh = mlp.shared_expert
             self.w_moe[i] = _pack([mlp.gate.weight, sh.gate_proj.weight, sh.up_proj.weight,
                                    mlp.shared_expert_gate.weight])
@@ -902,7 +897,7 @@ class FusedDecode:
         fuse_topk = GLUE_TOPK
         r = None
         if mfma.TOPK_EPI and mfma.GEMV and not fuse_topk:  # plan 37: top-k in the K-sum
-            r = mfma.gemv_topk(h, w3, idx, wt, experts, top_k, self.topk_cnt[i])
+            r = mfma.gemv_topk(h, w3, idx, wt, experts, top_k)
         if r is None:
             r = self._gemv(h, w3)
             if not fuse_topk:

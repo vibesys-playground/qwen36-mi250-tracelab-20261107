@@ -1,4 +1,4 @@
-"""Served A/B of the engine's forward: the same workload with ENGINE_FAST=0, then the default.
+"""Served A/B of engine settings: the same workload with ENGINE_FAST=0, then the default.
 
     python tools/serve_probe.py [--sessions 8] [--rounds 3] [--first 2000] [--grow 300] [--max-new 128]
 
@@ -99,9 +99,14 @@ def pct(values: list[float], q: float) -> float | None:
 def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[int]]:
     env = dict(os.environ)
     env.pop("ENGINE_FAST", None)
-    if setting is not None:
+    if setting is not None and "=" in setting:  # KEY=VALUE[+KEY=VALUE...]
+        for pair in setting.split("+"):
+            key, _, value = pair.partition("=")
+            env[key] = value
+    elif setting is not None:
         env["ENGINE_FAST"] = setting
-    log = Path(f"/tmp/serve-probe-{setting or 'default'}.log")
+    name = "".join(c if c.isalnum() else "_" for c in setting or "default")
+    log = Path(f"/tmp/serve-probe-{name}.log")
     with log.open("w") as sink:
         proc = subprocess.Popen(
             [sys.executable, "-m", "engine.server", "--host", "127.0.0.1", "--port", str(port),
@@ -140,7 +145,7 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
                  for r in results)
     engine_lines = [x for x in log.read_text().splitlines() if x.startswith("engine:")]
     print(json.dumps({
-        "event": "setting", "ENGINE_FAST": setting or "default", "load_s": round(load_s, 1),
+        "event": "setting", "setting": setting or "default", "load_s": round(load_s, 1),
         "wall_s": round(wall, 2), "requests": len(results), "output_tokens": tokens,
         "output_tok_per_s": round(tokens / wall, 2),
         "tpot_ms_p50": pct(tpot, 0.5), "tpot_ms_p90": pct(tpot, 0.9),
@@ -159,7 +164,11 @@ def main() -> None:
     parser.add_argument("--grow", type=int, default=300)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
-    parser.add_argument("--settings", default="0,default", help="ENGINE_FAST values, in order")
+    parser.add_argument(
+        "--settings",
+        default="0,default",
+        help="comma-separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
+    )
     args = parser.parse_args()
     from engine.generator import CHECKPOINT
 

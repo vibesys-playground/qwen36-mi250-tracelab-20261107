@@ -5,10 +5,11 @@
 Serves ``GET /health``, ``GET /v1/models``, ``POST /v1/completions`` and
 ``POST /v1/chat/completions``, streaming (SSE) or not. Connection threads parse
 requests and write responses; one worker thread owns the model. It repeats one
-loop: prefill each newly arrived request, one at a time, then pick one token
-for every running request and feed all of them back in a single batched decode
-step. The port opens only after the weights are loaded, so a readiness probe on
-``/health`` passes once the server can answer.
+loop: prefill the newly arrived requests, then pick one token for every running
+request and feed all of them back in a single batched decode step. On the fast
+path the prefills of all waiting requests share passes (``PackedPrefill``), one
+pass per loop. The port opens only after the weights are loaded, so a readiness
+probe on ``/health`` passes once the server can answer.
 """
 
 from __future__ import annotations
@@ -24,8 +25,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from engine import experts, protocol
-from engine.generator import CHECKPOINT, Generation, Generator, Step
-from engine.protocol import ChatRequest, CompletionRequest, Envelope, RequestError, Usage
+from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
+from engine.protocol import (
+    ChatRequest,
+    CompletionRequest,
+    Envelope,
+    RequestError,
+    Sampling,
+    Usage,
+)
 from engine.text import Detokenizer, StopMatcher
 
 _DONE = object()
@@ -38,11 +46,20 @@ class AwaitDecode:
     generation: Generation
 
 
+@dataclass(frozen=True)
+class Prefill:
+    """Yielded by a job for its prompt; the worker sends back the request's ``Generation``."""
+
+    prompt: tuple[int, ...]
+    sampling: Sampling
+
+
 @dataclass
 class Job:
     """A request handed to the worker; the worker answers on ``events``.
 
-    ``run`` yields the request's response events, and an ``AwaitDecode`` after
+    ``run`` yields a ``Prefill`` first (the worker sends the ``Generation``
+    back), then the request's response events, and an ``AwaitDecode`` after
     each token that is not its last.
     """
 
@@ -56,7 +73,14 @@ def _internal(exc: Exception) -> RequestError:
 
 
 class Worker:
-    """The only thread that touches the model: prefills new jobs, then decodes all running jobs together."""
+    """The only thread that touches the model: prefills new jobs, then decodes all running jobs together.
+
+    On the fast path new jobs' prefills are packed (``PackedPrefill``): every
+    loop admits the jobs that arrived, runs one pass over the next prefill
+    chunk of each waiting prompt, hands the prompts that finished to decoding,
+    and runs one decode step for every running job. Otherwise each new job is
+    prefilled alone (``Generator.start``) before the decode step, as before.
+    """
 
     def __init__(self, generator: Generator) -> None:
         self._generator = generator
@@ -67,15 +91,22 @@ class Worker:
         self._jobs.put(job)
 
     @staticmethod
-    def _advance(job: Job, events: Iterator[dict[str, Any] | AwaitDecode]) -> Generation | None:
-        """Run ``job`` up to its next decode step; None once it has ended."""
+    def _advance(
+        job: Job, events: Iterator[Any], send: Generation | None = None
+    ) -> AwaitDecode | Prefill | None:
+        """Run ``job`` (resumed with ``send``) up to its next decode step or its prefill;
+        None once it has ended."""
         try:
-            for event in events:
+            event = events.send(send)  # type: ignore[attr-defined]
+            while True:
                 if job.cancelled.is_set():
                     break
-                if isinstance(event, AwaitDecode):
-                    return event.generation
+                if isinstance(event, (AwaitDecode, Prefill)):
+                    return event
                 job.events.put(event)
+                event = next(events)
+        except StopIteration:
+            pass
         except RequestError as exc:
             job.events.put(exc)
         except Exception as exc:  # report to the client; the worker keeps serving
@@ -83,27 +114,63 @@ class Worker:
         job.events.put(_DONE)
         return None
 
+    @staticmethod
+    def _fail(job: Job, events: Iterator[Any], exc: Exception) -> None:
+        job.events.put(exc if isinstance(exc, RequestError) else _internal(exc))
+        job.events.put(_DONE)
+        events.close()  # type: ignore[attr-defined]
+
     def _loop(self) -> None:
-        running: list[tuple[Job, Iterator[dict[str, Any] | AwaitDecode]]] = []
+        g = self._generator
+        packer = PackedPrefill(g) if g.packing else None
+        prefilling: dict[int, tuple[Job, Iterator[Any]]] = {}
+        running: list[tuple[Job, Iterator[Any]]] = []
         while True:
-            block = not running
+            block = not running and not prefilling
+            ready: list[tuple[Job, Iterator[Any], Generation]] = []
             while True:
                 try:
                     job = self._jobs.get(block=block)
                 except queue.Empty:
                     break
                 block = False
-                running.append((job, job.run()))
+                events = job.run()
+                want = self._advance(job, events)
+                if not isinstance(want, Prefill):
+                    if want is not None:  # a job that decodes before its prefill: not ours
+                        self._fail(job, events, RuntimeError("job decoded before its prefill"))
+                    continue
+                if packer is None:
+                    try:
+                        ready.append((job, events, g.start(want.prompt, want.sampling)))
+                    except Exception as exc:  # noqa: BLE001 - this request only
+                        self._fail(job, events, exc)
+                else:
+                    prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
+            if packer is not None:
+                for ticket, exc in packer.failed():
+                    self._fail(*prefilling.pop(ticket), exc)
+                if packer.busy:
+                    for ticket, result in packer.step():
+                        job, events = prefilling.pop(ticket)
+                        if isinstance(result, Exception):
+                            self._fail(job, events, result)
+                        else:
+                            ready.append((job, events, result))
             waiting = []
             for job, events in running:
-                generation = self._advance(job, events)
-                if generation is not None:
-                    waiting.append((job, events, generation))
+                want = self._advance(job, events)
+                if isinstance(want, AwaitDecode):
+                    waiting.append((job, events, want.generation))
+            for job, events, generation in ready:
+                want = self._advance(job, events, generation)
+                if isinstance(want, AwaitDecode):
+                    waiting.append((job, events, want.generation))
             running = [(job, events) for job, events, _ in waiting]
             if not waiting:
                 continue
             try:
-                self._generator.decode([generation for _, _, generation in waiting])
+                g.decode([generation for _, _, generation in waiting])
             except Exception as exc:  # the step failed for every request in it
                 for job, _, _ in waiting:
                     job.events.put(_internal(exc))
@@ -182,7 +249,7 @@ def completion_job(
     prompt = (
         generator.encode_text(request.prompt) if isinstance(request.prompt, str) else request.prompt
     )
-    generation = generator.start(prompt, request.sampling)
+    generation = yield Prefill(prompt, request.sampling)
     env = Envelope(model=model, kind="text_completion")
     usage = Usage(prompt_tokens=len(prompt), cached_tokens=generation.cached_tokens)
     output = _Output(generator, request.sampling.stop, thinking=False)
@@ -216,7 +283,7 @@ def chat_job(
 ) -> Iterator[dict[str, Any] | AwaitDecode]:
     """Events for ``/v1/chat/completions``; reasoning streams as ``reasoning_content``."""
     prompt = generator.encode_chat(request)
-    generation = generator.start(prompt, request.sampling)
+    generation = yield Prefill(prompt, request.sampling)
     env = Envelope(model=model, kind="chat.completion")
     usage = Usage(prompt_tokens=len(prompt), cached_tokens=generation.cached_tokens)
     output = _Output(generator, request.sampling.stop, thinking=request.thinking)
@@ -284,6 +351,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "decode_steps": g.decode_steps,
                 "decoded_tokens": g.decoded_tokens,
                 "largest_batch": g.largest_batch,
+                "prefill_passes": g.prefill_passes,
+                "prefill_segments": g.prefill_segments,
             }
             self._send_json(200, {"status": "ok", **stats})
         elif self.path == "/v1/models":

@@ -245,6 +245,9 @@ class Generator:
         self.decode_steps = 0
         self.decoded_tokens = 0
         self.largest_batch = 0
+        # Packed prefill counters: segments per pass tell how wide prefill passes were.
+        self.prefill_passes = 0
+        self.prefill_segments = 0
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -577,8 +580,6 @@ class PackedPrefill:
         self._pending: list[_Pending] = []
         self._failed: list[tuple[int, Exception]] = []
         self._tickets = 0
-        self.passes = 0
-        self.packed_segments = 0
 
     @property
     def busy(self) -> bool:
@@ -630,8 +631,8 @@ class PackedPrefill:
         for entry in batch:
             begin, end, _ = entry.spans[entry.at]
             segments.append((entry.slot, entry.prompt[begin:end], begin))
-        self.passes += 1
-        self.packed_segments += len(segments)
+        g.prefill_passes += 1
+        g.prefill_segments += len(segments)
         done: list[tuple[int, Generation | Exception]] = []
         try:
             logits = g.fast.prefill_packed(segments)

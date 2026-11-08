@@ -138,6 +138,32 @@ def test_verify_matches_decode_and_snapshots(two: tp.TPModel) -> None:
         two.reset(s)
 
 
+def test_launched_steps_match_synchronous_ones(two: tp.TPModel) -> None:
+    """``launch_verify``/``launch_decode`` drive both ranks and return ``verify``'s picks and
+    ``decode``'s argmax (the server's lookahead uses them under ENGINE_TP=2)."""
+    prompt = PROMPTS[1]
+    last = int(_prefill(two, 0, prompt).argmax())
+    snap = two.snapshot(0, len(prompt))
+    want = int(two.decode([last], [0], [len(prompt)])[0].argmax())
+    two.reset(1)
+    two.restore(snap, 1)
+    launched = two.launch_decode([last], [1], [len(prompt)])
+    assert launched.result() == [[want]]
+    for slot in (2, 3):
+        two.reset(slot)
+        two.restore(snap, slot)
+    draft = (want + 1) % two.vocab
+    _, g1, g2, d1, d2 = two.verify([last, last], [want, draft], [2, 3], [len(prompt)] * 2)
+    for slot in (2, 3):
+        two.reset(slot)
+        two.restore(snap, slot)
+    rows = two.launch_verify([last, last], [want, draft], [2, 3], [len(prompt)] * 2).result()
+    assert rows == [g1, d1, g2, d2]
+    two.release(snap)
+    for s in range(4):
+        two.reset(s)
+
+
 def test_argmax_ties_go_to_the_lowest_index() -> None:
     group = tp.Group(CPU)
     group.start()

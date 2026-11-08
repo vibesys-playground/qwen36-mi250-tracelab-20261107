@@ -51,6 +51,20 @@ SCORE_BUDGET = 1 << 30
 CONV_BUCKET = 256
 
 
+class LaunchedStep:
+    """A decode step queued on the devices (``FastModel.launch_verify``/``launch_decode``):
+    its picks are copied to ``host`` as it ends; ``result`` waits for them."""
+
+    def __init__(self, host: torch.Tensor, event: torch.cuda.Event | None) -> None:
+        self.host = host
+        self.event = event
+
+    def result(self) -> list[list[int]]:
+        if self.event is not None:
+            self.event.synchronize()  # releases the GIL while the devices work
+        return self.host.tolist()
+
+
 class FastPathUnavailable(RuntimeError):
     """The loaded model is not one this forward implements."""
 
@@ -418,6 +432,11 @@ class FastModel:
                     self.fused_error = f"{type(exc).__name__}: {exc}"
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
+        # Launched steps (``ENGINE_LOOKAHEAD``) stage their inputs and page-table rows in
+        # pinned memory, so no host-to-device copy waits for the step before it.
+        from engine.generator import lookahead_enabled
+
+        self.pin_uploads = all(d.type == "cuda" for d in self.devices) and lookahead_enabled()
 
     # ---------------------------------------------------------------- setup
 
@@ -494,9 +513,12 @@ class FastModel:
         pages = self.slot_pages[slot]
         if pages:
             row[: len(pages)] = torch.tensor(pages, dtype=torch.int32)
+        pinned = getattr(self, "pin_uploads", False)
+        if pinned:
+            row = row.pin_memory()
         for model in [self, *self._peers]:
             for meta in model.devices.values():
-                meta.page_table[slot].copy_(row)
+                meta.page_table[slot].copy_(row, non_blocking=pinned)
 
     def _ensure_pages(self, slot: int, length: int) -> None:
         """Give ``slot`` pages for its first ``length`` tokens."""
@@ -1433,6 +1455,92 @@ class FastModel:
             meta.packed.copy_(host)
         x, _ = self._run(self.segments, size, size)
         return x[:batch]
+
+    # ---------------------------------------------------------------- launched steps
+
+    def _upload(self, host: torch.Tensor) -> None:
+        """Copy one step's ``[4, rows]`` inputs to every device without blocking the host.
+
+        On GPUs the buffer is pinned first, so the copies are asynchronous and stream
+        ordered (the caching host allocator keeps it until they complete).
+        """
+        if self.pin_uploads:
+            host = host.pin_memory()
+        for meta in self.devices.values():
+            meta.packed.copy_(host, non_blocking=self.pin_uploads)
+
+    @staticmethod
+    def _read_later(ids: torch.Tensor) -> LaunchedStep:
+        """Start copying a small integer result to host memory; ``LaunchedStep.result`` waits."""
+        if ids.device.type != "cuda":
+            return LaunchedStep(ids.clone(), None)
+        host = torch.empty(ids.shape, dtype=ids.dtype, pin_memory=True)
+        with torch.cuda.device(ids.device):
+            host.copy_(ids, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(ids.device))
+        return LaunchedStep(host, event)
+
+    @torch.inference_mode()
+    def launch_verify(
+        self,
+        tokens: Sequence[int],
+        drafts: Sequence[int],
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> LaunchedStep:
+        """``verify`` without waiting for it: the step is queued on the devices and its picks
+        are copied to host memory as it ends. ``result()`` of the returned step is
+        ``[g1, d1, g2, d2]`` (one list each, as ``verify`` returns them). Only the picks
+        are kept: the step's logits are overwritten by the next one, so every request in
+        it must take its token from ``g1`` (greedy, see ``engine.speculative.eligible``).
+        """
+        if self.mtp is None:
+            raise RuntimeError("verify needs the MTP head")
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            self._ensure_pages(slot, position + 2)
+        size = self.bucket(batch) if self.use_graphs else batch
+        rows = 2 * size
+        host = torch.zeros((4, self._rows), dtype=torch.long)
+        host[1].fill_(self.dummy)
+        host[3].fill_(self.dummy)
+        host[3, size:rows] = self.dummy + self.gdn_rows
+        cur = [self._g(s) for s in slots]
+        other = [s + (1 - self.bank[s]) * self.gdn_rows for s in slots]
+        for half, toks, pos, states in (
+            (0, tokens, positions, cur),
+            (size, drafts, [p + 1 for p in positions], other),
+        ):
+            host[0, half : half + batch] = torch.tensor(list(toks), dtype=torch.long)
+            host[1, half : half + batch] = torch.tensor(list(slots), dtype=torch.long)
+            host[2, half : half + batch] = torch.tensor(list(pos), dtype=torch.long)
+            host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
+        self._upload(host)
+        _, out = self._run(self.vsegments, size, rows, verify=True)
+        # Rows: picks then drafts after each first token, then after each draft.
+        return self._read_later(torch.cat((out[:, :batch], out[:, size : size + batch])))
+
+    @torch.inference_mode()
+    def launch_decode(
+        self, tokens: Sequence[int], slots: Sequence[int], positions: Sequence[int]
+    ) -> LaunchedStep:
+        """``decode`` without waiting for it, for greedy requests only: ``result()`` is
+        ``[picks]``, the argmax of each row's logits (which are not kept)."""
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            self._ensure_pages(slot, position + 1)
+        size = self.bucket(batch) if self.use_graphs else batch
+        host = torch.zeros((4, self._rows), dtype=torch.long)
+        host[1].fill_(self.dummy)
+        host[3].fill_(self.dummy)
+        host[0, :batch] = torch.tensor(list(tokens), dtype=torch.long)
+        host[1, :batch] = torch.tensor(list(slots), dtype=torch.long)
+        host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
+        host[3, :batch] = torch.tensor([self._g(s) for s in slots], dtype=torch.long)
+        self._upload(host)
+        x, _ = self._run(self.segments, size, size)
+        return self._read_later(torch.argmax(x[:batch], dim=-1).unsqueeze(0))
 
     def capture(self, size: int, verify: bool = False) -> None:
         """Capture every segment's graph for batch ``size``; on failure record why and run eagerly.

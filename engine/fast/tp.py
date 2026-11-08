@@ -40,6 +40,7 @@ The all-reduce (``Group.allreduce``):
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import copy
 import ctypes
 import math
@@ -867,6 +868,83 @@ class TPModel:
         picks = out.cpu().tolist()
         g, d = picks[0], picks[1]
         return logits, g[:batch], g[size : size + batch], d[:batch], d[size : size + batch]
+
+    # ------------------------------------------------------------ launched steps
+
+    def _upload(self, host: torch.Tensor) -> None:
+        """``_load_inputs`` without blocking the host (``FastModel._upload``): one pinned
+        buffer, copied to both ranks stream-ordered."""
+        r0 = self.ranks[0]
+        if not r0.pin_uploads:
+            self._load_inputs(host)
+            return
+        host = host.pin_memory()
+        for model in self.ranks:
+            for meta in model.devices.values():
+                meta.packed.copy_(host, non_blocking=True)
+
+    @torch.inference_mode()
+    def launch_verify(
+        self,
+        tokens: Sequence[int],
+        drafts: Sequence[int],
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> Any:
+        """``FastModel.launch_verify`` over both ranks: both graphs are queued, rank 0's
+        combined picks are copied to pinned host memory as the step ends."""
+        r0 = self.ranks[0]
+        if r0.mtp is None:
+            raise RuntimeError("verify needs the MTP head")
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            r0._ensure_pages(slot, position + 2)
+        size = r0.bucket(batch) if r0.use_graphs else batch
+        rows = 2 * size
+        host = torch.zeros((4, r0._rows), dtype=torch.long)
+        host[1].fill_(r0.dummy)
+        host[3].fill_(r0.dummy)
+        host[3, size:rows] = r0.dummy + r0.gdn_rows
+        cur = [r0._g(s) for s in slots]
+        other = [s + (1 - r0.bank[s]) * r0.gdn_rows for s in slots]
+        for half, toks, pos, states in (
+            (0, tokens, positions, cur),
+            (size, drafts, [p + 1 for p in positions], other),
+        ):
+            host[0, half : half + batch] = torch.tensor(list(toks), dtype=torch.long)
+            host[1, half : half + batch] = torch.tensor(list(slots), dtype=torch.long)
+            host[2, half : half + batch] = torch.tensor(list(pos), dtype=torch.long)
+            host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
+        self._upload(host)
+        _, out = self._run(size, rows, verify=True)
+        with torch.cuda.device(out.device) if out.device.type == "cuda" else contextlib.nullcontext():
+            picks = torch.cat((out[:, :batch], out[:, size : size + batch]))
+        return FastModel._read_later(picks)
+
+    @torch.inference_mode()
+    def launch_decode(
+        self, tokens: Sequence[int], slots: Sequence[int], positions: Sequence[int]
+    ) -> Any:
+        """``FastModel.launch_decode`` over both ranks: the argmax of the gathered logits."""
+        r0 = self.ranks[0]
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            r0._ensure_pages(slot, position + 1)
+        size = r0.bucket(batch) if r0.use_graphs else batch
+        host = torch.zeros((4, r0._rows), dtype=torch.long)
+        host[1].fill_(r0.dummy)
+        host[3].fill_(r0.dummy)
+        host[0, :batch] = torch.tensor(list(tokens), dtype=torch.long)
+        host[1, :batch] = torch.tensor(list(slots), dtype=torch.long)
+        host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
+        host[3, :batch] = torch.tensor([r0._g(s) for s in slots], dtype=torch.long)
+        self._upload(host)
+        outs, _ = self._run(size, size, verify=False)
+        dev = outs[0].device
+        with torch.cuda.device(dev) if dev.type == "cuda" else contextlib.nullcontext():
+            logits = self._gather([o[:batch] for o in outs])
+            picks = torch.argmax(logits, dim=-1).unsqueeze(0)
+        return FastModel._read_later(picks)
 
     # ------------------------------------------------------------ graphs
 

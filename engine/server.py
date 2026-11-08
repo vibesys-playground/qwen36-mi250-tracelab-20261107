@@ -18,11 +18,32 @@ change it), this process instead becomes the front of ``engine.router``: it
 starts each replica as this same server on its own devices and routes every
 request to one of them, keeping a session on one replica. With one GPU, none,
 or ``--replicas 1``, it serves in-process as described above.
+
+With ``ENGINE_ZERO_SYNC`` on (the default; "0" turns it off) the worker thread
+does no text work for requests without stop strings: a job yields a ``Render``
+per token, and the connection thread that streams the response detokenizes the
+token and builds its chunk, while the worker runs the next decode step. Such a
+request's end depends on token ids alone (length, end of sequence), which the
+worker still decides; the text and chunks are the same as when the worker
+renders them. Requests with stop strings, whose end depends on the text, are
+rendered on the worker as before.
+
+With ``ENGINE_LOOKAHEAD`` on (the default; "0" turns it off) a fast-path decode
+step whose requests are all greedy is launched without waiting
+(``Generator.launch``) and collected at the top of the next loop, before new
+jobs are admitted, so a prefill still runs right after the step in flight.
+When the collected step leaves every one of its requests needing another step
+after the tokens it picked (known from the token ids: length, end of sequence;
+never for requests with stop strings) and no request joins, the next step is
+launched from those picks at once, and the jobs take their tokens while it
+runs (one-step lookahead). The batch, the inputs and the order of steps are the
+ones the synchronous loop runs, so outputs and session tails do not change.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import queue
@@ -35,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from engine import experts, protocol, router
-from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
+from engine.generator import CHECKPOINT, Generation, Generator, Launched, PackedPrefill, Step
 from engine.protocol import (
     ChatRequest,
     CompletionRequest,
@@ -64,6 +85,14 @@ class Prefill:
     sampling: Sampling
 
 
+@dataclass(frozen=True)
+class Render:
+    """Yielded by a job in place of a response event: the connection thread calls ``make``
+    in order, and sends what it returns (None: nothing to send for this token)."""
+
+    make: Callable[[], dict[str, Any] | None]
+
+
 @dataclass
 class Job:
     """A request handed to the worker; the worker answers on ``events``.
@@ -90,6 +119,8 @@ class Worker:
     chunk of each waiting prompt, hands the prompts that finished to decoding,
     and runs one decode step for every running job. Otherwise each new job is
     prefilled alone (``Generator.start``) before the decode step, as before.
+    With ``ENGINE_LOOKAHEAD`` the decode step may be in flight across loops
+    (see the module doc).
     """
 
     def __init__(self, generator: Generator) -> None:
@@ -145,8 +176,22 @@ class Worker:
         g = self._generator
         packer = PackedPrefill(g) if g.packing else None
         prefilling: dict[int, tuple[Job, Iterator[Any]]] = {}
-        running: list[tuple[Job, Iterator[Any]]] = []
+        running: list[tuple[Job, Iterator[Any], Generation]] = []
+        # A decode step launched without waiting (``Generator.launch``), collected next loop.
+        launched: Launched | None = None
         while True:
+            # The step in flight ends first, so a job arriving meanwhile is prefilled right
+            # after it, as when the step ran synchronously.
+            collected: Launched | None = None
+            if launched is not None:
+                collected, launched = launched, None
+                try:
+                    g.collect(collected)
+                except Exception as exc:  # the step failed for every request in it
+                    for job, _, _ in running:
+                        job.events.put(_internal(exc))
+                        job.events.put(_DONE)
+                    running, collected = [], None
             block = not running and not prefilling
             ready: list[tuple[Job, Iterator[Any], Generation]] = []
             serial: list[tuple[Job, Iterator[Any], Prefill]] = []
@@ -176,8 +221,28 @@ class Worker:
                             self._fail(job, events, result)
                         else:
                             ready.append((job, events, result))
+            # One-step lookahead: when the step just collected leaves every one of its
+            # requests needing another step (judged on the token ids it picked) and no
+            # request joins, the next step is launched from those picks now, and the
+            # tokens are handed to the jobs (text, chunks, events) while it runs.
+            ahead = (
+                collected is not None
+                and not ready
+                and not serial
+                and [gen for _, _, gen in running] == collected.generations
+                and all(gen.runs_past_picked() for gen in collected.generations)
+                and g.launchable(collected.generations)
+            )
+            if ahead:
+                try:
+                    launched = g.launch(collected.generations, ahead=True)
+                except Exception as exc:  # the step failed for every request in it
+                    for job, _, _ in running:
+                        job.events.put(_internal(exc))
+                        job.events.put(_DONE)
+                    running, ahead = [], False
             waiting = []
-            for job, events in running:
+            for job, events, _ in running:
                 want = self._advance_all(job, events)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
@@ -196,11 +261,13 @@ class Worker:
                 want = self._advance_all(job, events, generation)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
-            running = [(job, events) for job, events, _ in waiting]
-            if not waiting:
+            running = waiting
+            if ahead or not waiting:
+                # Ahead: the launched step holds exactly these requests (a job cancelled
+                # meanwhile rides along; the next loop sees the batch changed).
                 continue
             try:
-                g.decode([generation for _, _, generation in waiting])
+                launched = g.launch([generation for _, _, generation in waiting])
             except Exception as exc:  # the step failed for every request in it
                 for job, _, _ in waiting:
                     job.events.put(_internal(exc))
@@ -211,11 +278,14 @@ class Worker:
 class _Output:
     """Splits generated tokens into reasoning and content text, with stop strings applied."""
 
-    def __init__(self, generator: Generator, stops: tuple[str, ...], thinking: bool) -> None:
+    def __init__(
+        self, generator: Generator, stops: tuple[str, ...], thinking: bool, tokenizer: Any = None
+    ) -> None:
         self._generator = generator
+        self._tokenizer = tokenizer if tokenizer is not None else generator.tokenizer
         self._stops = stops
         self.in_reasoning = thinking
-        self._detok = Detokenizer(generator.tokenizer)
+        self._detok = Detokenizer(self._tokenizer)
         self._matcher = StopMatcher(stops)
         self.content: list[str] = []
         self.reasoning: list[str] = []
@@ -232,7 +302,7 @@ class _Output:
             tail = self._detok.flush()
             self.reasoning.append(tail)
             self.in_reasoning = False
-            self._detok = Detokenizer(self._generator.tokenizer)
+            self._detok = Detokenizer(self._tokenizer)
             return tail, ""
         text = self._detok.push(step.token_id)
         if self.in_reasoning:
@@ -252,17 +322,46 @@ class _Output:
         return "", out
 
 
+def _deferred(generator: Generator, sampling: Sampling) -> bool:
+    """Whether a request's text is rendered on its connection thread (see the module doc)."""
+    return generator.zero_sync and not sampling.stop
+
+
+def _output(generator: Generator, sampling: Sampling, thinking: bool) -> _Output:
+    tokenizer = generator.text_tokenizer if _deferred(generator, sampling) else None
+    return _Output(generator, sampling.stop, thinking, tokenizer)
+
+
+def _render(
+    output: _Output, step: Step, finish: protocol.FinishReason | None
+) -> tuple[str, str]:
+    """(reasoning delta, content delta) of one step of a request without stop strings."""
+    reasoning, content = output.push(step)
+    if finish is not None:
+        r_tail, c_tail = output.flush()
+        return reasoning + r_tail, content + c_tail
+    return reasoning, content
+
+
 def _run(
-    generation: Generation, output: _Output, usage: Usage
+    generation: Generation, output: _Output, usage: Usage, defer: bool = False
 ) -> Iterator[tuple[Step, str, str, protocol.FinishReason | None]]:
     """Yield (step, reasoning delta, content delta, finish) per token until the request ends.
 
     The caller yields ``AwaitDecode`` after each unfinished step, so the worker
-    has decoded the token before this generator resumes.
+    has decoded the token before this generator resumes. With ``defer`` the
+    text is not rendered here (both deltas are empty; see ``_render``).
     """
     while True:
         step = generation.next_step()
         usage.completion_tokens += int(step.emit)
+        if defer:
+            if step.finish is not None:
+                generation.retire()
+                yield step, "", "", step.finish
+                return
+            yield step, "", "", None
+            continue
         reasoning, content = output.push(step)
         finish = "stop" if output.stopped else step.finish
         if finish is not None:
@@ -275,7 +374,7 @@ def _run(
 
 def completion_job(
     generator: Generator, model: str, request: CompletionRequest
-) -> Iterator[dict[str, Any] | AwaitDecode]:
+) -> Iterator[dict[str, Any] | AwaitDecode | Render]:
     """Events for ``/v1/completions``: chunks when streaming, else one response."""
     prompt = (
         generator.encode_text(request.prompt) if isinstance(request.prompt, str) else request.prompt
@@ -283,73 +382,92 @@ def completion_job(
     generation = yield Prefill(prompt, request.sampling)
     env = Envelope(model=model, kind="text_completion")
     usage = Usage(prompt_tokens=len(prompt), cached_tokens=generation.cached_tokens)
-    output = _Output(generator, request.sampling.stop, thinking=False)
+    output = _output(generator, request.sampling, thinking=False)
+    defer = _deferred(generator, request.sampling)
     token_ids: list[int] = []
     finish: protocol.FinishReason = "length"
-    for step, _, text, finish_now in _run(generation, output, usage):
+
+    def chunk(step: Step, text: str, finish_now: protocol.FinishReason | None) -> dict[str, Any]:
+        return protocol.completion_chunk(
+            env, text, step.token_id if step.emit else None, finish_now, request.return_token_ids
+        )
+
+    def render(step: Step, finish_now: protocol.FinishReason | None) -> dict[str, Any] | None:
+        _, text = _render(output, step, finish_now)
+        return chunk(step, text, finish_now) if request.stream else None
+
+    for step, _, text, finish_now in _run(generation, output, usage, defer):
         if step.emit:
             token_ids.append(step.token_id)
-        if request.stream:
-            yield protocol.completion_chunk(
-                env,
-                text,
-                step.token_id if step.emit else None,
-                finish_now,
-                request.return_token_ids,
-            )
+        if defer:
+            yield Render(functools.partial(render, step, finish_now))
+        elif request.stream:
+            yield chunk(step, text, finish_now)
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
     if request.stream:
         if request.include_usage:
             yield protocol.usage_chunk(env, usage)
-    else:
-        yield protocol.completion_response(
+        return
+
+    def response(finish: protocol.FinishReason) -> dict[str, Any]:
+        return protocol.completion_response(
             env, "".join(output.content), token_ids, finish, usage, request.return_token_ids
         )
+
+    yield Render(functools.partial(response, finish)) if defer else response(finish)
 
 
 def chat_job(
     generator: Generator, model: str, request: ChatRequest
-) -> Iterator[dict[str, Any] | AwaitDecode]:
+) -> Iterator[dict[str, Any] | AwaitDecode | Render]:
     """Events for ``/v1/chat/completions``; reasoning streams as ``reasoning_content``."""
     prompt = generator.encode_chat(request)
     generation = yield Prefill(prompt, request.sampling)
     env = Envelope(model=model, kind="chat.completion")
     usage = Usage(prompt_tokens=len(prompt), cached_tokens=generation.cached_tokens)
-    output = _Output(generator, request.sampling.stop, thinking=request.thinking)
+    output = _output(generator, request.sampling, thinking=request.thinking)
+    defer = _deferred(generator, request.sampling)
     token_ids: list[int] = []
     finish: protocol.FinishReason = "length"
     if request.stream:
         yield protocol.chat_chunk(
             env, {"role": "assistant", "content": ""}, None, None, request.return_token_ids
         )
-    for step, reasoning, content, finish_now in _run(generation, output, usage):
+
+    def chunk(
+        step: Step, reasoning: str, content: str, finish_now: protocol.FinishReason | None
+    ) -> dict[str, Any]:
+        delta: dict[str, Any] = {"content": content}
+        if reasoning:
+            delta = {"reasoning_content": reasoning, **({"content": content} if content else {})}
+        return protocol.chat_chunk(
+            env, delta, step.token_id if step.emit else None, finish_now, request.return_token_ids
+        )
+
+    def render(step: Step, finish_now: protocol.FinishReason | None) -> dict[str, Any] | None:
+        reasoning, content = _render(output, step, finish_now)
+        return chunk(step, reasoning, content, finish_now) if request.stream else None
+
+    for step, reasoning, content, finish_now in _run(generation, output, usage, defer):
         if step.emit:
             token_ids.append(step.token_id)
-        if request.stream:
-            delta: dict[str, Any] = {"content": content}
-            if reasoning:
-                delta = {
-                    "reasoning_content": reasoning,
-                    **({"content": content} if content else {}),
-                }
-            yield protocol.chat_chunk(
-                env,
-                delta,
-                step.token_id if step.emit else None,
-                finish_now,
-                request.return_token_ids,
-            )
+        if defer:
+            yield Render(functools.partial(render, step, finish_now))
+        elif request.stream:
+            yield chunk(step, reasoning, content, finish_now)
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
     if request.stream:
         if request.include_usage:
             yield protocol.usage_chunk(env, usage)
-    else:
+        return
+
+    def response(finish: protocol.FinishReason) -> dict[str, Any]:
         reasoning_text = "".join(output.reasoning) if request.thinking else None
-        yield protocol.chat_response(
+        return protocol.chat_response(
             env,
             "".join(output.content),
             reasoning_text,
@@ -358,6 +476,8 @@ def chat_job(
             usage,
             request.return_token_ids,
         )
+
+    yield Render(functools.partial(response, finish)) if defer else response(finish)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -414,8 +534,22 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.worker.submit(job)
         self._respond(job, stream=request.stream)
 
+    @staticmethod
+    def _next(job: Job) -> Any:
+        """The job's next event, with ``Render`` events made here (on this connection thread)."""
+        while True:
+            event = job.events.get()
+            if not isinstance(event, Render):
+                return event
+            try:
+                made = event.make()
+            except Exception as exc:  # noqa: BLE001 - reported to this request's client
+                return _internal(exc)
+            if made is not None:
+                return made
+
     def _respond(self, job: Job, *, stream: bool) -> None:
-        first = job.events.get()
+        first = self._next(job)
         if isinstance(first, RequestError):
             self._send_json(first.status, protocol.error_body(str(first), first.status))
             self._drain(job)
@@ -439,7 +573,7 @@ class _Handler(BaseHTTPRequestHandler):
                     payload = event
                 self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
                 self.wfile.flush()
-                event = job.events.get()
+                event = self._next(job)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except OSError:  # the client went away: stop generating for it
@@ -459,6 +593,10 @@ class _Server(ThreadingHTTPServer):
         super().__init__(address, _Handler)
         self.generator = generator
         self.model_name = model_name
+        if generator.zero_sync:
+            # Connection threads render text while the worker waits on the device; hand the
+            # GIL back to the worker sooner than the default 5 ms once its wait ends.
+            sys.setswitchinterval(0.0005)
         self.worker = Worker(generator)
 
 

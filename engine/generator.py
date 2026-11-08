@@ -33,6 +33,24 @@ references); the default is the fast path when a GPU is visible. There a
 session tail is the finished request's slot state itself: its KV pages are
 moved (not copied) into the tail entry and its Gated DeltaNet states cloned,
 and the next round adopts those pages into its own slot.
+
+Token selection (``ENGINE_ZERO_SYNC``, on unless "0"): after each decode step
+the next token of every request that is greedy at that step (temperature 0 and
+no end-of-sequence masking for ``min_tokens``) is picked by one ``argmax`` over
+the whole batch on the device and read back with one copy into pinned host
+memory, instead of one argmax and one blocking ``int()`` per request on a
+cloned logits row. ``torch.argmax`` over the batch returns the same index as
+over each row alone (the first maximum), so greedy outputs do not change.
+Sampled requests keep their cloned row and ``pick``.
+
+Launched steps (``ENGINE_LOOKAHEAD``, on unless "0"): on the fast path, a decode
+step whose requests are all greedy can be queued without waiting (``launch``):
+its inputs are staged in pinned memory and copied without blocking, and only
+its picks (a verify step's two picks and two drafts per request, or a plain
+step's argmax) are copied back, into pinned memory, as it ends. ``collect``
+waits for them and applies them exactly as the synchronous step does
+(``speculative.apply``). A request with a launched step still in flight keeps
+no session tail (the server never lets that happen; see ``engine.server``).
 """
 
 from __future__ import annotations
@@ -40,6 +58,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -53,6 +72,21 @@ from engine import batching, experts, gdn, speculative
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
+
+
+def lookahead_enabled(setting: str | None = None) -> bool:
+    """``ENGINE_LOOKAHEAD``: decode steps queued without waiting (``Generator.launch``) and
+    the server's one-step lookahead (``engine.server.Worker``); on unless "0"."""
+    if setting is None:
+        setting = os.environ.get("ENGINE_LOOKAHEAD")
+    return (setting or "1").strip() != "0"
+
+
+def zero_sync_enabled(setting: str | None = None) -> bool:
+    """``ENGINE_ZERO_SYNC``: batched on-device greedy picks and off-thread text; on unless "0"."""
+    if setting is None:
+        setting = os.environ.get("ENGINE_ZERO_SYNC")
+    return (setting or "1").strip() != "0"
 
 
 def experts_implementation(hip_version: str | None) -> str | None:
@@ -385,6 +419,8 @@ class Generation:
         self._max_tokens = max_tokens
         self._count = 0
         self.last_token: int | None = None
+        # The next token when ``Generator.decode`` already picked it on the device (greedy).
+        self.next_token: int | None = None
         self.done = False
         self.slot = slot
         self._ended_slot: int | None = None  # the slot ``finished`` queued, until ``retire``
@@ -398,6 +434,9 @@ class Generation:
         self.queue: list[int] = []
         self.draft = 0
         self.flipped = False
+        # Launched decode steps (``Generator.launch``) that include this request and have not
+        # been collected yet; its slot state is then ahead of what the host has seen.
+        self.inflight = 0
         if slot is not None:
             # A request dropped before it ends (a client gone) gives its slot back when collected.
             self._finalizer = weakref.finalize(self, generator._released.append, slot)
@@ -410,6 +449,8 @@ class Generation:
         g = self._generator
         if self.queue:  # picked by a verify step: the argmax ``pick`` would return
             token = self.queue.pop(0)
+        elif self.next_token is not None:  # picked on the device by a batched greedy argmax
+            token, self.next_token = self.next_token, None
         else:
             token = g.pick(self.logits, self._sampling, self._count, self._rng)
         self._count += 1
@@ -424,6 +465,33 @@ class Generation:
         if self.done:
             g.finished(self)
         return Step(token, emit=True, finish=finish)
+
+    def feed_token(self) -> int | None:
+        """The token the next decode step feeds: the last one picked, taken or not."""
+        if self.queue:
+            return self.queue[-1]
+        if self.next_token is not None:
+            return self.next_token
+        return self.last_token
+
+    def runs_past_picked(self) -> bool:
+        """Whether this request needs another decode step after taking every token already
+        picked for it (a verify step's queue, or a batched greedy pick), judged on token ids
+        alone, so that step can be launched before those tokens are taken. False when none
+        is picked, and for requests with stop strings, whose end depends on their text."""
+        picked = list(self.queue)
+        if self.next_token is not None:
+            picked.append(self.next_token)
+        if not picked or self._sampling.stop or self.slot is None:
+            return False
+        count = self._count
+        for token in picked:
+            count += 1
+            if token in self._generator.eos_ids and not self._sampling.ignore_eos:
+                return False
+            if count >= self._max_tokens:
+                return False
+        return True
 
     def has_queued(self) -> bool:
         """Whether the next token is already picked (the server takes it without a decode)."""
@@ -447,7 +515,9 @@ class Generation:
             # The slot still holds the state (``finished`` only queues it for the reset).
             slot = self.slot if self.slot is not None else self._ended_slot
             speculative.settle(g, self, slot)
-            if slot is not None and self._prompt and self._picked:
+            # A launched step still running for this request (never, by the server's rule for
+            # launching ahead) would leave the slot past ``key``: keep no tail then.
+            if slot is not None and self._prompt and self._picked and not self.inflight:
                 key = self._prompt + tuple(self._picked[:-1])
                 if len(key) == self.length:
                     g.keep_tail_fast(key, slot)
@@ -514,6 +584,26 @@ class Generator:
         self.verify_steps = 0
         self.mtp_proposed = 0
         self.mtp_accepted = 0
+        # Launched decode steps and the server's one-step lookahead (``ENGINE_LOOKAHEAD``).
+        self.lookahead = fast is not None and lookahead_enabled()
+        self.launched_steps = 0
+        self.lookahead_steps = 0
+        # Batched device-side greedy picks (``ENGINE_ZERO_SYNC``) and their pinned readback buffers.
+        self.zero_sync = zero_sync_enabled()
+        self._readback: dict[torch.device, tuple[torch.Tensor, Any]] = {}
+        # Step timing, shown on /health: the time between consecutive decode steps of a busy
+        # loop (wall per step) and, with zero sync, the part spent waiting for the device.
+        self.decode_intervals = 0
+        self.decode_interval_s = 0.0
+        self.decode_wait_s = 0.0
+        self._last_decode: float | None = None
+        # Connection threads detokenize with their own copy, which only ever decodes.
+        self.text_tokenizer = tokenizer
+        if self.zero_sync:
+            try:
+                self.text_tokenizer = copy.deepcopy(tokenizer)
+            except Exception:  # noqa: BLE001 - decoding is read-only; sharing also works
+                pass
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -730,6 +820,13 @@ class Generator:
             "prefix_cache_entries": len(pc),
             "prefix_cache_bytes": pc.bytes,
             "prefix_cache_evictions": pc.evictions,
+            "zero_sync": int(self.zero_sync),
+            "lookahead": int(self.lookahead),
+            "launched_steps": self.launched_steps,
+            "lookahead_steps": self.lookahead_steps,
+            "decode_intervals": self.decode_intervals,
+            "decode_interval_ms": round(self.decode_interval_s * 1e3, 1),
+            "decode_wait_ms": round(self.decode_wait_s * 1e3, 1),
         }
 
     # ---------------------------------------------------------------- fast path
@@ -829,9 +926,63 @@ class Generator:
             [g.slot for g in generations],
             [g.length for g in generations],
         )
-        for g, row in zip(generations, logits, strict=True):
-            g.logits = row.clone()
+        for g in generations:
             g.length += 1
+        self._select(generations, logits, clone=True)
+
+    def _greedy_now(self, generation: Generation) -> bool:
+        """Whether ``pick`` would take a plain argmax for this request's next token."""
+        s = getattr(generation, "_sampling", None)  # None: a warmup stand-in, never picked
+        if s is None or s.temperature != 0.0:
+            return False
+        return s.ignore_eos or generation._count >= s.min_tokens or not self.eos_ids
+
+    def _select(self, generations: list[Generation], logits: torch.Tensor, *, clone: bool) -> None:
+        """Hand each generation its next logits row; with zero sync, also pick greedy tokens.
+
+        ``logits`` is [batch, vocab]; ``clone`` copies the rows a later ``pick``
+        reads (the fast path returns a graph's static output, overwritten by the
+        next step). Rows of requests picked here are left as views.
+        """
+        if not self.zero_sync:
+            for g, row in zip(generations, logits, strict=True):
+                g.logits = row.clone() if clone else row
+            return
+        greedy = []
+        for i, (g, row) in enumerate(zip(generations, logits, strict=True)):
+            if self._greedy_now(g):
+                greedy.append(i)
+                g.logits = row
+            else:
+                g.logits = row.clone() if clone else row
+        if not greedy:
+            return
+        rows = logits
+        if len(greedy) != len(generations):
+            rows = logits.index_select(0, torch.tensor(greedy, device=logits.device))
+        tokens = self._read_ids(torch.argmax(rows, dim=-1))
+        for i, token in zip(greedy, tokens, strict=True):
+            generations[i].next_token = token
+
+    def _read_ids(self, ids: torch.Tensor) -> list[int]:
+        """``ids.tolist()`` through one non-blocking copy into a reused pinned buffer."""
+        dev = ids.device
+        if dev.type != "cuda":
+            return ids.tolist()
+        n = ids.numel()
+        buf, event = self._readback.get(dev, (None, None))
+        if buf is None or buf.numel() < n:
+            buf = torch.empty(max(n, 64), dtype=ids.dtype, pin_memory=True)
+            event = torch.cuda.Event()
+            self._readback[dev] = (buf, event)
+        out = buf[:n]
+        with torch.cuda.device(dev):
+            out.copy_(ids, non_blocking=True)
+            event.record(torch.cuda.current_stream(dev))
+        start = time.perf_counter()
+        event.synchronize()  # releases the GIL: connection threads render text meanwhile
+        self.decode_wait_s += time.perf_counter() - start
+        return out.tolist()
 
     def decode(self, generations: list[Generation]) -> None:
         """Feed each generation's last token in one forward pass and store its next logits.
@@ -840,16 +991,15 @@ class Generator:
         batch: left-padded attention keys and values, a padding mask, and each
         request's own position.
         """
-        self.decode_steps += 1
-        self.decoded_tokens += len(generations)
-        self.largest_batch = max(self.largest_batch, len(generations))
+        self._count_step(generations)
         if self.fast is not None:
             self._decode_fast(generations)
             return
         with torch.inference_mode():
             if len(generations) == 1:
                 g = generations[0]
-                g.logits = self.forward([g.last_token], g.cache)
+                logits = self.forward([g.last_token], g.cache)
+                self._select(generations, logits.unsqueeze(0), clone=False)
                 return
             merged, lengths = batching.merge([g.cache for g in generations])
             out = self.model(
@@ -861,11 +1011,84 @@ class Generator:
                 logits_to_keep=1,
             )
             logits = out.logits[:, -1].float()
-            for g, cache, row in zip(
-                generations, batching.split(merged, lengths), logits, strict=True
-            ):
+            for g, cache in zip(generations, batching.split(merged, lengths), strict=True):
                 g.cache = cache
-                g.logits = row
+            self._select(generations, logits, clone=False)
+
+    def _count_step(self, generations: list[Generation]) -> None:
+        self.decode_steps += 1
+        self.decoded_tokens += len(generations)
+        self.largest_batch = max(self.largest_batch, len(generations))
+        now = time.perf_counter()
+        if self._last_decode is not None and now - self._last_decode < 1.0:
+            self.decode_intervals += 1
+            self.decode_interval_s += now - self._last_decode
+        self._last_decode = now
+
+    # ---------------------------------------------------------------- launched steps
+
+    def launchable(self, generations: list[Generation]) -> bool:
+        """Whether one decode step for ``generations`` can be launched without waiting for it
+        (``launch``): the fast path with ``ENGINE_LOOKAHEAD`` on, and every request greedy
+        (``speculative.eligible``; with the MTP head, every one speculating), so its next
+        tokens are the step's argmax picks and its logits need not be kept."""
+        if not self.lookahead or not generations:
+            return False
+        mtp = self.fast.mtp is not None
+        return all(
+            g.slot is not None
+            and speculative.eligible(g._sampling)
+            and (g.speculates or not mtp)
+            for g in generations
+        )
+
+    def launch(self, generations: list[Generation], ahead: bool = False) -> Launched | None:
+        """Run one decode step for ``generations``; with ``launchable`` ones, only queue it.
+
+        Each request feeds its last picked token (``Generation.feed_token``):
+        normally the one it just took; ``ahead`` (the server's lookahead), the
+        last one a collected step picked for it, before the request takes it.
+        Returns the queued step, which ``collect`` finishes, or None when the
+        step ran here as ``decode``.
+        """
+        if not self.launchable(generations):
+            self.decode(generations)
+            return None
+        self._count_step(generations)
+        self.launched_steps += 1
+        self.lookahead_steps += int(ahead)
+        fast = self.fast
+        tokens = [g.feed_token() for g in generations]
+        slots = [g.slot for g in generations]
+        lengths = [g.length for g in generations]
+        if fast.mtp is not None:
+            step = fast.launch_verify(tokens, [g.draft for g in generations], slots, lengths)
+        else:
+            step = fast.launch_decode(tokens, slots, lengths)
+            for g in generations:
+                g.length += 1
+        for g in generations:
+            g.inflight += 1
+        return Launched(list(generations), step, fast.mtp is not None)
+
+    def collect(self, launched: Launched) -> None:
+        """Wait for a launched step and hand each request its picks, exactly as ``decode``
+        would have: a verify step's queue and draft (``speculative.apply``), or the greedy
+        token of a plain step."""
+        start = time.perf_counter()
+        try:
+            rows = launched.step.result()
+        finally:
+            self.decode_wait_s += time.perf_counter() - start
+            for g in launched.generations:
+                g.inflight -= 1
+        if launched.verify:
+            g1, d1, g2, d2 = rows
+            self.verify_steps += 1
+            speculative.apply(self, launched.generations, g1, g2, d1, d2)
+        else:
+            for g, token in zip(launched.generations, rows[0], strict=True):
+                g.next_token = token
 
     def forward(self, ids: list[int] | tuple[int, ...], cache: DynamicCache) -> torch.Tensor:
         """Run ``ids`` through the model on top of ``cache``; logits of the last position."""
@@ -915,6 +1138,15 @@ class Generator:
             sorted_probs[outside] = 0.0
             probs = torch.zeros_like(probs).scatter_(0, order, sorted_probs)
         return int(torch.multinomial(probs, 1, generator=rng))
+
+
+@dataclass
+class Launched:
+    """A decode step ``Generator.launch`` queued: its requests, in batch order, and its picks."""
+
+    generations: list[Generation]
+    step: Any  # engine.fast.model.LaunchedStep
+    verify: bool
 
 
 @dataclass

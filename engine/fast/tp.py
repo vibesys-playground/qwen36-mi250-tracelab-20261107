@@ -1152,11 +1152,9 @@ class TPModel:
         positions: Sequence[int],
     ) -> tuple[torch.Tensor, list[list[int]], list[int], list[list[int]]]:
         """``FastModel.verify_chain`` over both ranks (same inputs, outputs and contract)."""
-        from engine.fast import mfma
-
         r0 = self.ranks[0]
-        if r0.mtp is None or not mfma.CHAIN:
-            raise RuntimeError("the chained verify needs the MTP head and ENGINE_SPEC_CHAIN=1")
+        if not r0.chain:
+            raise RuntimeError("the chained verify needs the MTP head, Triton and ENGINE_SPEC_CHAIN=1")
         batch = len(tokens)
         groups = len(drafts[0]) + 1
         size = r0.bucket(batch) if r0.use_graphs else batch

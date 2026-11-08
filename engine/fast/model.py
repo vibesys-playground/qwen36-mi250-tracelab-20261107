@@ -352,9 +352,11 @@ class FastModel:
                 raise ValueError(f"the MTP head must sit on the lm_head's device {self.lm_head.device}")
             # The head embeds its input token on its own device (a copy of the same table).
             self.mtp_embed = self.embed if self.embed.device == mdev else self.embed.to(mdev)
+        # Plan 31's chained verify (``engine.fast.mfma``; it needs the Triton kernels).
+        self.chain = mtp is not None and mfma.CHAIN and self.use_triton
         # A verify step runs two rows per slot; any batch has at most one (two) rows per slot.
         self._rows = max(max(self.buckets) * (2 if mtp is not None else 1), slots)
-        if mtp is not None and mfma.CHAIN:  # a chained verify step: up to RING rows per slot
+        if self.chain:  # a chained verify step: up to RING rows per slot
             self._rows = max(self._rows, max(self.buckets) * mfma.RING)
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
 
@@ -367,7 +369,7 @@ class FastModel:
         self.gdn_rows = rows
         self.bank = [0] * rows
         banks = 2 if mtp is not None else 1
-        if mtp is not None and mfma.CHAIN:
+        if self.chain:
             # Plan 31's chained verify: a ring of ``mfma.RING`` states per slot, entry j the
             # state after the step's j-th row; accepting a drafts advances ``bank`` by a.
             banks = mfma.RING
@@ -1590,8 +1592,8 @@ class FastModel:
         ``advance(slot, n)`` makes the state after row n current (n <= a). Attention KV is
         written at every row's position; entries past the slot's new length are overwritten by
         later steps."""
-        if self.mtp is None or not mfma.CHAIN:
-            raise RuntimeError("the chained verify needs the MTP head and ENGINE_SPEC_CHAIN=1")
+        if not self.chain:
+            raise RuntimeError("the chained verify needs the MTP head, Triton and ENGINE_SPEC_CHAIN=1")
         batch = len(tokens)
         groups = len(drafts[0]) + 1
         size = self.bucket(batch) if self.use_graphs else batch

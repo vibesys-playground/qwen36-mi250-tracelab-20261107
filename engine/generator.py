@@ -595,7 +595,7 @@ class Generator:
                 # With the MTP head every step is a verify step: capture those, not plain decode.
                 from engine.fast import mfma
 
-                chain = head is not None and mfma.CHAIN
+                chain = head is not None and getattr(fast, "chain", False)
                 fast.capture_all(decode=head is None, verify=not chain)
                 if chain and fast.use_graphs:
                     # Plan 31: the chained verify's graphs, k + 1 = 8, 4, 2 rows per slot.

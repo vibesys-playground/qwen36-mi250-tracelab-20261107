@@ -329,8 +329,7 @@ def slice_main(args) -> None:
 
     # ---------------------------------------------------------------- compile first (cheap)
     t0 = time.perf_counter()
-    src = (HIPDIR / "slice.hip").read_text()
-    code, log = rtc.compile_hip(src)
+    code, log = rtc.compile_hip_subprocess(str(HIPDIR / "slice.hip"))
     out("slice_compile", seconds=round(time.perf_counter() - t0, 2), resources=rtc.resources(log))
 
     # ---------------------------------------------------------------- load as the server does
@@ -482,10 +481,34 @@ def slice_main(args) -> None:
             ranks_equal=bool(torch.equal(ref_out[0].cpu(), ref_out[1].cpu())),
             timeouts=fast.timeouts())
 
+    # ---------------------------------------------------------------- timing: 3 layers, graph vs HIP
+    def timed(fn, iters):
+        restore(base)
+        for _ in range(3):
+            fn()
+        sync()
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+        with torch.cuda.device(ranks[0].embed.device):
+            ev[0].record()
+        t1 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        with torch.cuda.device(ranks[0].embed.device):
+            ev[1].record()
+        sync()
+        wall = (time.perf_counter() - t1) * 1e3 / iters
+        return ev[0].elapsed_time(ev[1]) / iters, wall
+
+    with torch.inference_mode():
+        ref_ms, ref_wall = timed(ref_replay, args.iters)
+    out("ref_time", layers=layers, rows=8, ref_graph_ms=round(ref_ms, 4), ref_wall_ms=round(ref_wall, 4))
+
     # ---------------------------------------------------------------- the HIP slice
+    out("step", at="enable_peer")
     enable_peer(rtc, ranks[0].embed.device.index, ranks[1].embed.device.index)
     recv_ptrs = [fine_alloc(rtc, m.embed.device.index, 2 * 2 * 8192 * 8) for m in ranks]
     torch.cuda.set_device(ranks[0].embed.device)
+    out("step", at="rank_slices", recv=[hex(p) for p in recv_ptrs])
     rs = [RankSlice(rtc, code, ranks[r], r, layers, states[r], x_in[r], recv_ptrs, nl) for r in (0, 1)]
     out("slice_setup", grid=rs[0].grid, occupancy=rs[0].slice_fn.occupancy(512),
         regs=rs[0].slice_fn.attr(4))
@@ -500,6 +523,7 @@ def slice_main(args) -> None:
         ep_next[0] += 2 * cur_nl[0]
 
     restore(base)
+    out("step", at="first_launch")
     hip_run()
     sync()
     errs = [rs[r].err.tolist() for r in (0, 1)]
@@ -525,26 +549,6 @@ def slice_main(args) -> None:
         out("parity_layer", layer=i, conv_state=conv_c, rec_state=rec_c, routing_rows_identical=same,
             rows=8, unique_experts=nu)
 
-    # ---------------------------------------------------------------- timing: 3 layers, graph vs HIP
-    def timed(fn, iters):
-        restore(base)
-        for _ in range(3):
-            fn()
-        sync()
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-        with torch.cuda.device(ranks[0].embed.device):
-            ev[0].record()
-        t1 = time.perf_counter()
-        for _ in range(iters):
-            fn()
-        with torch.cuda.device(ranks[0].embed.device):
-            ev[1].record()
-        sync()
-        wall = (time.perf_counter() - t1) * 1e3 / iters
-        return ev[0].elapsed_time(ev[1]) / iters, wall
-
-    with torch.inference_mode():
-        ref_ms, ref_wall = timed(ref_replay, args.iters)
     hip_ms, hip_wall = timed(hip_run, args.iters)
     out("slice_time", layers=layers, rows=8, ref_graph_ms=round(ref_ms, 4), ref_wall_ms=round(ref_wall, 4),
         hip_ms=round(hip_ms, 4), hip_wall_ms=round(hip_wall, 4), ratio=round(hip_ms / ref_ms, 3),
@@ -600,6 +604,9 @@ def slice_main(args) -> None:
 
 
 def main() -> None:
+    import faulthandler
+
+    faulthandler.enable()
     parser = argparse.ArgumentParser()
     parser.add_argument("part", choices=("env", "slice"))
     parser.add_argument("--devices", default="0,1")

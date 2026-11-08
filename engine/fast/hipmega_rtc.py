@@ -27,9 +27,9 @@ LIB = Path(torch.__file__).parent / "lib"
 CACHE = Path(os.environ.get("ENGINE_HIPMEGA_CACHE", "/tmp/hipmega-cache"))
 
 
-def _load(name: str) -> ctypes.CDLL:
+def _load(name: str, mode: int = ctypes.RTLD_GLOBAL) -> ctypes.CDLL:
     path = LIB / name
-    return ctypes.CDLL(str(path) if path.exists() else name, mode=ctypes.RTLD_GLOBAL)
+    return ctypes.CDLL(str(path) if path.exists() else name, mode=mode)
 
 
 _hip: ctypes.CDLL | None = None
@@ -46,7 +46,8 @@ def hip() -> ctypes.CDLL:
 def rtc() -> ctypes.CDLL:
     global _rtc
     if _rtc is None:
-        _rtc = _load("libhiprtc.so")
+        # Local symbols: comgr carries its own LLVM, which must not interpose on Triton's.
+        _rtc = _load("libhiprtc.so", ctypes.RTLD_LOCAL)
     return _rtc
 
 
@@ -108,6 +109,22 @@ def compile_hip(src: str, arch: str = "gfx90a", options: tuple[str, ...] = ()) -
     except OSError:
         pass
     return data, log
+
+
+def compile_hip_subprocess(path: str, arch: str = "gfx90a", options: tuple[str, ...] = ()) -> tuple[bytes, str]:
+    """``compile_hip`` of the file at ``path`` in a child process (hipRTC and comgr's LLVM never
+    load into this one), then the cached result."""
+    import subprocess
+    import sys
+
+    code = ("import sys; sys.path.insert(0, %r); from engine.fast import hipmega_rtc as r; "
+            "r.compile_hip(open(%r).read(), %r, %r)" % (str(Path(__file__).resolve().parents[2]), path, arch,
+                                                          tuple(options)))
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=600)
+    src = Path(path).read_text()
+    opts = ["--offload-arch=" + arch, "-O3", "-std=c++17", "-Rpass-analysis=kernel-resource-usage", *options]
+    key = hashlib.sha256((src + "\0" + "\0".join(opts)).encode()).hexdigest()[:24]
+    return (CACHE / f"{key}.co").read_bytes(), (CACHE / f"{key}.log").read_text()
 
 
 def _arg(a) -> ctypes._SimpleCData:

@@ -262,7 +262,7 @@ def make_launchers(cus: int, max_rows: int):
             items = s.R * s.topk * triton.cdiv(L.I, bn)
             fused._moe_up_kernel[(min(items, 2 * cus),)](
                 s.h, s.idx, L.gu, act, s.R, L.gu.stride(0),
-                H=L.H, I=L.I, TOPK=s.topk, BN=bn, BK=min(1024, p2(L.H)), num_warps=4,
+                H=L.H, I=L.I, TOPK=s.topk, BN=bn, BK=min(1024, p2(L.H)), ORDER=0, num_warps=4,
             )
             return act
         o, g, bn, bk, w = cfg
@@ -285,7 +285,7 @@ def make_launchers(cus: int, max_rows: int):
             fused._moe_down_kernel[(min(items, 2 * cus),)](
                 act, s.r, s.idx, s.wt, L.dn, L.sd, s.x, outt, s.R, L.dn.stride(0), L.N3,
                 H=L.H, I=L.I, IS=L.IS, E=L.E, TOPK=s.topk, BN=bn,
-                BKI=min(1024, p2(L.I)), BKS=min(1024, p2(L.IS)), num_warps=4,
+                BKI=min(1024, p2(L.I)), BKS=min(1024, p2(L.IS)), ORDER=0, num_warps=4,
             )
             return outt
         o, g, bn, w = cfg

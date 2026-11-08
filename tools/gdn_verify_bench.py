@@ -49,6 +49,7 @@ def main() -> None:
 
     import torch
 
+    from engine.fast import fused as fused_mod
     from engine.fast import kernels
     from engine.generator import CHECKPOINT, Generator
 
@@ -200,6 +201,10 @@ def main() -> None:
                                 fused._gdn(i, h, dec_states)
                             elif name == "verify":
                                 fused._gdn_verify(i, h, ver_states)
+                            elif name == "verify_banks":
+                                fused._gdn_verify(i, h, ver_states, bank_fused=False)
+                            elif name == "verify_bankfused":
+                                fused._gdn_verify(i, h, ver_states, bank_fused=True)
                             elif name == "verify_nocopy":
                                 p = fused._gemv(h, fused.w_in[i])
                                 c = torch.empty_like(core)
@@ -238,7 +243,7 @@ def main() -> None:
 
                 return run
 
-            names = ["gdn", "verify", "verify_nocopy", "gemv_in_conv", "gemv_in", "conv_halves",
+            names = ["gdn", "verify", "verify_banks", "verify_bankfused", "verify_nocopy", "gemv_in_conv", "gemv_in", "conv_halves",
                      "step_halves", "step_all", "bank_copies", "bank_copy_rec", "out_proj"]
             totals = {}
             for name in names:
@@ -272,6 +277,14 @@ def main() -> None:
                     f"step_split_ms={step_gap:.3f} (step_halves-step_all)",
                     flush=True,
                 )
+                if "verify_banks" in totals and "verify_bankfused" in totals:
+                    print(
+                        f"RESULT bank_fused B={batch} old(copies)-gdn_ms={totals['verify_banks'] - totals['gdn']:.3f} "
+                        f"new(bank_fused)-gdn_ms={totals['verify_bankfused'] - totals['gdn']:.3f} "
+                        f"saved_ms={totals['verify_banks'] - totals['verify_bankfused']:.3f} "
+                        f"(ENGINE_GDN_BANK_FUSED default={fused_mod.BANK_FUSED})",
+                        flush=True,
+                    )
                 if batch in steps:
                     over = steps[batch]["over"]
                     print(
@@ -285,6 +298,39 @@ def main() -> None:
                           f"-> {verdict}", flush=True)
         except Exception:  # noqa: BLE001
             print(f"RESULT layers B={batch} error:\n{traceback.format_exc()}", flush=True)
+
+    # ---------------------------------------------------------------- 2b. bitwise old vs new
+    # Every GDN layer at B=1..4, either bank current: the bank-fused path and the old path
+    # with bank copies from the same random states must give identical outputs and states.
+    try:
+        for batch in (1, 2, 3, 4):
+            for flip in (0, 1):
+                bad = []
+                for dev, layer_ids in by_dev.items():
+                    with torch.cuda.device(dev), kernels.on_device(torch.empty(0, device=dev)), \
+                            torch.inference_mode():
+                        h = (torch.randn((2 * batch, hidden_size), device=dev) * 0.5).to(fast.embed.dtype)
+                        cur = torch.arange(batch, device=dev) + flip * gdn_rows
+                        oth = torch.arange(batch, device=dev) + (1 - flip) * gdn_rows
+                        st = torch.cat((cur, oth)).to(torch.long)
+                        for i in layer_ids:
+                            conv_state, rec_state = fast.gdn_state[i]
+                            conv_state.copy_((torch.randn(conv_state.shape, device=dev) * 0.5).to(conv_state.dtype))
+                            rec_state.copy_(torch.randn(rec_state.shape, device=dev) * 0.1)
+                            c0, r0 = conv_state.clone(), rec_state.clone()
+                            a = fused._gdn_verify(i, h, st, bank_fused=False).clone()
+                            ca, ra = conv_state.clone(), rec_state.clone()
+                            conv_state.copy_(c0)
+                            rec_state.copy_(r0)
+                            b = fused._gdn_verify(i, h, st, bank_fused=True).clone()
+                            if not (torch.equal(a, b) and torch.equal(ca, conv_state) and torch.equal(ra, rec_state)):
+                                bad.append(i)
+                            conv_state.zero_()
+                            rec_state.zero_()
+                print(f"RESULT bitwise B={batch} current_bank={flip} layers={len(gdn_layers)} "
+                      f"mismatching={bad if bad else 'none'}", flush=True)
+    except Exception:  # noqa: BLE001
+        print(f"RESULT bitwise error:\n{traceback.format_exc()}", flush=True)
 
     # ---------------------------------------------------------------- 3. kernel counts
     try:
@@ -302,7 +348,8 @@ def main() -> None:
                 ).to(torch.long)
                 counts = {}
                 for name, fn in (("gdn", lambda: fused._gdn(i, h, dec_states)),
-                                 ("verify", lambda: fused._gdn_verify(i, h, ver_states))):
+                                 ("verify", lambda: fused._gdn_verify(i, h, ver_states)),
+                                 ("verify_banks", lambda: fused._gdn_verify(i, h, ver_states, bank_fused=False))):
                     with kernels.on_device(h), torch.inference_mode():
                         fn()
                     sync()
@@ -317,6 +364,7 @@ def main() -> None:
                         print(f"RESULT kernels B=2 {name}: " + " | ".join(names), flush=True)
                 print(
                     f"RESULT kernel_count B={batch} gdn={counts['gdn']} verify={counts['verify']} "
+                    f"verify_banks={counts['verify_banks']} "
                     f"extra_per_step_30layers={(counts['verify'] - counts['gdn']) * len(gdn_layers)}",
                     flush=True,
                 )

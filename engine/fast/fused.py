@@ -53,6 +53,10 @@ HEAD = os.environ.get("ENGINE_FUSED_HEAD", "1") == "1"
 HEAD_TILE = tuple(int(v) for v in os.environ.get("ENGINE_FUSED_HEAD_TILE", "4,2048").split(","))
 HEAD_GRID = int(os.environ.get("ENGINE_FUSED_HEAD_GRID", "2"))
 GRID = int(os.environ.get("ENGINE_FUSED_GRID", "2"))
+# A verify step's GDN layer writes each slot's state to both banks inside its conv and
+# delta-rule kernels (ENGINE_GDN_BANK_FUSED=1, default), instead of running the two halves
+# with index_select/index_copy_ bank copies between them (0, the old path).
+BANK_FUSED = os.environ.get("ENGINE_GDN_BANK_FUSED", "1") == "1"
 # Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
 # From a sweep on one gfx90a GCD (j71): 4 x 2048 beat 8 x 1024 and 16 x 512 at 4 and 8 rows.
 TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
@@ -157,6 +161,114 @@ if triton is not None:
         y = (tl.load(nw_ptr + vv).to(tl.float32) * n).to(tl.bfloat16).to(tl.float32)
         zz = tl.load(base_in + Z_OFF + head * DV + vv).to(tl.float32)
         tl.store(out_ptr + (row * V_HEADS + head) * DV + vv, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16))
+
+    @triton.jit
+    def _gdn_conv_pair_kernel(
+        state_ptr, slot_ptr, io_ptr, w_ptr, N, C, stride_io, stride_slot, BLOCK: tl.constexpr,
+    ):
+        """A verify step's short convolution for slot ``r`` (kernel size 4): row ``r`` (the
+        first token) on state row ``slots[r]``, then row ``r + N`` (the draft) on the window
+        that leaves, stored to state row ``slots[r + N]``. Each row is ``_gdn_conv_kernel``'s
+        math in its order; the other bank's window is written whole, so no bank copy is
+        needed. In place on ``io`` (the raw q|k|v columns of the projection rows)."""
+        r = tl.program_id(0)
+        block = tl.program_id(1)
+        first = tl.load(slot_ptr + r).to(tl.int64)
+        second = tl.load(slot_ptr + r + N).to(tl.int64)
+        c = block * BLOCK + tl.arange(0, BLOCK)
+        ok = c < C
+        a = state_ptr + first * stride_slot + c * 4
+        b = state_ptr + second * stride_slot + c * 4
+        x0 = tl.load(io_ptr + r * stride_io + c, mask=ok, other=0.0)
+        x1 = tl.load(io_ptr + (r + N) * stride_io + c, mask=ok, other=0.0)
+        s1 = tl.load(a + 1, mask=ok, other=0.0)
+        s2 = tl.load(a + 2, mask=ok, other=0.0)
+        s3 = tl.load(a + 3, mask=ok, other=0.0)
+        w0 = tl.load(w_ptr + c * 4, mask=ok, other=0.0).to(tl.float32)
+        w1 = tl.load(w_ptr + c * 4 + 1, mask=ok, other=0.0).to(tl.float32)
+        w2 = tl.load(w_ptr + c * 4 + 2, mask=ok, other=0.0).to(tl.float32)
+        w3 = tl.load(w_ptr + c * 4 + 3, mask=ok, other=0.0).to(tl.float32)
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        acc += s1.to(tl.float32) * w0
+        acc += s2.to(tl.float32) * w1
+        acc += s3.to(tl.float32) * w2
+        acc += x0.to(tl.float32) * w3
+        y0 = acc.to(tl.bfloat16).to(tl.float32)
+        y0 = (y0 * tl.sigmoid(y0)).to(tl.bfloat16)
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        acc += s2.to(tl.float32) * w0
+        acc += s3.to(tl.float32) * w1
+        acc += x0.to(tl.float32) * w2
+        acc += x1.to(tl.float32) * w3
+        y1 = acc.to(tl.bfloat16).to(tl.float32)
+        y1 = (y1 * tl.sigmoid(y1)).to(tl.bfloat16)
+        tl.store(a, s1, mask=ok)
+        tl.store(a + 1, s2, mask=ok)
+        tl.store(a + 2, s3, mask=ok)
+        tl.store(a + 3, x0, mask=ok)
+        tl.store(b, s2, mask=ok)
+        tl.store(b + 1, s3, mask=ok)
+        tl.store(b + 2, x0, mask=ok)
+        tl.store(b + 3, x1, mask=ok)
+        tl.store(io_ptr + r * stride_io + c, y0, mask=ok)
+        tl.store(io_ptr + (r + N) * stride_io + c, y1, mask=ok)
+
+    @triton.jit
+    def _gdn_row(s, base_in, nw_ptr, alog_ptr, dtb_ptr, head, k_head, eps, scale,
+                 Z_OFF, B_OFF, A_OFF, KEY_DIM: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr):
+        """``_gdn_step_kernel``'s math for one row on the fp32 state tile ``s`` (in registers):
+        returns the updated state and the gated-norm output (BF16)."""
+        kk = tl.arange(0, DK)
+        vv = tl.arange(0, DV)
+        q = tl.load(base_in + k_head * DK + kk).to(tl.float32)
+        k = tl.load(base_in + KEY_DIM + k_head * DK + kk).to(tl.float32)
+        v = tl.load(base_in + 2 * KEY_DIM + head * DV + vv).to(tl.float32)
+        q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) * scale
+        k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
+        beta = tl.sigmoid(tl.load(base_in + B_OFF + head).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        a = tl.load(base_in + A_OFF + head).to(tl.float32) + tl.load(dtb_ptr + head).to(tl.float32)
+        softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        g = -tl.exp(tl.load(alog_ptr + head).to(tl.float32)) * softplus
+        s = s * tl.exp(g)
+        kv_mem = tl.sum(s * k[:, None], axis=0)
+        delta = (v - kv_mem) * beta
+        s = s + k[:, None] * delta[None, :]
+        o = tl.sum(s * q[:, None], axis=0)
+        o = o.to(tl.bfloat16).to(tl.float32)
+        n = (o * tl.rsqrt(tl.sum(o * o, axis=0) / DV + eps)).to(tl.bfloat16).to(tl.float32)
+        y = (tl.load(nw_ptr + vv).to(tl.float32) * n).to(tl.bfloat16).to(tl.float32)
+        zz = tl.load(base_in + Z_OFF + head * DV + vv).to(tl.float32)
+        return s, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16)
+
+    @triton.jit
+    def _gdn_verify_step_kernel(
+        state_ptr, slot_ptr, in_ptr, alog_ptr, dtb_ptr, nw_ptr, out_ptr, N,
+        stride_in, V_HEADS, stride_slot, stride_head, eps, scale,
+        Z_OFF, B_OFF, A_OFF,
+        RATIO: tl.constexpr, KEY_DIM: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+    ):
+        """A verify step's delta rule for one v-head of slot ``r``: the state tile is loaded
+        once from row ``slots[r]``, row ``r`` (first token) updates it and stores it back,
+        row ``r + N`` (draft) continues from the tile in registers and stores to row
+        ``slots[r + N]`` (the other bank). Per-row math as ``_gdn_step_kernel``."""
+        r = tl.program_id(0)
+        head = tl.program_id(1)
+        k_head = head // RATIO
+        first = tl.load(slot_ptr + r).to(tl.int64)
+        second = tl.load(slot_ptr + r + N).to(tl.int64)
+        kk = tl.arange(0, DK)
+        vv = tl.arange(0, DV)
+        tile = head * stride_head + kk[:, None] * DV + vv[None, :]
+        s = tl.load(state_ptr + first * stride_slot + tile)
+        s, y = _gdn_row(s, in_ptr + r * stride_in, nw_ptr, alog_ptr, dtb_ptr, head, k_head, eps,
+                        scale, Z_OFF, B_OFF, A_OFF, KEY_DIM=KEY_DIM, DK=DK, DV=DV)
+        tl.store(state_ptr + first * stride_slot + tile, s)
+        tl.store(out_ptr + (r * V_HEADS + head) * DV + vv, y)
+        s = s.to(state_ptr.dtype.element_ty).to(tl.float32)
+        s, y = _gdn_row(s, in_ptr + (r + N) * stride_in, nw_ptr, alog_ptr, dtb_ptr, head, k_head,
+                        eps, scale, Z_OFF, B_OFF, A_OFF, KEY_DIM=KEY_DIM, DK=DK, DV=DV)
+        tl.store(state_ptr + second * stride_slot + tile, s)
+        tl.store(out_ptr + ((r + N) * V_HEADS + head) * DV + vv, y)
 
     @triton.jit
     def _attn_prep_kernel(
@@ -529,22 +641,44 @@ class FusedDecode:
             RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
         )
 
-    def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+    def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor,
+                    bank_fused: bool | None = None) -> torch.Tensor:
         """A verify step's GDN layer: rows ``[:n]`` are each slot's first token on its current
         state row, rows ``[n:]`` its draft on the other bank's row (``FastModel._gdn_verify``).
 
-        The projection GEMV and ``out_proj`` run once over all rows (weights read once); the
-        short convolution (``kernels.gdn_conv_``, the same math as the GEMV's conv epilogue)
-        and the delta-rule step run on the first half, the first half's states are copied to
-        the second half's rows, then the second half runs there, so each draft row starts from
-        the state after its slot's first token."""
+        The projection GEMV and ``out_proj`` run once over all rows (weights read once).
+        With ``BANK_FUSED`` (default) one pair-aware conv kernel and one pair-aware delta-rule
+        kernel run each slot's two rows in turn, writing the state after the first token to
+        the current bank row and the state after the draft to the other bank row, so no
+        bank copy is needed. Otherwise (the old path) the short convolution
+        (``kernels.gdn_conv_``) and the step run on the first half, the first half's states
+        are copied to the second half's rows, then the second half runs there. Both give
+        the same bits: each row's math and order are the same."""
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
         conv_dim = 2 * m.key_dim + m.value_dim
-        proj = self._gemv(h, self.w_in[i])  # raw projections; the conv runs per half below
+        proj = self._gemv(h, self.w_in[i])  # raw projections; the conv runs per row pair below
         core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
         n = h.shape[0] // 2
+        if BANK_FUSED if bank_fused is None else bank_fused:
+            assert conv_state.shape[-1] == 4 and conv_state.stride(1) == 4 and conv_state.stride(2) == 1
+            block = 256
+            _gdn_conv_pair_kernel[(n, triton.cdiv(conv_dim, block))](
+                conv_state, states, proj, m.conv1d.weight, n, conv_dim, proj.stride(0),
+                conv_state.stride(0), BLOCK=block,
+            )
+            heads, dk, dv = m.num_v_heads, m.head_k_dim, m.head_v_dim
+            z_off = 2 * m.key_dim + m.value_dim
+            b_off = z_off + m.in_proj_z.weight.shape[0]
+            a_off = b_off + m.in_proj_b.weight.shape[0]
+            _gdn_verify_step_kernel[(n, heads)](
+                rec_state, states, proj, m.A_log, m.dt_bias, m.norm.weight, core, n,
+                proj.stride(0), heads, rec_state.stride(0), rec_state.stride(1),
+                m.norm.variance_epsilon, dk ** -0.5, z_off, b_off, a_off,
+                RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
+            )
+            return self._gemv(core, m.out_proj.weight)
         halves = ((slice(0, n), states[:n]), (slice(n, 2 * n), states[n:]))
         for index, (rows, slots) in enumerate(halves):
             if index:

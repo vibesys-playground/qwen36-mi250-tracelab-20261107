@@ -26,6 +26,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / ".vibesys/shared/cpu_check")]
 
 from engine import router  # noqa: E402
 from engine.router import Affinity, affinity_key, device_env, resolve_layout  # noqa: E402
+from conftest import repeat_reuse  # noqa: E402
 from tiny_checkpoint import write_checkpoint  # noqa: E402
 
 CHUNK = 8
@@ -255,7 +256,7 @@ def test_a_repeated_prompt_hits_the_cache_through_the_router(front: str) -> None
     first, first_usage = _completion(front, prompt, 8)
     second, second_usage = _completion(front, prompt, 8)
     assert first_usage["prompt_tokens_details"]["cached_tokens"] == 0
-    assert second_usage["prompt_tokens_details"]["cached_tokens"] == len(prompt) - 1
+    assert second_usage["prompt_tokens_details"]["cached_tokens"] == repeat_reuse(len(prompt), CHUNK)
     assert second == first
 
 

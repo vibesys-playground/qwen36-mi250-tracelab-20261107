@@ -35,7 +35,7 @@ import sys
 
 import torch
 
-from engine.fast import kernels
+from engine.fast import kernels, mfma
 
 triton, tl = kernels.triton, kernels.tl
 
@@ -684,7 +684,8 @@ class FusedDecode:
 
     def __init__(self, fast) -> None:
         self.fast = fast
-        self.max_rows = MAX_ROWS
+        # The chained verify (plan 31, ``mfma.CHAIN``) runs up to 8 rows per slot.
+        self.max_rows = max(MAX_ROWS, 64) if mfma.CHAIN else MAX_ROWS
         self.w_in: dict[int, torch.Tensor] = {}
         self.w_moe: dict[int, torch.Tensor] = {}
         self.rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -735,7 +736,7 @@ class FusedDecode:
         """bf16(x @ w.T) for the lm_head: its own tiles and grid (``HEAD_TILE``,
         ``HEAD_GRID``), rows in blocks of 2 (or as ``ROW_TILE`` says for "fixed"/"rows")."""
         x = x.contiguous()
-        if GEMV:
+        if GEMV or mfma.GEMV:
             return self._gemv(x, w)
         bp, _, _ = self._tiles(x.shape[0], x.shape[1])
         bn, bk = HEAD_TILE
@@ -766,6 +767,11 @@ class FusedDecode:
         assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
+        if mfma.GEMV and tiles is None:  # plan 31: 16-row MFMA tiles (``engine.fast.mfma``)
+            mfma.gemv(x, w, out)
+            if conv is not None:
+                out[:, : conv[3]] = kernels.gdn_conv_(conv[0], conv[1], out[:, : conv[3]], conv[2])
+            return out
         if GEMV and tiles is None:
             if conv is not None and conv[0].shape[-1] != 4:  # the epilogue is for 4 taps
                 self._gemv(x, w, out)
@@ -906,7 +912,7 @@ class FusedDecode:
         )
 
     def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor,
-                    bank_fused: bool | None = None) -> torch.Tensor:
+                    bank_fused: bool | None = None, groups: int = 2) -> torch.Tensor:
         """A verify step's GDN layer: rows ``[:n]`` are each slot's first token on its current
         state row, rows ``[n:]`` its draft on the other bank's row (``FastModel._gdn_verify``).
 
@@ -918,6 +924,8 @@ class FusedDecode:
         (``kernels.gdn_conv_``) and the step run on the first half, the first half's states
         are copied to the second half's rows, then the second half runs there. Both give
         the same bits: each row's math and order are the same."""
+        if mfma.CHAIN or groups != 2:  # plan 31: G rows per slot, states to the ring
+            return mfma.gdn_chain(self, i, h, states, groups)
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
@@ -1002,7 +1010,8 @@ class FusedDecode:
         with kernels.on_device(x):
             _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, fast.eps)
             if self._is_gdn(i):
-                h = self._gdn_verify(i, h, states) if verify else self._gdn(i, h, states)
+                h = (self._gdn_verify(i, h, states, groups=mfma.groups_of(verify)) if verify
+                     else self._gdn(i, h, states))
             else:
                 h = self._attn(i, h, slots, positions, meta)
             x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, fast.eps)

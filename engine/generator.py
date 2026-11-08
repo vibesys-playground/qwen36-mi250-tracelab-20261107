@@ -398,6 +398,12 @@ class Generation:
         self.queue: list[int] = []
         self.draft = 0
         self.flipped = False
+        # The chained verify (plan 31): the head's next drafts, ring entries the last step
+        # advanced, and this request's own decayed counts of drafts checked and accepted.
+        self.drafts: list[int] = []
+        self.advanced = 0
+        self.spec_checked = 0.0
+        self.spec_accepted = 0.0
         if slot is not None:
             # A request dropped before it ends (a client gone) gives its slot back when collected.
             self._finalizer = weakref.finalize(self, generator._released.append, slot)
@@ -429,11 +435,12 @@ class Generation:
         """Whether the next token is already picked (the server takes it without a decode)."""
         return bool(self.queue)
 
-    def continues_after(self, token: int) -> bool:
-        """Whether, picking ``token`` next, this request still needs another token."""
+    def continues_after(self, token: int, ahead: int = 0) -> bool:
+        """Whether, picking ``token`` next (after ``ahead`` already queued tokens), this request
+        still needs another token."""
         if token in self._generator.eos_ids and not self._sampling.ignore_eos:
             return False
-        return self._count + 1 < self._max_tokens
+        return self._count + ahead + 1 < self._max_tokens
 
     def retire(self) -> None:
         """Hand this finished request's cache to the prefix cache as a session tail.
@@ -586,7 +593,16 @@ class Generator:
                 print(f"engine: fast path unavailable ({exc}); using Transformers", flush=True)
             else:
                 # With the MTP head every step is a verify step: capture those, not plain decode.
-                fast.capture_all(decode=head is None)
+                from engine.fast import mfma
+
+                chain = head is not None and mfma.CHAIN
+                fast.capture_all(decode=head is None, verify=not chain)
+                if chain and fast.use_graphs:
+                    # Plan 31: the chained verify's graphs, k + 1 = 8, 4, 2 rows per slot.
+                    for groups in (8, 4, 2):
+                        for size in sorted(fast.buckets, reverse=True):
+                            if groups <= mfma.RING and groups * size <= 64 and fast.graph_error is None:
+                                fast.capture(size, False, groups)
                 print(
                     f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
                     f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "

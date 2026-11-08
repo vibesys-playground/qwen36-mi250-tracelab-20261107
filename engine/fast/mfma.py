@@ -48,6 +48,9 @@ BM = 16  # the fixed row tile
 #   in registers (no cross-program dependency).
 # Either way the softmax/top-k math is ``_topk_vals``, the body of ``fused._topk``, in one
 # wave (num_warps=1 as ``_topk_kernel``), so experts, order and weights are bitwise equal.
+# Step 0 (j183, TP2 GCD 2,3, served verify_chain B=2): both modes bitwise over 1000 graph
+# replays x 3 layers x R 1-32; mode 2 9.155 -> 8.809 ms (k=1), 13.648 -> 13.311 ms (k=3);
+# mode 1 is slower (9.594, 14.385: one wave does every row's top-k after the last store).
 TOPK_EPI = int(os.environ.get("ENGINE_TOPK_EPI", "0"))
 
 # Tiles per weight shape (N, K): outputs per tile, K chunk, warps, K split. Never by row count.

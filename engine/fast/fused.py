@@ -48,6 +48,11 @@ def enabled() -> bool:
     return os.environ.get("ENGINE_FUSED_DECODE", "1") == "1"
 
 
+def verify_enabled() -> bool:
+    """Verify steps (two rows per slot) and the MTP head through the fused layers too."""
+    return os.environ.get("ENGINE_FUSED_VERIFY", "1") == "1"
+
+
 if triton is not None:
 
     @triton.jit
@@ -354,8 +359,12 @@ class FusedDecode:
         self.w_moe: dict[int, torch.Tensor] = {}
         self.rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cus: dict[torch.device, int] = {}
-        for i, layer in enumerate(fast.layers):
-            if fast.layer_types[i] == "linear_attention":
+        indices = list(range(len(fast.layers)))
+        if getattr(fast, "mtp", None) is not None:
+            indices.append(fast.mtp_index)  # the MTP head's decoder layer (full attention)
+        for i in indices:
+            layer = self._layer(i)
+            if self._is_gdn(i):
                 m = layer.linear_attn
                 self.w_in[i] = _pack([m.in_proj_qkv.weight, m.in_proj_z.weight,
                                       m.in_proj_b.weight, m.in_proj_a.weight])
@@ -379,6 +388,15 @@ class FusedDecode:
             if dev not in self.cus:
                 self.cus[dev] = (torch.cuda.get_device_properties(dev).multi_processor_count
                                  if dev.type == "cuda" else 4)
+
+    def _layer(self, i: int) -> torch.nn.Module:
+        fast = self.fast
+        if getattr(fast, "mtp", None) is not None and i == fast.mtp_index:
+            return fast.mtp.layers[0]
+        return fast.layers[i]
+
+    def _is_gdn(self, i: int) -> bool:
+        return i < len(self.fast.layers) and self.fast.layer_types[i] == "linear_attention"
 
     # ---------------------------------------------------------------- pieces
 
@@ -409,7 +427,7 @@ class FusedDecode:
     def _moe(self, i: int, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """x + MoE(h) for layer ``i``."""
         fast = self.fast
-        mlp = fast.layers[i].mlp
+        mlp = self._layer(i).mlp
         rows, hidden = h.shape
         w3 = self.w_moe[i]
         r = self._gemv(h, w3)
@@ -443,16 +461,23 @@ class FusedDecode:
         return out
 
     def _gdn(self, i: int, h: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        """``slots`` are the rows' Gated DeltaNet state rows."""
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
-        w = self.w_in[i]
         conv_dim = 2 * m.key_dim + m.value_dim
-        proj = self._gemv(h, w, conv=(conv_state, slots, m.conv1d.weight, conv_dim))
-        rows = h.shape[0]
+        proj = self._gemv(h, self.w_in[i], conv=(conv_state, slots, m.conv1d.weight, conv_dim))
+        core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
+        self._gdn_step(m, rec_state, slots, proj, core)
+        return self._gemv(core, m.out_proj.weight)
+
+    def _gdn_step(self, m, rec_state: torch.Tensor, slots: torch.Tensor, proj: torch.Tensor,
+                  core: torch.Tensor) -> None:
+        """The delta-rule step and gated norm of ``proj``'s rows (conv already applied to their
+        q|k|v columns) on state rows ``slots``, into ``core``."""
+        rows = proj.shape[0]
         heads, dk, dv = m.num_v_heads, m.head_k_dim, m.head_v_dim
-        core = torch.empty((rows, heads * dv), dtype=h.dtype, device=h.device)
-        z_off = conv_dim
+        z_off = 2 * m.key_dim + m.value_dim
         b_off = z_off + m.in_proj_z.weight.shape[0]
         a_off = b_off + m.in_proj_b.weight.shape[0]
         _gdn_step_kernel[(rows, heads)](
@@ -461,12 +486,38 @@ class FusedDecode:
             m.norm.variance_epsilon, dk ** -0.5, z_off, b_off, a_off,
             RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
         )
+
+    def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        """A verify step's GDN layer: rows ``[:n]`` are each slot's first token on its current
+        state row, rows ``[n:]`` its draft on the other bank's row (``FastModel._gdn_verify``).
+
+        The projection GEMV and ``out_proj`` run once over all rows (weights read once); the
+        short convolution (``kernels.gdn_conv_``, the same math as the GEMV's conv epilogue)
+        and the delta-rule step run on the first half, the first half's states are copied to
+        the second half's rows, then the second half runs there, so each draft row starts from
+        the state after its slot's first token."""
+        fast = self.fast
+        m = fast.layers[i].linear_attn
+        conv_state, rec_state = fast.gdn_state[i]
+        conv_dim = 2 * m.key_dim + m.value_dim
+        proj = self._gemv(h, self.w_in[i])  # raw projections; the conv runs per half below
+        core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
+        n = h.shape[0] // 2
+        halves = ((slice(0, n), states[:n]), (slice(n, 2 * n), states[n:]))
+        for index, (rows, slots) in enumerate(halves):
+            if index:
+                first = states[:n]
+                conv_state.index_copy_(0, slots, conv_state.index_select(0, first))
+                rec_state.index_copy_(0, slots, rec_state.index_select(0, first))
+            part = proj[rows]
+            part[:, :conv_dim] = kernels.gdn_conv_(conv_state, slots, part[:, :conv_dim], m.conv1d.weight)
+            self._gdn_step(m, rec_state, slots, part, core[rows])
         return self._gemv(core, m.out_proj.weight)
 
     def _attn(self, i: int, h: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor,
               meta) -> torch.Tensor:
         fast = self.fast
-        m = fast.layers[i].self_attn
+        m = self._layer(i).self_attn
         qkv = self._gemv(h, self.w_in[i])
         rows = h.shape[0]
         k_pool, v_pool = fast.kv[i]
@@ -501,13 +552,17 @@ class FusedDecode:
     # ---------------------------------------------------------------- one layer
 
     def layer(self, i: int, x: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor,
-              meta) -> torch.Tensor:
+              meta, states: torch.Tensor | None = None, verify: bool = False) -> torch.Tensor:
+        """Layer ``i`` (``FastModel.mtp_index``: the MTP head's) for one token per row.
+        ``states`` are the rows' GDN state rows (default ``slots``); with ``verify`` the rows
+        are a verify step's two halves (see ``_gdn_verify``)."""
         fast = self.fast
-        layer = fast.layers[i]
+        layer = self._layer(i)
+        states = slots if states is None else states
         with kernels.on_device(x):
             _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, fast.eps)
-            if fast.layer_types[i] == "linear_attention":
-                h = self._gdn(i, h, slots)
+            if self._is_gdn(i):
+                h = self._gdn_verify(i, h, states) if verify else self._gdn(i, h, states)
             else:
                 h = self._attn(i, h, slots, positions, meta)
             x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, fast.eps)

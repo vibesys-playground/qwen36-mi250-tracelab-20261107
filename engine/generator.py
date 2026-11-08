@@ -49,7 +49,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts, gdn
+from engine import batching, experts, gdn, speculative
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -380,6 +380,15 @@ class Generation:
         self.slot = slot
         self._ended_slot: int | None = None  # the slot ``finished`` queued, until ``retire``
         self.length = length
+        # Self-speculative decoding (``engine.speculative``): tokens a verify step picked,
+        # the MTP head's draft of the token after ``last_token``, and whether the last step
+        # flipped the slot's state bank.
+        self.speculates = generator.fast is not None and generator.fast.mtp is not None and (
+            speculative.eligible(sampling)
+        )
+        self.queue: list[int] = []
+        self.draft = 0
+        self.flipped = False
         if slot is not None:
             # A request dropped before it ends (a client gone) gives its slot back when collected.
             self._finalizer = weakref.finalize(self, generator._released.append, slot)
@@ -390,7 +399,10 @@ class Generation:
     def next_step(self) -> Step:
         """Pick the next token from the current logits; ``decode`` must run before the next call."""
         g = self._generator
-        token = g.pick(self.logits, self._sampling, self._count, self._rng)
+        if self.queue:  # picked by a verify step: the argmax ``pick`` would return
+            token = self.queue.pop(0)
+        else:
+            token = g.pick(self.logits, self._sampling, self._count, self._rng)
         self._count += 1
         self.last_token = token
         self._picked.append(token)
@@ -404,6 +416,16 @@ class Generation:
             g.finished(self)
         return Step(token, emit=True, finish=finish)
 
+    def has_queued(self) -> bool:
+        """Whether the next token is already picked (the server takes it without a decode)."""
+        return bool(self.queue)
+
+    def continues_after(self, token: int) -> bool:
+        """Whether, picking ``token`` next, this request still needs another token."""
+        if token in self._generator.eos_ids and not self._sampling.ignore_eos:
+            return False
+        return self._count + 1 < self._max_tokens
+
     def retire(self) -> None:
         """Hand this finished request's cache to the prefix cache as a session tail.
 
@@ -415,6 +437,7 @@ class Generation:
         if g.fast is not None:
             # The slot still holds the state (``finished`` only queues it for the reset).
             slot = self.slot if self.slot is not None else self._ended_slot
+            speculative.settle(g, self, slot)
             if slot is not None and self._prompt and self._picked:
                 key = self._prompt + tuple(self._picked[:-1])
                 if len(key) == self.length:
@@ -474,6 +497,10 @@ class Generator:
         # Packed prefill counters: segments per pass tell how wide prefill passes were.
         self.prefill_passes = 0
         self.prefill_segments = 0
+        # Self-speculative decoding counters: verify steps, drafts checked and accepted.
+        self.verify_steps = 0
+        self.mtp_proposed = 0
+        self.mtp_accepted = 0
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -527,19 +554,24 @@ class Generator:
         if use_fast_path(os.environ.get("ENGINE_FAST"), torch.cuda.is_available()):
             from engine.fast.model import FastModel, FastPathUnavailable
 
+            head = speculative.load_head(lm, model, revision)
             try:
                 fast = FastModel(
                     lm,
                     slots=int(os.environ.get("ENGINE_SLOTS", "32")),
-                    max_len=options["max_model_len"],
+                    # A verify step writes its draft one position past the last token.
+                    max_len=options["max_model_len"] + (1 if head is not None else 0),
+                    mtp=head,
                 )
             except FastPathUnavailable as exc:
                 print(f"engine: fast path unavailable ({exc}); using Transformers", flush=True)
             else:
-                fast.capture_all()
+                # With the MTP head every step is a verify step: capture those, not plain decode.
+                fast.capture_all(decode=head is None)
                 print(
                     f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
-                    f"graph_error={fast.graph_error} kv_pages={fast.pool.pages}",
+                    f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "
+                    f"mtp={head is not None}",
                     flush=True,
                 )
         generator = cls(lm, tokenizer, eos_ids, fast=fast, **options)
@@ -648,6 +680,9 @@ class Generator:
             "largest_batch": self.largest_batch,
             "prefill_passes": self.prefill_passes,
             "prefill_segments": self.prefill_segments,
+            "mtp_verify_steps": self.verify_steps,
+            "mtp_proposed": self.mtp_proposed,
+            "mtp_accepted": self.mtp_accepted,
             "prefilled_tokens": self.prefilled_tokens,
             "cached_tokens": self.cached_tokens,
             "prefix_cache_tail_hits": pc.tail_hits,
@@ -713,7 +748,7 @@ class Generator:
             raise
         self.cached_tokens += reused
         self.prefilled_tokens += len(prompt) - reused
-        return Generation(
+        generation = Generation(
             self,
             sampling,
             reused,
@@ -724,6 +759,9 @@ class Generator:
             slot=slot,
             length=len(prompt),
         )
+        if self.fast.mtp is not None:
+            generation.draft = int(self.fast.last_drafts[0])
+        return generation
 
     def _prefill_fast(self, prompt: tuple[int, ...], start: int, slot: int) -> torch.Tensor:
         """``prefill``'s chunks and snapshots, into ``slot``."""
@@ -732,7 +770,8 @@ class Generator:
         position = start
         while position < body:
             end = min((position // self._chunk + 1) * self._chunk, body)
-            self.fast.prefill(slot, prompt[position:end], position)
+            # ``prompt[end]`` follows the chunk (for the MTP head's last pair; ``end < body``).
+            self.fast.prefill(slot, prompt[position:end], position, prompt[end])
             position = end
             if position == last_boundary and position != body:
                 self._prefix_cache.store(prompt[:position], slot)
@@ -741,6 +780,9 @@ class Generator:
         return self.fast.prefill(slot, prompt[body:], body)
 
     def _decode_fast(self, generations: list[Generation]) -> None:
+        if self.fast.mtp is not None:
+            speculative.verify_step(self, generations)
+            return
         logits = self.fast.decode(
             [g.last_token for g in generations],
             [g.slot for g in generations],
@@ -923,15 +965,17 @@ class PackedPrefill:
                 continue
             batch.append(entry)
             used += end - begin
-        segments = []
+        segments, follows = [], []
         for entry in batch:
             begin, end, _ = entry.spans[entry.at]
             segments.append((entry.slot, entry.prompt[begin:end], begin))
+            follows.append(entry.prompt[end] if end < len(entry.prompt) else None)
         g.prefill_passes += 1
         g.prefill_segments += len(segments)
         done: list[tuple[int, Generation | Exception]] = []
         try:
-            logits = g.fast.prefill_packed(segments)
+            logits = g.fast.prefill_packed(segments, follows)
+            drafts = g.fast.last_drafts.tolist() if g.fast.mtp is not None else None
         except Exception as exc:  # noqa: BLE001 - the pass failed for every request in it
             for entry in batch:
                 g.fast.reset(entry.slot)
@@ -956,6 +1000,8 @@ class PackedPrefill:
                     slot=entry.slot,
                     length=len(entry.prompt),
                 )
+                if drafts is not None:
+                    generation.draft = drafts[row]
                 done.append((entry.ticket, generation))
         self._pending = [e for e in self._pending if e.at < len(e.spans)]
         return done

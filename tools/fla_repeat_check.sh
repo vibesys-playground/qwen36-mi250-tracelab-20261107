@@ -1,7 +1,7 @@
 #!/bin/sh
 # Plan 26: is cross-process greedy divergence fla's per-process autotuning, and do pins fix it?
 #
-#   sh tools/fla_repeat_check.sh            # (one MI250 node, 8 GCDs, TP2 replicas)
+#   sh tools/fla_repeat_check.sh [pinned-only [split]]   # (one MI250 node, 8 GCDs, TP2 replicas)
 #
 # 1. Four processes at once (GCD pairs), each autotuning fla on its own (FLA_CACHE_RESULTS=0,
 #    ENGINE_FLA_PIN=0), FUSED=1: greedy references (tools/tp_parity.py) and their fla picks;
@@ -10,6 +10,8 @@
 #    (ref, then check: 8/8 identical?) and a third concurrently on GCD 2,3 (compared with the
 #    first); FUSED=1 against a FUSED=0 reference on GCD 4,5 (teacher-forced top-1); spec == plain
 #    on GCD 6,7. With ENGINE_FLA_PINS unset the committed engine/fast/fla_configs.json is used.
+# "pinned-only" skips step 1 (the committed pins); "split" then adds tools/prefill_op_split.py
+# FUSED=0 and FUSED=1 on GCD 4,5 (GPU time and wall with the pinned fla configs).
 set -x
 L=/tmp/fr-logs
 mkdir -p $L
@@ -43,5 +45,11 @@ python tools/fla_pins_pick.py --refs /tmp/pin_a.pt /tmp/pin_c.pt
 grep -E "RESULT|Error" $L/pin_c.log | tail -4
 echo "=== pinned: FUSED=1 against FUSED=0"; grep -E "RESULT|Error|^---" $L/pin_parity.log | tail -10
 echo "=== spec == plain (FUSED=1, pinned)"; grep -E "RESULT|Error|Traceback" $L/spec.log | tail -20
+if [ "$2" = "split" ]; then
+  ( ENGINE_PREFILL_FUSED=0 timeout 1800 python tools/prefill_op_split.py all --devices 4,5 ; \
+    ENGINE_PREFILL_FUSED=1 timeout 1800 python tools/prefill_op_split.py all --devices 4,5 ) > $L/split.log 2>&1
+  echo "=== op split (FUSED=0, then FUSED=1)"
+  grep -E "^N=|ALL FUSIBLE|TOTAL|gdn chunk \(fla\)" $L/split.log | cut -c1-330
+fi
 echo "=== tracebacks"; for f in $L/*.log; do grep -B2 -A20 Traceback $f | head -40; done
 true

@@ -390,13 +390,19 @@ def part_a(dev, ncu: int) -> dict:
         nprog = ncu * mult
         per_barrier = calibrate(dev, nprog)
         print(f"barrier calib grid={nprog} counter_per_barrier={per_barrier}")
-        for vol in (False, True):
+        # The volatile-load spin timed out in j63 even on a fresh counter (the scalar load
+        # likely never re-reads L2); only the atomic spin is measured.
+        for vol in (False,):
             bar = torch.zeros(1, dtype=torch.int32, device=dev)
             err = torch.zeros(1, dtype=torch.int32, device=dev)
             bad = torch.zeros(1, dtype=torch.int32, device=dev)
             buf = torch.zeros(2 * nprog, dtype=torch.int32, device=dev)
 
             def launch(iters):
+                # A fresh counter per launch: the epoch base assumes every earlier launch ran
+                # the same number of barriers (j63 mixed 0, 10 and 2000 on one counter, so
+                # its barriers waited for a target already passed: invalid, 75% mismatches).
+                bar.zero_()
                 _barrier_bench[(nprog,)](bar, err, buf, bad, iters, per_barrier,
                                          SPIN_VOLATILE=vol, num_warps=4)
 

@@ -230,8 +230,9 @@ def main() -> None:
 
     def run_threads(targets: list[threading.Thread], label: str) -> None:
         for t in targets:
-            t.daemon = True
-            t.start()
+            if t.ident is None:  # not started yet (the overlap's decode thread already runs)
+                t.daemon = True
+                t.start()
         deadline = time.perf_counter() + args.hang_s
         for t in targets:
             t.join(max(0.0, deadline - time.perf_counter()))

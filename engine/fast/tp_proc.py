@@ -673,69 +673,73 @@ class ProcTPModel(tpm.TPModel):
         atexit.register(self.close)
         threading.Thread(target=_watch_child, args=(weakref.ref(self), proc), daemon=True,
                          name="tp-rank1-watch").start()
-        shards = self._shard(lm, mtp)
-        ll = _LLProc(0, self.devices_tp) if cuda else None
-        self.group = ProcGroup(0, self.devices_tp, ll, self._data)
-        shard0, head0 = shards[0]
-        r0 = FastModel(shard0, slots=slots, max_len=max_len, kv_tokens=kv_tokens, use_triton=use_triton,
-                       use_graphs=use_graphs, buckets=buckets, mtp=head0)
-        r0.tp, r0.rank, r0.vocab_offset = self.group, 0, shard0.vocab_offset
-        if len(r0.segments) != 1:
-            raise RuntimeError("a tensor-parallel rank must hold its whole shard on one device")
-        self.ranks = [r0]
-        options = dict(slots=slots, max_len=max_len, use_triton=use_triton, use_graphs=use_graphs,
-                       buckets=tuple(buckets),
-                       kv_tokens=(r0.pool.pages - 1) * PAGE if kv_tokens is None else kv_tokens)
-        leaves: list[torch.Tensor] = []
-        index: dict[int, int] = {}
-        skeleton = _strip(list(shards[1]), leaves, index)
-        del index
-        init = {
-            "devices": [str(d) for d in self.devices_tp],
-            "shard": skeleton[0],
-            "head": skeleton[1],
-            "options": options,
-            "gdn": _gdn_globals(),
-            "attn_splits": attn_splits,
-            "handles": ll.handles() if ll is not None else None,
-        }
-        with self._io:
-            self._conn.send(("init", init))
-        del init, shards, skeleton
-        moved = sum(t.untyped_storage().nbytes() for t in leaves)
-        if leaves:
-            self._send("weights", list(enumerate(leaves)))
-            self._reply("weights_done", REPLY_S)
-        self._keep = leaves  # rank 1's weights: the child maps them; they must outlive it
-        self._send("weights_end")
-        tpm._empty_cache(self.devices_tp)
-        ready = self._reply("ready", REPLY_S)
-        if ll is not None:
-            ll.connect(ready["handles"])
-        if ready["pages"] != r0.pool.pages:
-            raise RuntimeError(f"ranks hold {r0.pool.pages} and {ready['pages']} KV pages")
-        self._peer_vocab = ready["vocab"]
-        self._row_bytes1 = ready["row_bytes"]
-        self.vocab = r0.vocab + self._peer_vocab
-        r0._peers = []
-        push = r0._push_table
+        try:
+            shards = self._shard(lm, mtp)
+            ll = _LLProc(0, self.devices_tp) if cuda else None
+            self.group = ProcGroup(0, self.devices_tp, ll, self._data)
+            shard0, head0 = shards[0]
+            r0 = FastModel(shard0, slots=slots, max_len=max_len, kv_tokens=kv_tokens, use_triton=use_triton,
+                           use_graphs=use_graphs, buckets=buckets, mtp=head0)
+            r0.tp, r0.rank, r0.vocab_offset = self.group, 0, shard0.vocab_offset
+            if len(r0.segments) != 1:
+                raise RuntimeError("a tensor-parallel rank must hold its whole shard on one device")
+            self.ranks = [r0]
+            options = dict(slots=slots, max_len=max_len, use_triton=use_triton, use_graphs=use_graphs,
+                           buckets=tuple(buckets),
+                           kv_tokens=(r0.pool.pages - 1) * PAGE if kv_tokens is None else kv_tokens)
+            leaves: list[torch.Tensor] = []
+            index: dict[int, int] = {}
+            skeleton = _strip(list(shards[1]), leaves, index)
+            del index
+            init = {
+                "devices": [str(d) for d in self.devices_tp],
+                "shard": skeleton[0],
+                "head": skeleton[1],
+                "options": options,
+                "gdn": _gdn_globals(),
+                "attn_splits": attn_splits,
+                "handles": ll.handles() if ll is not None else None,
+            }
+            with self._io:
+                self._conn.send(("init", init))
+            del init, shards, skeleton
+            moved = sum(t.untyped_storage().nbytes() for t in leaves)
+            if leaves:
+                self._send("weights", list(enumerate(leaves)))
+                self._reply("weights_done", REPLY_S)
+            self._keep = leaves  # rank 1's weights: the child maps them; they must outlive it
+            self._send("weights_end")
+            tpm._empty_cache(self.devices_tp)
+            ready = self._reply("ready", REPLY_S)
+            if ll is not None:
+                ll.connect(ready["handles"])
+            if ready["pages"] != r0.pool.pages:
+                raise RuntimeError(f"ranks hold {r0.pool.pages} and {ready['pages']} KV pages")
+            self._peer_vocab = ready["vocab"]
+            self._row_bytes1 = ready["row_bytes"]
+            self.vocab = r0.vocab + self._peer_vocab
+            r0._peers = []
+            push = r0._push_table
 
-        def push_both(slot: int) -> None:  # every page-table change goes to rank 1 as well
-            push(slot)
-            self._send("table", slot, list(r0.slot_pages[slot]))
+            def push_both(slot: int) -> None:  # every page-table change goes to rank 1 as well
+                push(slot)
+                self._send("table", slot, list(r0.slot_pages[slot]))
 
-        r0._push_table = push_both
-        r0._push_table(r0.dummy)
-        self.last_drafts: torch.Tensor | None = None
-        self.graph_error: str | None = None
-        self.capture_mode: str | None = None
-        if ready["fla_pins"] != r0.fla_pins:  # both ranks must run fla with the same configs
-            raise RuntimeError(f"fla pins differ: rank 0 {r0.fla_pins}, rank 1 {ready['fla_pins']}")
-        if ready["kernels"] != dict(r0.triton_kernels):  # and the same kernel paths
-            raise RuntimeError(f"kernel paths differ: rank 0 {r0.triton_kernels}, rank 1 {ready['kernels']}")
-        print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1), "
-              f"fla pins {ready['fla_pins']}, prefill_fused {r0.triton_kernels.get('prefill_fused')}, "
-              f"{moved / 2**30:.1f} GiB of weights handed over", flush=True)
+            r0._push_table = push_both
+            r0._push_table(r0.dummy)
+            self.last_drafts: torch.Tensor | None = None
+            self.graph_error: str | None = None
+            self.capture_mode: str | None = None
+            if ready["fla_pins"] != r0.fla_pins:  # both ranks must run fla with the same configs
+                raise RuntimeError(f"fla pins differ: rank 0 {r0.fla_pins}, rank 1 {ready['fla_pins']}")
+            if ready["kernels"] != dict(r0.triton_kernels):  # and the same kernel paths
+                raise RuntimeError(f"kernel paths differ: rank 0 {r0.triton_kernels}, rank 1 {ready['kernels']}")
+            print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1), "
+                  f"fla pins {ready['fla_pins']}, prefill_fused {r0.triton_kernels.get('prefill_fused')}, "
+                  f"{moved / 2**30:.1f} GiB of weights handed over", flush=True)
+        except BaseException:  # no rank 1 left behind by a failed load
+            self.close()
+            raise
 
     def _shard(self, lm: Any, mtp: Any) -> list:
         """``shard_model`` with rank 1's copies in their own memory pool (see the module doc)."""

@@ -22,4 +22,10 @@ done
 python tools/serve_probe.py $SHAPE --settings ENGINE_TP_PROC=1,ENGINE_TP_PROC=0
 sleep 5
 echo "=== 4. leftover processes"
-ps -eo pid,ppid,etime,args | grep -E "multiprocessing|engine.server" | grep -v grep || echo "RESULT orphans none"
+# Only processes of this job count (the node may run other jobs): SLURM_JOB_ID in their env.
+found=0
+for p in $(ps -eo pid=,args= | grep -E "multiprocessing|engine.server" | grep -v grep | awk '{print $1}'); do
+  env=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -E "^(SLURM_JOB_ID|ENGINE_TP_PROC)=" | tr '\n' ' ')
+  case "$env" in *"SLURM_JOB_ID=${SLURM_JOB_ID:-none} "*) found=1; echo "LEFTOVER $(ps -o pid=,ppid=,etime=,args= -p $p) [$env]";; *) echo "other job: $p [$env]";; esac
+done
+[ $found = 0 ] && echo "RESULT orphans none"

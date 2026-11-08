@@ -157,3 +157,20 @@ def test_child_death_raises_and_close_leaves_no_process(checkpoint: Path) -> Non
     child = other._proc
     other.close()
     assert not child.is_alive()
+
+
+def test_failed_load_stops_the_child(checkpoint: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rank 0's load failing after the child started (j157: the shard's memory pool) leaves
+    no rank-1 process behind."""
+    import multiprocessing
+
+    before = {p.pid for p in multiprocessing.active_children()}
+
+    def fail(self, lm, mtp):  # noqa: ANN001, ANN202
+        raise RuntimeError("test: shard failed")
+
+    monkeypatch.setattr(tp_proc.ProcTPModel, "_shard", fail)
+    with pytest.raises(RuntimeError, match="shard failed"):
+        _load(checkpoint, True)
+    left = [p for p in multiprocessing.active_children() if p.pid not in before]
+    assert not left, left

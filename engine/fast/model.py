@@ -604,7 +604,12 @@ class FastModel:
 
     @torch.inference_mode()
     def warmup(
-        self, slot: int, chunk: int, token_ids: Sequence[int], other: int | None = None
+        self,
+        slot: int,
+        chunk: int,
+        token_ids: Sequence[int],
+        other: int | None = None,
+        pack_tokens: int | None = None,
     ) -> None:
         """Run every prefill variant serving uses once, in ``slot`` (free), then reset it.
 
@@ -647,6 +652,8 @@ class FastModel:
                 self.prefill_packed([(slot, ids[37:101], 37), (other, ids[:64], 0)])
                 end = min(len(ids), max(chunk, 70))
                 self.prefill_packed([(slot, ids[101:102], 101), (other, ids[64:end], 64)])
+                if pack_tokens:
+                    self._warm_pass_lengths(slot, other, min(pack_tokens, len(ids)), ids)
         finally:
             self.reset(slot)
             if other is not None:
@@ -654,6 +661,22 @@ class FastModel:
         for dev in self.devices:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
+
+    def _warm_pass_lengths(self, slot: int, other: int, longest: int, ids: Sequence[int]) -> None:
+        """Packed passes of two fresh segments at every length band up to ``longest`` tokens.
+
+        fla's l2norm (the GDN chunk rule's q/k norm) autotunes once per
+        ``NB = cdiv(tokens * heads, 65536)``, a few seconds each, so every band a
+        pass can reach is run here rather than first in a request.
+        """
+        m = self.layers[next(iter(self.gdn_state))].linear_attn
+        band = max(1, 65536 // max(m.num_v_heads, m.num_k_heads))
+        for total in range(band, longest + band, band):
+            total = min(total, longest)
+            half = total // 2
+            self.reset(slot)
+            self.reset(other)
+            self.prefill_packed([(slot, ids[:half], 0), (other, ids[half:total], 0)])
 
     def _warm_moe_prefill(self, chunk: int) -> None:
         """Compile the grouped prefill experts for every tile shape up to ``chunk`` tokens

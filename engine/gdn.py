@@ -331,7 +331,9 @@ def warmup(generator: Any) -> float:
     model = generator.model
     vocab = int(model.config.get_text_config().vocab_size)
     span = max(1, min(vocab - 1, 4096))
-    ids = [(7919 * i + 11) % span + 1 for i in range(max(generator._chunk, 64) + 64)]
+    # As many ids as the longest prefill pass (``Generator.warmup_tokens``), plus some.
+    longest = max(generator._chunk, getattr(generator, "warmup_tokens", 0), 64)
+    ids = [(7919 * i + 11) % span + 1 for i in range(longest + 64)]
     counters = (generator.decode_steps, generator.decoded_tokens, generator.largest_batch)
     if getattr(generator, "fast", None) is not None:
         # The engine's own forward: its prefills (the GDN chunk kernel installed here, its

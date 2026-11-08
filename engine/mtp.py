@@ -155,6 +155,11 @@ def _snapshot_files(model: str, revision: str | None) -> tuple[dict[str, str], A
     """The weight map of ``model`` and a function from a shard name to its local path."""
     local = Path(model)
     if local.is_dir():
+        if not (local / INDEX).exists():  # a single-file checkpoint
+            from safetensors import safe_open
+
+            with safe_open(str(local / "model.safetensors"), framework="pt") as reader:
+                return dict.fromkeys(reader.keys(), "model.safetensors"), lambda name: str(local / name)
         index = json.loads((local / INDEX).read_text())
         return index["weight_map"], lambda name: str(local / name)
     from huggingface_hub import hf_hub_download

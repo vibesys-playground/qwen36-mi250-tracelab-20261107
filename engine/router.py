@@ -426,6 +426,9 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 "prefix_cache_entries",
                 "prefix_cache_bytes",
                 "prefix_cache_evictions",
+                "mtp_verify_steps",
+                "mtp_proposed",
+                "mtp_accepted",
             )
             body: dict[str, Any] = {"status": "ok"}
             body.update({k: sum(s.get(k, 0) for s in states) for k in counters})

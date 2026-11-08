@@ -57,12 +57,26 @@ from torch.nn import functional as F
 
 from engine import cpu_place
 from engine.fast import kernels
-from engine.fast.model import PAGE, FastModel, Snapshot, _PackPlan, _rms
+from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
 
 CHUNK = 64  # 32-bit words per CTA of the in-graph all-reduce
-CAPACITY = 1 << 16  # words per parity buffer: 64 rows x 2048 BF16 (a verify step of bucket 32)
+# Plan 33 (ENGINE_PREFILL_GRAPH, default on; 0 for eager prefill): single-segment passes of up to the
+# largest bucket replay one captured graph per rank and size (``TPModel.capture_prefill``),
+# their all-reduces in the graph too, so the all-reduce buffer must hold a pass's hidden state.
+PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "1") == "1"
+# Padded pass sizes (rows); a pass of n tokens (DECODE_EXPERT_TOKENS < n <= the largest, 2,048
+# = the server's prefill chunk) runs the smallest size >= n; longer or packed passes run eagerly.
+PG_BUCKETS = tuple(sorted(int(b) for b in os.environ.get(
+    "ENGINE_PREFILL_GRAPH_BUCKETS",
+    "64,80,96,112,128,160,192,224,256,288,320,384,448,512,576,640,704,768,896,1024,1152,1280,"
+    "1408,1536,1792,2048",
+).split(",")))
+# Words per parity buffer: 64 rows x 2048 BF16 (a verify step of bucket 32); with prefill graphs
+# 2^22 (4,096 rows), which costs 2 x (2 x 2^22 x 8 B) = 128 MiB of fine-grained memory per GCD
+# (receive + loopback buffers) and 256 KiB of epochs, against 2 MiB at 2^16.
+CAPACITY = 1 << (22 if PREFILL_GRAPH else 16)
 MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeouts``)
 # Python's thread switch interval while both ranks run eagerly (prefill): the threads hand the
 # GIL to each other at every all-reduce, so a short interval only bounds the odd stall.
@@ -715,6 +729,11 @@ class TPModel:
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="tp-rank1", initializer=cpu_place.pin_rank, initargs=(1,)
         )
+        # Captured prefill passes (plan 33): size -> (graphs, input buffers, logits, drafts) per
+        # rank; filled at load by ``capture_prefill``, never while serving.
+        self.pg: dict[int, tuple[list, list[torch.Tensor], list[torch.Tensor], list]] = {}
+        self.pg_error: str | None = None
+        self.pg_replays = 0
 
     # ------------------------------------------------------------ shared attributes
 
@@ -880,6 +899,9 @@ class TPModel:
     @torch.inference_mode()
     def prefill(self, slot: int, ids: Sequence[int], start: int, follow: int | None = None) -> torch.Tensor:
         self.ranks[0]._ensure_pages(slot, start + len(ids))
+        size = self._pg_size(len(ids))
+        if size is not None:
+            return self._pg_run(size, slot, ids, start, follow)
         if LOCKSTEP:
             return self._lockstep([(slot, ids, start)], [follow])[0]
         parts = self._both(lambda m: m.prefill(slot, ids, start, follow))
@@ -894,6 +916,12 @@ class TPModel:
     ) -> torch.Tensor:
         for slot, ids, start in segments:
             self.ranks[0]._ensure_pages(slot, start + len(ids))
+        if len(segments) == 1:
+            size = self._pg_size(len(segments[0][1]))
+            if size is not None:
+                slot, ids, start = segments[0]
+                follow = follows[0] if follows is not None else None
+                return self._pg_run(size, slot, ids, start, follow)[None]
         if LOCKSTEP:
             if len({slot for slot, _, _ in segments}) != len(segments):
                 raise ValueError("a packed prefill holds at most one segment per slot")
@@ -903,6 +931,123 @@ class TPModel:
         parts = self._both(lambda m: m.prefill_packed(segments, follows))
         self.last_drafts = self.ranks[0].last_drafts
         return self._gather(parts)
+
+    # ------------------------------------------------------------ captured prefill
+
+    def _pg_size(self, count: int) -> int | None:
+        """The captured size a single-segment pass of ``count`` tokens replays, or None."""
+        if not self.pg or count <= DECODE_EXPERT_TOKENS:
+            return None
+        for size in PG_BUCKETS:
+            if size >= count:
+                return size if size in self.pg else None
+        return None
+
+    def _pg_run(self, size: int, slot: int, ids: Sequence[int], start: int,
+                follow: int | None) -> torch.Tensor:
+        """One prefill pass by replaying the size's graphs: the inputs in one copy per rank."""
+        r0 = self.ranks[0]
+        graphs, bufs, outs, drafts = self.pg[size]
+        host = FastModel.pg_host(size, ids, start, follow, slot, r0._g(slot))
+        for buf in bufs:
+            buf.copy_(host)
+        for g, buf in zip(graphs, bufs, strict=True):
+            with torch.cuda.device(buf.device):
+                g.replay()
+        self.pg_replays += 1
+        self.last_drafts = drafts[0].clone() if drafts[0] is not None else None
+        return self._gather(outs)
+
+    def capture_prefill(self) -> None:
+        """Capture one prefill graph per rank for every size of ``PG_BUCKETS`` (largest first,
+        sharing one memory pool per GPU; one pass replays at a time). Each size is first run
+        eagerly twice through the same code on the capture streams (compiling the kernels);
+        those passes write the dummy slot's state and page only. Any failure leaves prefill
+        eager (``pg_error``)."""
+        r0, r1 = self.ranks
+        if not PREFILL_GRAPH or self.group.ll is None or not all(m.pg_supported() for m in self.ranks):
+            return
+        dummy = r0.dummy
+        scratch = r0.slot_pages[dummy][0]
+        pools = {m.embed.device: torch.cuda.graph_pool_handle() for m in self.ranks}
+        streams = {m.embed.device: torch.cuda.Stream(m.embed.device) for m in self.ranks}
+        modes = getattr(self, "_capture_modes", None) or ["global", "thread_local", "relaxed"]
+        t0 = time.perf_counter()
+        try:
+            # The warm passes' page table: every entry the dummy page.
+            for m in self.ranks:
+                for meta in m.devices.values():
+                    meta.page_table[dummy].fill_(scratch)
+            for size in sorted(PG_BUCKETS, reverse=True):
+                count = max(DECODE_EXPERT_TOKENS + 1, size - 3)
+                host = FastModel.pg_host(size, [(7 * j) % 1000 + 100 for j in range(count)], 0, None,
+                                         dummy, r0._g(dummy))
+                bufs = [m._pg_inputs(size) for m in self.ranks]
+                for buf in bufs:
+                    buf.copy_(host)
+
+                def warm(m: FastModel, size: int = size, bufs: list = bufs) -> None:
+                    dev = m.embed.device
+                    stream = streams[dev]
+                    stream.wait_stream(torch.cuda.current_stream(dev))
+                    with torch.cuda.stream(stream):
+                        for _ in range(2):
+                            m._pg_body(bufs[m.rank], size)
+                    torch.cuda.current_stream(dev).wait_stream(stream)
+                    torch.cuda.synchronize(dev)
+
+                self._both(warm)
+
+                def cap(m: FastModel, mode: str, size: int = size, bufs: list = bufs):
+                    dev = m.embed.device
+                    graph = torch.cuda.CUDAGraph()
+                    # no_grad, not inference_mode (as the decode graphs): the first capture of
+                    # a process creates torch's generator graph state, and created as inference
+                    # tensors it would fail every later capture outside inference mode.
+                    with torch.cuda.device(dev), torch.no_grad():
+                        with torch.cuda.graph(graph, pool=pools[dev], stream=streams[dev],
+                                              capture_error_mode=mode):
+                            logits, drafts = m._pg_body(bufs[m.rank], size)
+                    return graph, logits, drafts
+
+                errors = []
+                for mode in modes:
+                    try:
+                        got = [cap(r0, mode)]
+                        got.append(self._pool.submit(self._on_rank1, lambda: cap(r1, mode)).result())
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{mode}: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+                        for dev in self.devices_tp:
+                            try:
+                                torch.cuda.synchronize(dev)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        continue
+                    self.pg[size] = ([g for g, _, _ in got], bufs, [lg for _, lg, _ in got],
+                                     [d for _, _, d in got])
+                    modes = [mode]
+                    break
+                else:
+                    raise RuntimeError(f"size {size}: {' | '.join(errors)}")
+        except Exception as exc:  # noqa: BLE001 - prefill stays eager
+            self.pg.clear()
+            self.pg_error = f"{type(exc).__name__}: {exc}"
+            print(f"engine: prefill graph capture failed, prefill stays eager: {self.pg_error}", flush=True)
+        finally:
+            r0._push_table(dummy)
+            for m in self.ranks:
+                for conv, rec in m.gdn_state.values():
+                    for row in (dummy, dummy + m.gdn_rows):
+                        if row < conv.shape[0]:
+                            conv[row].zero_()
+                            rec[row].zero_()
+            for dev in self.devices_tp:
+                torch.cuda.synchronize(dev)
+        if self.pg:
+            print(f"engine: prefill graphs for {len(self.pg)} sizes {min(self.pg)}..{max(self.pg)} "
+                  f"in {time.perf_counter() - t0:.1f}s; reserved "
+                  f"{[round(torch.cuda.memory_reserved(d) / 2**30, 2) for d in self.devices_tp]} GiB",
+                  flush=True)
 
     # ------------------------------------------------------------ lock-step prefill
 
@@ -1235,3 +1380,5 @@ class TPModel:
                 segs = r0.vsegments if is_verify else r0.segments
                 if self.graph_error is None and size not in segs[0].graphs:
                     self.capture(size, is_verify)
+        if not self.pg and self.pg_error is None:
+            self.capture_prefill()

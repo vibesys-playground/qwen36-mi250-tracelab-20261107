@@ -75,6 +75,14 @@ def use_fast_path(setting: str | None, gpu: bool) -> bool:
     return gpu
 
 
+def use_tensor_parallel() -> bool:
+    """``ENGINE_TP``: "2" splits every layer over the replica's two GPUs (``engine.fast.tp``),
+    "1" keeps the layer split; it applies only with exactly two visible GPUs."""
+    from engine.fast import tp
+
+    return tp.size() == 2 and torch.cuda.is_available() and torch.cuda.device_count() == 2
+
+
 @dataclass(frozen=True)
 class Step:
     """One generated token. ``emit`` is false for an end-of-sequence token that ends the output."""
@@ -555,14 +563,20 @@ class Generator:
             from engine.fast.model import FastModel, FastPathUnavailable
 
             head = speculative.load_head(lm, model, revision)
+            fast_options = {
+                "slots": int(os.environ.get("ENGINE_SLOTS", "32")),
+                # A verify step writes its draft one position past the last token.
+                "max_len": options["max_model_len"] + (1 if head is not None else 0),
+                "mtp": head,
+            }
             try:
-                fast = FastModel(
-                    lm,
-                    slots=int(os.environ.get("ENGINE_SLOTS", "32")),
-                    # A verify step writes its draft one position past the last token.
-                    max_len=options["max_model_len"] + (1 if head is not None else 0),
-                    mtp=head,
-                )
+                if use_tensor_parallel():
+                    # ENGINE_TP=2: every layer split over the replica's two GPUs (plan 13).
+                    from engine.fast.tp import TPModel
+
+                    fast = TPModel(lm, **fast_options)
+                else:
+                    fast = FastModel(lm, **fast_options)
             except FastPathUnavailable as exc:
                 print(f"engine: fast path unavailable ({exc}); using Transformers", flush=True)
             else:
@@ -571,7 +585,7 @@ class Generator:
                 print(
                     f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
                     f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "
-                    f"mtp={head is not None}",
+                    f"mtp={head is not None} tp={2 if use_tensor_parallel() else 1}",
                     flush=True,
                 )
         generator = cls(lm, tokenizer, eos_ids, fast=fast, **options)

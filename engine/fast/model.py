@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import traceback
 from pathlib import Path
 from collections.abc import Callable, Sequence
@@ -327,6 +328,13 @@ class FastModel:
             "moe_prefill": self.use_triton and moe_prefill.enabled(),
         }
         self.buckets = sorted(buckets)
+        # Tensor parallelism (``engine.fast.tp``): this model is one rank's shard and ``tp`` the
+        # group whose all-reduces join the partial sums; None runs the whole model here.
+        self.tp = None
+        self.rank = 0
+        self.vocab_offset = 0  # the first vocabulary row of this rank's lm_head shard
+        self._peers: list[FastModel] = []  # ranks whose page tables mirror this one's
+        self._lock = threading.RLock()  # shared by the ranks: page allocation and resets
         # The checkpoint's MTP head (``engine.mtp.MTPHead``) for self-speculative decoding
         # (``verify``): an extra full-attention layer, index ``mtp_index``, on the lm_head's
         # device, whose KV lives in the same pages as the model's (one more pool).
@@ -486,20 +494,22 @@ class FastModel:
         pages = self.slot_pages[slot]
         if pages:
             row[: len(pages)] = torch.tensor(pages, dtype=torch.int32)
-        for meta in self.devices.values():
-            meta.page_table[slot].copy_(row)
+        for model in [self, *self._peers]:
+            for meta in model.devices.values():
+                meta.page_table[slot].copy_(row)
 
     def _ensure_pages(self, slot: int, length: int) -> None:
         """Give ``slot`` pages for its first ``length`` tokens."""
         if length > self.max_len:
             raise RuntimeError(f"sequence of {length} tokens exceeds the context {self.max_len}")
-        pages = self.slot_pages[slot]
-        grew = False
-        while len(pages) * PAGE < length:
-            pages.append(self.pool.alloc())
-            grew = True
-        if grew:
-            self._push_table(slot)
+        with self._lock:
+            pages = self.slot_pages[slot]
+            grew = False
+            while len(pages) * PAGE < length:
+                pages.append(self.pool.alloc())
+                grew = True
+            if grew:
+                self._push_table(slot)
 
     def _g(self, slot: int) -> int:
         """The Gated DeltaNet state row that holds ``slot``'s current state."""
@@ -514,10 +524,11 @@ class FastModel:
 
     def reset(self, slot: int) -> None:
         """Release ``slot``'s pages and zero its recurrent and convolution state."""
-        for page in self.slot_pages[slot]:
-            self.pool.unref(page)
-        self.slot_pages[slot] = []
-        self.bank[slot] = 0
+        with self._lock:
+            for page in self.slot_pages[slot]:
+                self.pool.unref(page)
+            self.slot_pages[slot] = []
+            self.bank[slot] = 0
         for conv, rec in self.gdn_state.values():
             conv[slot].zero_()
             rec[slot].zero_()
@@ -615,21 +626,7 @@ class FastModel:
         compile and tune before the server answers. Decode is warmed by
         ``capture_all``.
         """
-        if self.triton_kernels["moe_prefill"]:
-            self._warm_moe_prefill(chunk)
-        seen = set()
-        for i, (conv, _) in self.gdn_state.items():
-            weight = self.layers[i].linear_attn.conv1d.weight
-            key = (weight.device, tuple(weight.shape))
-            if key in seen:
-                continue
-            seen.add(key)
-            kernel = conv.shape[-1]
-            for length in range(CONV_BUCKET, chunk + kernel + CONV_BUCKET, CONV_BUCKET):
-                window = torch.zeros(
-                    (conv.shape[1], max(length, kernel + 1)), dtype=conv.dtype, device=conv.device
-                )
-                prefill_conv(window, weight, 1)
+        self._warm_kernels(chunk)
         ids = list(token_ids)
         try:
             self.prefill(slot, ids[:37], 0)  # fresh, no initial state
@@ -654,6 +651,25 @@ class FastModel:
         for dev in self.devices:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
+
+    def _warm_kernels(self, chunk: int) -> None:
+        """The prefill kernels that compile per problem size: the grouped experts and the
+        bucketed convolutions up to ``chunk`` tokens."""
+        if self.triton_kernels["moe_prefill"]:
+            self._warm_moe_prefill(chunk)
+        seen = set()
+        for i, (conv, _) in self.gdn_state.items():
+            weight = self.layers[i].linear_attn.conv1d.weight
+            key = (weight.device, tuple(weight.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            kernel = conv.shape[-1]
+            for length in range(CONV_BUCKET, chunk + kernel + CONV_BUCKET, CONV_BUCKET):
+                window = torch.zeros(
+                    (conv.shape[1], max(length, kernel + 1)), dtype=conv.dtype, device=conv.device
+                )
+                prefill_conv(window, weight, 1)
 
     def _warm_moe_prefill(self, chunk: int) -> None:
         """Compile the grouped prefill experts for every tile shape up to ``chunk`` tokens
@@ -751,7 +767,7 @@ class FastModel:
         then its draft (see ``verify``)."""
         states = slots if states is None else states
         if self._fused_rows(x.shape[0], verify):
-            return self.fused.layer(i, x, slots, positions, meta, states, verify)
+            return self._fused_layer(i, x, slots, positions, meta, states, verify)
         layer = self.layers[i]
         fused = self.triton_kernels["fused"]
         if fused:
@@ -762,12 +778,54 @@ class FastModel:
             h = self._gdn_verify(i, h, states) if verify else self._gdn_decode(i, h, states)
         else:
             h = self._attn_decode(i, h, slots, positions, meta)
+        h = self._reduce(h)
         if fused:
             x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
         else:
             x = x + h
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
-        return x + self._moe(layer.mlp, h, decode=True)
+        return self._reduce(self._moe(layer.mlp, h, decode=True), x)
+
+    def _fused_layer(
+        self,
+        i: int,
+        x: torch.Tensor,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+        meta: _Device,
+        states: torch.Tensor | None = None,
+        verify: bool = False,
+    ) -> torch.Tensor:
+        """``FusedDecode.layer``; under tensor parallelism the same kernels on this rank's shard,
+        with the mixer's and the MoE's partial sums all-reduced (the MoE kernel gets a zero
+        residual, the all-reduce adds the real one)."""
+        if self.tp is None:
+            return self.fused.layer(i, x, slots, positions, meta, states, verify)
+        fused = self.fused
+        layer = fused._layer(i)
+        states = slots if states is None else states
+        with kernels.on_device(x):
+            _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
+            if fused._is_gdn(i):
+                h = fused._gdn_verify(i, h, states) if verify else fused._gdn(i, h, states)
+            else:
+                h = fused._attn(i, h, slots, positions, meta)
+            h = self._reduce(h)
+            x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
+            return self._reduce(fused._moe(i, torch.zeros_like(x), h), x)
+
+    def _reduce(self, h: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        """``residual + h`` (or ``h``) with ``h`` summed over the tensor-parallel ranks."""
+        if self.tp is None:
+            return h if residual is None else residual + h
+        return self.tp.allreduce(self.rank, h, residual)
+
+    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Greedy pick per row of ``logits`` (this rank's vocabulary shard under tensor
+        parallelism: the pick over the whole vocabulary, ties to the lowest index)."""
+        if self.tp is None:
+            return logits.argmax(-1)
+        return self.tp.argmax(self.rank, logits, self.vocab_offset)
 
     def _fused_rows(self, rows: int, verify: bool = False) -> bool:
         """Whether a decode (or verify, or MTP head) step of ``rows`` rows takes the fused
@@ -955,9 +1013,9 @@ class FastModel:
                 h = self._gdn_prefill(i, h, slot)
             else:
                 h = self._attn_prefill(i, h, slot, positions, start)
-            x = x + h
+            x = self._reduce(h, x)
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
-            x = x + self._moe(layer.mlp, h)
+            x = self._reduce(self._moe(layer.mlp, h), x)
         # The logits exactly as without the head (the norm over the last row alone).
         last = _rms(x[-1:].to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
         logits = F.linear(last, self.lm_head).float()
@@ -1079,9 +1137,9 @@ class FastModel:
                 h = self._gdn_prefill_packed(i, h, plan.on(ldev))
             else:
                 h = self._attn_prefill_packed(i, h, plan.on(ldev))
-            x = x + h
+            x = self._reduce(h, x)
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
-            x = x + self._moe(layer.mlp, h)
+            x = self._reduce(self._moe(layer.mlp, h), x)
         # The logits exactly as without the head (the norm over the segments' last rows alone).
         last = x.index_select(0, plan.on(x.device).last).to(self.final_norm.device)
         last = _rms(last, self.final_norm, self.eps).to(self.lm_head.device)
@@ -1191,9 +1249,9 @@ class FastModel:
         """The head's decoder layer (gated full attention by ``attend``, then the MoE)."""
         layer = self.mtp.layers[0]
         h = _rms(z, layer.input_layernorm.weight, self.eps)
-        z = z + attend(h)
+        z = self._reduce(attend(h), z)
         h = _rms(z, layer.post_attention_layernorm.weight, self.eps)
-        return z + self._moe(layer.mlp, h, decode=decode)
+        return self._reduce(self._moe(layer.mlp, h, decode=decode), z)
 
     def _mtp_in(self, hidden: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
         """``fc(cat(norm(embed(x[t+1])), norm(H[t])))``: embedding first (``engine.mtp``)."""
@@ -1230,35 +1288,35 @@ class FastModel:
         if picked:
             rows = torch.tensor([r for r, _ in picked], dtype=torch.long, device=dev)
             segs = torch.tensor([k for _, k in picked], dtype=torch.long, device=dev)
-            tokens.index_copy_(0, rows, logits.index_select(0, segs).argmax(-1))
+            tokens.index_copy_(0, rows, self._argmax(logits.index_select(0, segs)))
         on = plan.on(dev)
         z = self._mtp_layer(
             self._mtp_in(hidden, tokens),
             lambda h: self._attn_prefill_packed(self.mtp_index, h, on),
             decode=False,
         )
-        self.last_drafts = self._mtp_logits(z.index_select(0, on.last)).argmax(-1)
+        self.last_drafts = self._argmax(self._mtp_logits(z.index_select(0, on.last)))
 
     def _mtp_decode(self, hidden: torch.Tensor, tokens: torch.Tensor, meta: _Device) -> torch.Tensor:
         """The head on one pair per row at the rows' positions; its greedy guess per row."""
         n = hidden.shape[0]
         slots, positions = meta.slots[:n], meta.positions[:n]
         if self._fused_rows(n, verify=True):  # the head's layer through the fused kernels
-            z = self.fused.layer(self.mtp_index, self._mtp_in(hidden, tokens), slots, positions, meta)
-            return self._mtp_logits(z).argmax(-1)
+            z = self._fused_layer(self.mtp_index, self._mtp_in(hidden, tokens), slots, positions, meta)
+            return self._argmax(self._mtp_logits(z))
         z = self._mtp_layer(
             self._mtp_in(hidden, tokens),
             lambda h: self._attn_decode(self.mtp_index, h, slots, positions, meta),
             decode=True,
         )
-        return self._mtp_logits(z).argmax(-1)
+        return self._argmax(self._mtp_logits(z))
 
     def _verify_head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         """The verify step's last op: logits from the normed hidden ``x``, each row's greedy
         pick, and the MTP head on (hidden, pick) per row. Leaves ``[2, rows]`` (picks, drafts)
         in ``_verify_out``; returns the logits."""
         logits = self._logits(x, verify=True)
-        picks = logits.argmax(-1)
+        picks = self._argmax(logits)
         self._verify_out = torch.stack((picks, self._mtp_decode(x, picks, meta)))
         return logits
 
@@ -1415,9 +1473,10 @@ class FastModel:
                         streams[seg.device] = torch.cuda.Stream(seg.device)
                     stream = streams[seg.device]
                     stream.wait_stream(torch.cuda.current_stream(seg.device))
+                    # Under tensor parallelism the ranks warm up together first (``TPModel``).
                     with torch.cuda.stream(stream):
-                        for _ in range(2):  # compile the Triton kernels, warm the BLAS handles
-                            seg.run(static_in, meta)
+                        for _ in range(2 if self.tp is None else 0):
+                            seg.run(static_in, meta)  # compile the Triton kernels, warm BLAS
                     torch.cuda.current_stream(seg.device).wait_stream(stream)
                     torch.cuda.synchronize(seg.device)
                     graph = torch.cuda.CUDAGraph()

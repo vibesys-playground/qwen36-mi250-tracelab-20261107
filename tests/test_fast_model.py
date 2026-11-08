@@ -132,3 +132,21 @@ def test_snapshot_restore_continues_like_a_cold_prefill(generator: Generator) ->
     fast.reset(1)
     fast.release(snap)
     assert fast.pool.free > free
+
+
+@pytest.mark.skipif(kernels.triton is None, reason="needs Triton (TRITON_INTERPRET=1 on the CPU)")
+def test_attention_reads_the_last_page_of_the_pool() -> None:
+    """Page ids near the pool's end address the right memory (int64 offsets)."""
+    torch.manual_seed(0)
+    pages, heads, page, dim = 40, 2, 16, 32
+    k_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16)
+    v_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16)
+    table = torch.zeros(2, 4, dtype=torch.int32)
+    table[0, :3] = torch.tensor([pages - 1, pages - 2, 0])
+    table[1, :1] = torch.tensor([pages - 1])
+    q = torch.randn(2, 8, dim).to(torch.bfloat16)
+    slots = torch.tensor([0, 1])
+    lengths = torch.tensor([40, 16], dtype=torch.int32)
+    ref = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=False)
+    got = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=True)
+    assert float((ref.float() - got.float()).abs().max()) < 2e-2

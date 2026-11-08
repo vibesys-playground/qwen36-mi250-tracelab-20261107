@@ -291,7 +291,9 @@ class FastModel:
             free, _ = torch.cuda.mem_get_info(dev)
             fit = int(max(0, free - reserve) * fraction) // (count * page_bytes)
             pages = fit if pages is None else min(pages, fit)
-        pages = min(pages or 0, (self.slots + 1) * self.max_pages + 1)
+        # No more than ENGINE_KV_SEQS full-length sequences at once (8: the replay's sessions).
+        seqs = min(self.slots, int(os.environ.get("ENGINE_KV_SEQS", "8")))
+        pages = min(pages or 0, (seqs + 1) * self.max_pages + 1)
         if pages < need:
             raise RuntimeError(
                 f"the GPUs hold {pages} KV pages per attention layer; one {self.max_len}-token "

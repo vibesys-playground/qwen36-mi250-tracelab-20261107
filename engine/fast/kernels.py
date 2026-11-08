@@ -22,6 +22,7 @@ one model size.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -35,6 +36,15 @@ except ImportError:  # pragma: no cover - depends on the torch build
     tl = None
 
 INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+
+
+def on_device(t: torch.Tensor):
+    """Make ``t``'s GPU current: Triton launches on the current device, not on its tensors'.
+
+    Without this a kernel for a layer on another GPU runs on the current one with foreign
+    pointers (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on a multi-GPU layer split).
+    """
+    return torch.cuda.device(t.device) if t.device.type == "cuda" else contextlib.nullcontext()
 
 
 def triton_usable(device: torch.device) -> bool:
@@ -174,34 +184,36 @@ def moe_decode(
     ids = top_k_index.reshape(-1).contiguous()
     weights = top_k_weights.reshape(-1).contiguous()
     act = torch.empty((tokens * top_k, inter), dtype=torch.bfloat16, device=x.device)
-    _moe_gate_up_kernel[(tokens * top_k, triton.cdiv(inter, MOE_BLOCK_N))](
-        x,
-        gate_up,
-        ids,
-        act,
-        hidden,
-        inter,
-        gate_up.stride(0),
-        gate_up.stride(1),
-        TOP_K=top_k,
-        BLOCK_N=MOE_BLOCK_N,
-        BLOCK_K=MOE_BLOCK_K,
-    )
+    with on_device(x):
+        _moe_gate_up_kernel[(tokens * top_k, triton.cdiv(inter, MOE_BLOCK_N))](
+            x,
+            gate_up,
+            ids,
+            act,
+            hidden,
+            inter,
+            gate_up.stride(0),
+            gate_up.stride(1),
+            TOP_K=top_k,
+            BLOCK_N=MOE_BLOCK_N,
+            BLOCK_K=MOE_BLOCK_K,
+        )
     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
-    _moe_down_kernel[(tokens, triton.cdiv(hidden, MOE_BLOCK_N))](
-        act,
-        down,
-        ids,
-        weights,
-        out,
-        hidden,
-        inter,
-        down.stride(0),
-        down.stride(1),
-        TOP_K=top_k,
-        BLOCK_N=MOE_BLOCK_N,
-        BLOCK_K=min(MOE_BLOCK_K, triton.next_power_of_2(inter)),
-    )
+    with on_device(act):
+        _moe_down_kernel[(tokens, triton.cdiv(hidden, MOE_BLOCK_N))](
+            act,
+            down,
+            ids,
+            weights,
+            out,
+            hidden,
+            inter,
+            down.stride(0),
+            down.stride(1),
+            TOP_K=top_k,
+            BLOCK_N=MOE_BLOCK_N,
+            BLOCK_K=min(MOE_BLOCK_K, triton.next_power_of_2(inter)),
+        )
     return out
 
 
@@ -296,22 +308,23 @@ def gdn_recurrent_(
     assert state.is_contiguous() and state.dtype == torch.float32
     out = torch.empty((batch, heads, dv), dtype=torch.float32, device=q.device)
     bv = min(32, dv)
-    _gdn_step_kernel[(batch, heads, triton.cdiv(dv, bv))](
-        state,
-        slots,
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        g.contiguous(),
-        beta.contiguous(),
-        out,
-        heads,
-        state.stride(0),
-        state.stride(1),
-        DK=dk,
-        DV=dv,
-        BV=bv,
-    )
+    with on_device(state):
+        _gdn_step_kernel[(batch, heads, triton.cdiv(dv, bv))](
+            state,
+            slots,
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            g.contiguous(),
+            beta.contiguous(),
+            out,
+            heads,
+            state.stride(0),
+            state.stride(1),
+            DK=dk,
+            DV=dv,
+            BV=bv,
+        )
     return out
 
 
@@ -450,28 +463,29 @@ def paged_decode_attention(
     acc = torch.empty((batch, q_heads, splits, dim), dtype=torch.float32, device=q.device)
     ml = torch.empty((batch, q_heads, splits, 2), dtype=torch.float32, device=q.device)
     assert k_pool.stride() == v_pool.stride() and k_pool.stride(-1) == 1
-    _paged_attn_kernel[(batch, kv_heads, splits)](
-        q.contiguous(),
-        k_pool,
-        v_pool,
-        page_table,
-        slots,
-        lengths,
-        acc,
-        ml,
-        scale,
-        q_heads,
-        page_table.stride(0),
-        k_pool.stride(0),
-        k_pool.stride(1),
-        k_pool.stride(2),
-        GROUP=group,
-        GROUP_PAD=max(16, triton.next_power_of_2(group)),
-        D=dim,
-        PAGE=page,
-        SPLITS=splits,
-        DOT_F32=INTERPRET,
-    )
+    with on_device(q):
+        _paged_attn_kernel[(batch, kv_heads, splits)](
+            q.contiguous(),
+            k_pool,
+            v_pool,
+            page_table,
+            slots,
+            lengths,
+            acc,
+            ml,
+            scale,
+            q_heads,
+            page_table.stride(0),
+            k_pool.stride(0),
+            k_pool.stride(1),
+            k_pool.stride(2),
+            GROUP=group,
+            GROUP_PAD=max(16, triton.next_power_of_2(group)),
+            D=dim,
+            PAGE=page,
+            SPLITS=splits,
+            DOT_F32=INTERPRET,
+        )
     m, l = ml[..., 0], ml[..., 1]
     top = m.max(dim=-1, keepdim=True).values
     w = torch.exp(m - top)
@@ -573,10 +587,11 @@ def add_rms(
     rows, n = x.shape
     out = torch.empty_like(x)
     total = torch.empty_like(x) if h is not None else x
-    _add_rms_kernel[(rows,)](
-        x, h if h is not None else x, weight, total, out, eps, N=n,
-        BLOCK=triton.next_power_of_2(n), HAS_H=h is not None,
-    )
+    with on_device(x):
+        _add_rms_kernel[(rows,)](
+            x, h if h is not None else x, weight, total, out, eps, N=n,
+            BLOCK=triton.next_power_of_2(n), HAS_H=h is not None,
+        )
     return total, out
 
 
@@ -588,10 +603,11 @@ def gdn_conv_(
     kernel = state.shape[-1]
     out = torch.empty_like(x)
     block = 256
-    _gdn_conv_kernel[(batch, triton.cdiv(channels, block))](
-        state, slots, x.contiguous(), weight.contiguous(), out, channels, state.stride(0),
-        K=kernel, BLOCK=block,
-    )
+    with on_device(state):
+        _gdn_conv_kernel[(batch, triton.cdiv(channels, block))](
+            state, slots, x.contiguous(), weight.contiguous(), out, channels, state.stride(0),
+            K=kernel, BLOCK=block,
+        )
     return out
 
 
@@ -608,10 +624,11 @@ def gdn_fused_(
     batch = mixed.shape[0]
     heads, dk, dv = m.num_v_heads, m.head_k_dim, m.head_v_dim
     out = torch.empty((batch, heads * dv), dtype=mixed.dtype, device=mixed.device)
-    _gdn_fused_kernel[(batch, heads)](
-        state, slots, mixed.contiguous(), a.contiguous(), b.contiguous(), z.contiguous(),
-        m.A_log, m.dt_bias, m.norm.weight, out, mixed.shape[1], heads, state.stride(0),
-        state.stride(1), m.norm.variance_epsilon, dk ** -0.5,
-        RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
-    )
+    with on_device(state):
+        _gdn_fused_kernel[(batch, heads)](
+            state, slots, mixed.contiguous(), a.contiguous(), b.contiguous(), z.contiguous(),
+            m.A_log, m.dt_bias, m.norm.weight, out, mixed.shape[1], heads, state.stride(0),
+            state.stride(1), m.norm.variance_epsilon, dk ** -0.5,
+            RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
+        )
     return out

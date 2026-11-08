@@ -98,7 +98,7 @@ def _export(hip, ptr: int) -> bytes:
     rc = hip.hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr))
     if rc != 0:
         raise RuntimeError(f"hipIpcGetMemHandle failed: {rc}")
-    return bytes(h.reserved)
+    return ctypes.string_at(ctypes.addressof(h), 64)  # never h.reserved: it stops at a NUL
 
 
 def _open(hip, handle: bytes, info: dict) -> int:
@@ -108,7 +108,7 @@ def _open(hip, handle: bytes, info: dict) -> int:
     fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), _Handle, ctypes.c_uint]
     fn.restype = ctypes.c_int
     h = _Handle()
-    ctypes.memmove(h.reserved, handle, 64)
+    ctypes.memmove(ctypes.addressof(h), handle, 64)
     tried = []
     for flags in (1, 0):
         ptr = ctypes.c_void_p()
@@ -224,6 +224,11 @@ def _ipc_body(rank: int, conn, barrier, port: int, emit) -> None:
         emit("ipc_share", **info)
         hip.hipSetDevice(rank)
         torch.cuda.set_device(rank)
+        if info["ok"] and name == "torch":
+            # j146: torch maps the peer's memory for the peer's GPU only; the LL kernel on this
+            # GPU faulted writing to it. Record that it opens, and do not run the kernel on it.
+            emit("ipc_torch_mapping_not_used", why="mapped for the owner GPU only (j146 fault)")
+            break
         if info["ok"]:
             shared = (name, small, big, psmall, pbig)
             break
@@ -559,9 +564,14 @@ def passes(args) -> int:
         calls[rank] += 1
         return orig(rank, x, residual)
 
-    group.allreduce = counting
-    timed("both", 561)
-    group.allreduce = orig
+    def counted(fn):  # only the measured pass (the context's passes run before the wrap)
+        group.allreduce = counting
+        try:
+            fn()
+        finally:
+            group.allreduce = orig
+
+    timed("both", 561, counted)
     result("allreduce_calls_per_pass", per_rank=dict(calls))
     walls: dict[tuple[str, int], list[float]] = defaultdict(list)
     for _ in range(args.reps):

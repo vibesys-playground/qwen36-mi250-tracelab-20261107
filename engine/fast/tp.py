@@ -61,6 +61,8 @@ triton, tl = kernels.triton, kernels.tl
 CHUNK = 64  # 32-bit words per CTA of the in-graph all-reduce
 CAPACITY = 1 << 16  # words per parity buffer: 64 rows x 2048 BF16 (a verify step of bucket 32)
 MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeouts``)
+# Seconds an eager all-reduce waits for the peer thread before failing the pass.
+WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
 
 
 def size() -> int:
@@ -248,7 +250,7 @@ class Group:
             while (seq, 1 - rank) not in self._box:
                 if self._broken is not None:
                     raise RuntimeError(f"tensor-parallel peer failed: {self._broken}")
-                if not self._cv.wait(timeout=900):
+                if not self._cv.wait(timeout=WAIT_S):
                     raise RuntimeError("tensor-parallel peer did not reach the all-reduce")
             theirs, their_event = self._box.pop((seq, 1 - rank))
         if not theirs.is_cuda or theirs.device == x.device:
@@ -587,6 +589,11 @@ class TPModel:
             raise
         return [out0, future.result()]
 
+    def _on_rank1(self, fn: Callable[[], Any]) -> Any:
+        """``fn()`` on the worker thread with rank 1's GPU current."""
+        with _on(self.ranks[1]):
+            return fn()
+
     def _gather(self, parts: Sequence[torch.Tensor]) -> torch.Tensor:
         """Concatenate the ranks' vocabulary shards of fp32 logits on rank 0's device."""
         dev = parts[0].device
@@ -877,17 +884,29 @@ class TPModel:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"warm: {type(exc).__name__}: {exc}")
                 break
-            results = [m._capture(size, mode, verify) for m in self.ranks]
+            # Each rank captures on the thread that warmed it (BLAS handles are per thread), one
+            # after the other (a capture must not overlap another thread's HIP calls).
+            r1 = self.ranks[1]
+            results = [self.ranks[0]._capture(size, mode, verify)]
+            results.append(self._pool.submit(self._on_rank1, lambda: r1._capture(size, mode, verify)).result())
             if all(r is None for r in results):
                 self._capture_modes = [mode]
                 self.capture_mode = mode
                 return
+            # A failed capture clears that rank's graphs of every bucket: clear both ranks' (the
+            # next steps recapture what they need), and drop the capture streams, which a
+            # broken capture may leave unusable.
             for m in self.ranks:
                 for seg in m.segments + m.vsegments:
-                    seg.graphs.pop(size, None)
-                    seg.inputs.pop(size, None)
-                    seg.outputs.pop(size, None)
+                    seg.graphs.clear()
+                    seg.inputs.clear()
+                    seg.outputs.clear()
+                m.__dict__.pop("_capture_streams", None)
+            for dev in self.devices_tp:
+                torch.cuda.synchronize(dev)
             errors.append(f"{mode}: {[r for r in results if r]}")
+            print(f"engine: tensor-parallel capture of bucket {size} (verify={verify}) failed in "
+                  f"mode {mode}: {[r for r in results if r]}", flush=True)
         self.graph_error = " | ".join(errors)
 
     def capture_all(self, decode: bool = True, verify: bool = True) -> None:

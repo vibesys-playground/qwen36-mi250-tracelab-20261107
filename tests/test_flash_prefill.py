@@ -126,4 +126,5 @@ def test_choose_shapes_only():
     for count in (1, 61, 561, 999, 1000, 1650, 4000):
         cfg = fp.choose(count, 3600 - min(count, 3600), 1, 8, 104)
         assert cfg["split"] >= 1 and cfg["block_r"] * 8 >= 16
-    assert fp.choose(4000, 0, 1, 8, 104)["split"] == 1
+    assert fp.choose(61, 0, 1, 8, 104)["split"] == 1  # one key block: no split
+    assert fp.choose(561, 3040, 1, 8, 104) == fp.choose(561, 3040, 1, 8, 104)

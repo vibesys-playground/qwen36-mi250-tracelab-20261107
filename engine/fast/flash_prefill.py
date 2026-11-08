@@ -176,13 +176,23 @@ if triton is not None:
         tl.store(out_ptr + row * D + d, _bf16(o * sig, WIDEN).to(tl.bfloat16))
 
 
-# Tile and split choice from shapes alone (plan 35, j163 and the tune sweep of its build job).
-# Short segments: 8 rows x GROUP heads per program, 64-key blocks, the keys split so the CUs
-# fill; long ones: 16 rows, 128-key blocks, no split once the tiles fill the CUs.
-LONG_FROM = 1000  # new tokens at which the 16-row x 128-key tile takes over
-SPLIT_PROGRAMS = 2.5  # target programs per CU of a split launch
-SPLIT_MAX = 16
-SPLIT_MIN_BLOCKS = 4  # key blocks per split at least
+# Tile and split choice from shapes alone (plan 35): the fastest of the tune sweep in job j168
+# (tools/flash_prefill_probe.py --tune, one GCD, 8 query heads x 1 KV head, D=256, on a
+# 3,600-token context, and 2,300 after 5,800), per range of new tokens T. Knobs per row:
+# (rows per program, keys per block, waves_per_eu or None, key splits). The split is capped so
+# that every split holds SPLIT_MIN_BLOCKS key blocks (short contexts run unsplit).
+_TABLE = (
+    # T below   rows  keys  wpe   splits    measured (us/layer)
+    (96,        8,    64,   None, 13),    # T=61: 75.5
+    (192,       8,    64,   None, 6),     # T=128: 117.4
+    (330,       8,    64,   None, 3),     # T=256: 198.6
+    (480,       16,   128,  1,    4),     # T=400: 239.4
+    (780,       16,   64,   None, 2),     # T=561: 327.3, 700: 339.7
+    (1100,      16,   128,  1,    3),     # T=850: 471.0, 1000: 479.7
+    (1300,      16,   128,  1,    4),     # T=1200: 569.3
+    (None,      16,   64,   None, 2),     # T=1400: 612.8, 1650: 661.7, 2300 (after 5,800): 1875.4
+)
+SPLIT_MIN_BLOCKS = 4
 
 _CUS: dict = {}
 
@@ -198,12 +208,14 @@ def _cus(device: torch.device) -> int:
 
 def choose(count: int, start: int, heads: int, group: int, cus: int = 104) -> dict:
     """Launch knobs for a segment of ``count`` queries after ``start`` cached keys."""
-    if count >= LONG_FROM:
-        cfg = {"block_r": 16, "block_n": 128, "num_warps": 4, "num_stages": 1, "waves_per_eu": 1}
-    else:
-        cfg = {"block_r": 8, "block_n": 64, "num_warps": 4, "num_stages": 1}
-    cfg["block_r"] = max(cfg["block_r"], 16 // group)  # M = rows x group >= 16 for tl.dot
-    cfg["split"] = split_for(count, start, heads, cfg["block_r"], cfg["block_n"], cus)
+    for below, rows, keys, wpe, splits in _TABLE:
+        if below is None or count < below:
+            break
+    cfg = {"block_r": max(rows, 16 // group), "block_n": keys, "num_warps": 4, "num_stages": 1}
+    if wpe is not None:
+        cfg["waves_per_eu"] = wpe
+    blocks = -(-(start + count) // keys)
+    cfg["split"] = max(1, min(splits, blocks // SPLIT_MIN_BLOCKS))
     return cfg
 
 
@@ -213,8 +225,7 @@ def split_for(count: int, start: int, heads: int, rows: int, block_n: int, cus: 
     if tiles >= cus:
         return 1
     blocks = -(-(start + count) // block_n)
-    want = math.ceil(SPLIT_PROGRAMS * cus / tiles)
-    return max(1, min(want, blocks // SPLIT_MIN_BLOCKS, SPLIT_MAX))
+    return max(1, min(math.ceil(2.5 * cus / tiles), blocks // SPLIT_MIN_BLOCKS, 16))
 
 
 def flash_prefill_attention(

@@ -562,6 +562,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"engine: weights loaded, allocated per GPU {per_gpu}", flush=True)
     print(f"engine: serving {args.model} on http://{args.host}:{args.port}", flush=True)
+    try:
+        from engine.fast import jit_log
+
+        jit_log.mark_serving()
+    except ImportError:
+        pass
     server.serve_forever()
 
 

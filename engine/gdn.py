@@ -197,6 +197,9 @@ def _fla_chunk(
         )
 
 
+fla_chunk = _fla_chunk  # what ``install`` binds for the chunked rule under ENGINE_GDN=fla
+
+
 def _fla_recurrent(
     query: torch.Tensor,
     key: torch.Tensor,

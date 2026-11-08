@@ -420,6 +420,8 @@ class _FrontHandler(BaseHTTPRequestHandler):
             counters = (
                 "decode_steps",
                 "decoded_tokens",
+                "prefill_passes",
+                "prefill_segments",
                 "prefilled_tokens",
                 "cached_tokens",
                 "prefix_cache_tail_hits",

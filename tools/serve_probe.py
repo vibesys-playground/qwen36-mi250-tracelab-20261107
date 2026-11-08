@@ -1,4 +1,4 @@
-"""Served A/B of the engine's forward: the same workload with ENGINE_FAST=0, then the default.
+"""Served A/B of engine settings: the same workload with ENGINE_FAST=0, then the default.
 
     python tools/serve_probe.py [--sessions 8] [--rounds 3] [--first 2000] [--grow 300] [--max-new 128]
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -63,14 +64,21 @@ def stream(url: str, body: dict) -> dict:
     return {"ids": ids, "times": times, "start": start, "usage": usage}
 
 
+def rounds_of(index: int, args) -> int:
+    """Session ``index``'s rounds: ``--rounds`` may be fractional (6.3: some sessions 6, some 7)."""
+    return max(1, math.floor((index + 1) * args.rounds) - math.floor(index * args.rounds))
+
+
 def session(url: str, pool: list[int], index: int, args) -> list[dict]:
-    span = args.first + args.rounds * args.grow
-    offset = (index * span) % max(1, len(pool) - span)
+    rounds = rounds_of(index, args)
+    span = args.first + rounds * args.grow
+    stride = args.first + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
+    offset = (index * stride) % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
     prompt = fresh[: args.first]
     used = args.first
     out = []
-    for r in range(args.rounds):
+    for r in range(rounds):
         body = {
             "prompt": prompt,
             "max_tokens": args.max_new,
@@ -99,9 +107,14 @@ def pct(values: list[float], q: float) -> float | None:
 def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[int]]:
     env = dict(os.environ)
     env.pop("ENGINE_FAST", None)
-    if setting is not None:
+    if setting is not None and "=" in setting:  # KEY=VALUE[+KEY=VALUE...]
+        for pair in setting.split("+"):
+            key, _, value = pair.partition("=")
+            env[key] = value
+    elif setting is not None:
         env["ENGINE_FAST"] = setting
-    log = Path(f"/tmp/serve-probe-{setting or 'default'}.log")
+    name = "".join(c if c.isalnum() else "_" for c in setting or "default")
+    log = Path(f"/tmp/serve-probe-{name}.log")
     with log.open("w") as sink:
         proc = subprocess.Popen(
             [sys.executable, "-m", "engine.server", "--host", "127.0.0.1", "--port", str(port),
@@ -122,7 +135,7 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
             time.sleep(2)
         load_s = time.perf_counter() - t0
         t0 = time.perf_counter()
-        with ThreadPoolExecutor(args.sessions) as ex:
+        with ThreadPoolExecutor(args.concurrency or args.sessions) as ex:
             results = [r for s in ex.map(lambda i: session(url, pool, i, args), range(args.sessions)) for r in s]
         wall = time.perf_counter() - t0
         health = httpx.get(url + "/health", timeout=30).json()
@@ -140,7 +153,7 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
                  for r in results)
     engine_lines = [x for x in log.read_text().splitlines() if x.startswith("engine:")]
     print(json.dumps({
-        "event": "setting", "ENGINE_FAST": setting or "default", "load_s": round(load_s, 1),
+        "event": "setting", "setting": setting or "default", "load_s": round(load_s, 1),
         "wall_s": round(wall, 2), "requests": len(results), "output_tokens": tokens,
         "output_tok_per_s": round(tokens / wall, 2),
         "tpot_ms_p50": pct(tpot, 0.5), "tpot_ms_p90": pct(tpot, 0.9),
@@ -154,18 +167,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=None)
     parser.add_argument("--sessions", type=int, default=8)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=float, default=3, help="per session; may be fractional")
+    parser.add_argument(
+        "--concurrency", type=int, default=None, help="sessions in flight at once (default: all)"
+    )
     parser.add_argument("--first", type=int, default=2000)
     parser.add_argument("--grow", type=int, default=300)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
-    parser.add_argument("--settings", default="0,default", help="ENGINE_FAST values, in order")
+    parser.add_argument(
+        "--settings",
+        default="0,default",
+        help="comma-separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
+    )
     args = parser.parse_args()
     from engine.generator import CHECKPOINT
 
     model = args.model or CHECKPOINT["model"]
     revision = None if args.model else CHECKPOINT["revision"]
-    pool = token_pool(model, revision, args.sessions * (args.first + args.rounds * args.grow) + 1)
+    need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
+    pool = token_pool(model, revision, need)
+    print(json.dumps({"event": "shape", **vars(args)}), flush=True)
     outputs = {}
     for setting in args.settings.split(","):
         outputs[setting] = serve_and_run(None if setting == "default" else setting, args.port, args, pool)

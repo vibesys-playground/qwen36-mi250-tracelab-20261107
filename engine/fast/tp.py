@@ -791,6 +791,9 @@ class TPModel:
     def flip(self, slot: int) -> None:
         self.ranks[0].flip(slot)  # the banks are shared
 
+    def advance(self, slot: int, n: int) -> None:
+        self.ranks[0].advance(slot, n)
+
     def _copy_page(self, src: int) -> int:
         dst = self.ranks[0].pool.alloc()
         for model in self.ranks:
@@ -1051,25 +1054,34 @@ class TPModel:
             for meta in model.devices.values():
                 meta.packed.copy_(host)
 
-    def _run(self, size: int, rows: int, verify: bool) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+    def _run(self, size: int, rows: int, verify: bool, chain: int = 0
+             ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
         """Both ranks' outputs (their logits shards) and, for a verify step, the picks."""
         r0 = self.ranks[0]
         if r0.use_graphs and self.graph_error is None:
-            segs = [m.vsegments if verify else m.segments for m in self.ranks]
+            segs = [m._segs(verify, chain) for m in self.ranks]
             if size not in segs[0][0].graphs:
-                self.capture(size, verify)
+                # Capturing fills the step inputs with the dummy slot: keep the caller's.
+                saved = [(meta, meta.packed.clone()) for m in self.ranks for meta in m.devices.values()]
+                self.capture(size, verify, chain)
+                for meta, packed in saved:
+                    meta.packed.copy_(packed)
             if self.graph_error is None:
                 outs = []
                 for model, seg in zip(self.ranks, segs, strict=True):
                     with torch.cuda.device(seg[0].device):
                         seg[0].graphs[size].replay()
                     outs.append(seg[0].outputs[size])
+                if chain:
+                    return outs, r0._chain_static[(size, chain)]
                 return outs, (r0._verify_static[size] if verify else None)
 
         def eager(model: FastModel) -> tuple[torch.Tensor, torch.Tensor | None]:
-            seg = (model.vsegments if verify else model.segments)[0]
+            seg = model._segs(verify, chain)[0]
             meta = model.devices[seg.device]
             out = seg.run(meta.tokens[:rows], meta)
+            if chain:
+                return out, model._chain_out
             return out, (model._verify_out if verify else None)
 
         results = self._both(eager)
@@ -1115,7 +1127,7 @@ class TPModel:
         host[3].fill_(r0.dummy)
         host[3, size:rows] = r0.dummy + r0.gdn_rows
         cur = [r0._g(s) for s in slots]
-        other = [s + (1 - r0.bank[s]) * r0.gdn_rows for s in slots]
+        other = [r0._ring_row(s, 1) for s in slots]
         for half, toks, pos, states in (
             (0, tokens, positions, cur),
             (size, drafts, [p + 1 for p in positions], other),
@@ -1131,18 +1143,36 @@ class TPModel:
         g, d = picks[0], picks[1]
         return logits, g[:batch], g[size : size + batch], d[:batch], d[size : size + batch]
 
+    @torch.inference_mode()
+    def verify_chain(
+        self,
+        tokens: Sequence[int],
+        drafts: Sequence[Sequence[int]],
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> tuple[torch.Tensor, list[list[int]], list[int], list[list[int]]]:
+        """``FastModel.verify_chain`` over both ranks (same inputs, outputs and contract)."""
+        r0 = self.ranks[0]
+        if not r0.chain:
+            raise RuntimeError("the chained verify needs the MTP head, Triton and ENGINE_SPEC_CHAIN=1")
+        batch = len(tokens)
+        groups = len(drafts[0]) + 1
+        size = r0.bucket(batch) if r0.use_graphs else batch
+        host = r0._chain_host(tokens, drafts, slots, positions, groups, size)
+        self._load_inputs(host)
+        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        logits = self._gather([o[:batch] for o in outs])
+        picks, acc, nxt = FastModel._chain_parse(out, batch, size, groups)
+        return logits, picks, acc, nxt
+
     # ------------------------------------------------------------ graphs
 
-    def _warm(self, model: FastModel, size: int, verify: bool) -> None:
+    def _warm(self, model: FastModel, size: int, verify: bool, chain: int = 0) -> None:
         """What ``FastModel._capture`` runs before capturing (both ranks together)."""
-        rows = 2 * size if verify else size
+        rows = chain * size if chain else (2 * size if verify else size)
         for meta in model.devices.values():
-            meta.slots[:rows].fill_(model.dummy)
-            meta.positions[:rows].zero_()
-            meta.gdn[:rows].fill_(model.dummy)
-            if verify:
-                meta.gdn[size:rows].fill_(model.dummy + model.gdn_rows)
-        seg = (model.vsegments if verify else model.segments)[0]
+            model._fill_dummy(meta, size, rows, verify, chain)
+        seg = model._segs(verify, chain)[0]
         meta = model.devices[seg.device]
         streams = model.__dict__.setdefault("_capture_streams", {})
         if seg.device not in streams:
@@ -1155,7 +1185,7 @@ class TPModel:
         torch.cuda.current_stream(seg.device).wait_stream(stream)
         torch.cuda.synchronize(seg.device)
 
-    def capture(self, size: int, verify: bool = False) -> None:
+    def capture(self, size: int, verify: bool = False, chain: int = 0) -> None:
         """Both ranks' graphs for bucket ``size``, or record why not (then steps run eagerly)."""
         modes = getattr(self, "_capture_modes", None) or os.environ.get(
             "ENGINE_CAPTURE_MODES", "global,thread_local,relaxed"
@@ -1163,15 +1193,15 @@ class TPModel:
         errors = []
         for mode in modes:
             try:
-                self._both(lambda m: self._warm(m, size, verify))
+                self._both(lambda m: self._warm(m, size, verify, chain))
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"warm: {type(exc).__name__}: {exc}")
                 break
             # Each rank captures on the thread that warmed it (BLAS handles are per thread), one
             # after the other (a capture must not overlap another thread's HIP calls).
             r1 = self.ranks[1]
-            results = [self.ranks[0]._capture(size, mode, verify)]
-            results.append(self._pool.submit(self._on_rank1, lambda: r1._capture(size, mode, verify)).result())
+            results = [self.ranks[0]._capture(size, mode, verify, chain)]
+            results.append(self._pool.submit(self._on_rank1, lambda: r1._capture(size, mode, verify, chain)).result())
             if all(r is None for r in results):
                 self._capture_modes = [mode]
                 self.capture_mode = mode
@@ -1180,7 +1210,7 @@ class TPModel:
             # next steps recapture what they need), and drop the capture streams, which a
             # broken capture may leave unusable.
             for m in self.ranks:
-                for seg in m.segments + m.vsegments:
+                for seg in m._all_segments():
                     seg.graphs.clear()
                     seg.inputs.clear()
                     seg.outputs.clear()

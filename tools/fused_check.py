@@ -39,6 +39,7 @@ def main() -> int:
     ap.add_argument("--rows", default="1,2,4,8")
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--slots", type=int, default=16)
+    ap.add_argument("--sweep", action="store_true", help="also time tile variants at 4 and 8 rows")
     ap.add_argument("--max-len", type=int, default=262144)
     args = ap.parse_args()
     if args.devices is not None:
@@ -273,6 +274,30 @@ def main() -> int:
                 current = a[0][step]
         print(f"RESULT teacher_forced top1_pct={100.0 * agree / total:.2f} ({agree}/{total}) "
               f"max_logit_diff={tf_max:.4f}")
+        # Yardstick: the per-op path with PyTorch's experts instead of its Triton MoE kernel, an
+        # accepted variant of the current numerics, against the per-op Triton path.
+        toggle(False)
+        fast.triton_kernels["moe"] = False
+        try:
+            with torch.inference_mode():
+                current = []
+                for slot, p in enumerate(gp):
+                    fast.reset(slot)
+                    current.append(int(prefill(slot, p).argmax()))
+                ytok = []
+                for step in range(args.steps):
+                    out = fast.decode(current, rows, [len(p) + step for p in gp]).float()
+                    current = [int(t) for t in out.argmax(-1).tolist()]
+                    ytok.append(current)
+        finally:
+            fast.triton_kernels["moe"] = True
+        yprefix = []
+        for r in rows:
+            n = 0
+            while n < args.steps and a[0][n][r] == ytok[n][r]:
+                n += 1
+            yprefix.append(n)
+        print(f"RESULT yardstick per_op_torch_experts_vs_per_op identical_prefix={yprefix} of {args.steps}")
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         print("RESULT greedy_parity error")
@@ -308,7 +333,7 @@ def main() -> int:
                             res[flag] = ms.graph_ms(call)
                     print(f"RESULT layer_ms kind={kind} R={R} per_op={res[False]:.4f} fused={res[True]:.4f} "
                           f"speedup={res[False] / res[True]:.2f}x")
-                    if R >= 4:  # tile variants of the fused path
+                    if R >= 4 and args.sweep:  # tile variants of the fused path
                         from engine.fast import fused as fused_mod
 
                         base = dict(fused_mod.TILES)

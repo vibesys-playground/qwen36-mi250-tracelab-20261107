@@ -40,7 +40,8 @@ triton, tl = kernels.triton, kernels.tl
 
 MAX_ROWS = int(os.environ.get("ENGINE_FUSED_MAX_ROWS", "8"))
 # Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
-TILES = {"bn": 8, "bk4": 1024, "bk8": 512, "moe_bn": 8}
+# From a sweep on one gfx90a GCD (j71): 4 x 2048 beat 8 x 1024 and 16 x 512 at 4 and 8 rows.
+TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
 
 
 def enabled() -> bool:
@@ -425,7 +426,7 @@ class FusedDecode:
         idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
         wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
         _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
-                              TOPKP=_pow2(top_k), num_warps=4)
+                              TOPKP=_pow2(top_k), num_warps=1)
         act = torch.empty((rows * top_k, inter), dtype=h.dtype, device=h.device)
         items = rows * top_k * triton.cdiv(inter, bn)
         _moe_up_kernel[(min(items, cus),)](

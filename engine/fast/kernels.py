@@ -31,6 +31,10 @@ from torch.nn import functional as F
 try:  # Triton ships with the ROCm and CUDA builds of torch, not with the CPU build.
     import triton
     import triton.language as tl
+
+    from engine.fast import jit_log
+
+    jit_log.install()
 except ImportError:  # pragma: no cover - depends on the torch build
     triton = None
     tl = None

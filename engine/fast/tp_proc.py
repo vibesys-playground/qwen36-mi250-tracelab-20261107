@@ -5,12 +5,13 @@ thread, so the two ranks take turns on one GIL: an eager prefill pass costs the 
 both ranks' ~5k kernel launches one after the other (j139: a 561-token pass 196 ms with both
 ranks, 130 ms for one rank alone). Here rank 1 is a child process with its own interpreter:
 
-- **Load.** The parent loads and shards the checkpoint as before (``shard_model``). Rank 1's
-  weights (already on its GPU) move to the child in batches through torch's CUDA IPC: the
-  child copies a batch into its own memory, then the parent frees it and returns emptied
-  allocator segments to the driver. Batches follow the parent's segments, so the GPU ends up
-  the child's (j150: weights left mapped from the parent pinned ~14 GB of freed blocks in
-  their segments, and rank 1's KV pool no longer fit).
+- **Load.** The parent loads and shards the checkpoint as before (``shard_model``), with
+  rank 1's shard copies allocated from a memory pool of their own (``torch.cuda.MemPool``),
+  so they share no allocator segment with the checkpoint's tensors: once those are freed,
+  every other segment on rank 1's GPU goes back to the driver. The child maps the shard
+  through torch's CUDA IPC (no copy) and builds its ``FastModel`` on it; the parent keeps
+  the pool alive. (j150/j153: shard tensors carved out of the loader's segments pinned
+  ~14 GB of freed blocks in them, and rank 1's KV pool no longer fit.)
 - **Commands.** The parent keeps every piece of host state (page pool and page lists, state
   banks, prefix-cache snapshots) and sends rank 1 what changes, in program order, over a
   pipe: page-table rows, resets, bank flips, page copies, snapshot copies of rank 1's Gated
@@ -258,33 +259,6 @@ def _fill(obj: Any, table: dict[int, torch.Tensor]) -> Any:
     return obj
 
 
-def _by_segment(leaves: list[torch.Tensor]) -> list[list[int]]:
-    """Leaves grouped by the caching-allocator segment holding them, the segments with the
-    most memory that is not theirs (freed blocks) first: sending those frees the most."""
-    import bisect
-
-    segs = sorted(
-        (s["device"], s["address"], s["total_size"]) for s in torch.cuda.memory_snapshot()
-    )
-    starts = [(d, a) for d, a, _ in segs]
-    groups: dict[tuple[int, int], list[int]] = {}
-    live: dict[tuple[int, int], int] = {}
-    total: dict[tuple[int, int], int] = {}
-    for i, t in enumerate(leaves):
-        key = (t.device.index, t.untyped_storage().data_ptr())
-        at = bisect.bisect_right(starts, key) - 1
-        if at >= 0 and segs[at][0] == key[0] and segs[at][1] <= key[1] < segs[at][1] + segs[at][2]:
-            seg = (segs[at][0], segs[at][1])
-            total[seg] = segs[at][2]
-        else:
-            seg = key
-            total[seg] = t.untyped_storage().nbytes()
-        groups.setdefault(seg, []).append(i)
-        live[seg] = live.get(seg, 0) + t.untyped_storage().nbytes()
-    order = sorted(groups, key=lambda g: live[g] - total[g])
-    return [groups[g] for g in order]
-
-
 # ================================================================================ the group
 
 
@@ -430,8 +404,7 @@ class _Rank1:
         }
 
     def _weights(self) -> dict[int, torch.Tensor]:
-        """Rank 1's weights, batch by batch: each copied into this process's memory before the
-        parent frees its own (it waits for ``weights_done``)."""
+        """Rank 1's weights, mapped from the parent's memory (``weights`` batches)."""
         table: dict[int, torch.Tensor] = {}
         while True:
             msg = self.conn.recv()
@@ -440,11 +413,7 @@ class _Rank1:
             if msg[0] != "weights":
                 raise RuntimeError(f"rank 1 expected weights, got {msg[0]!r}")
             for i, t in msg[2]:
-                table[i] = t.clone()
-                del t
-            del msg  # drop the mapped originals: the parent frees them after ``weights_done``
-            if self.dev.type == "cuda":
-                torch.cuda.synchronize(self.dev)
+                table[i] = t
             self.conn.send(("weights_done", None))
 
     def _ensure_pages(self, slot: int, length: int) -> None:
@@ -691,7 +660,7 @@ class ProcTPModel(tpm.TPModel):
         atexit.register(self.close)
         threading.Thread(target=_watch_child, args=(weakref.ref(self), proc), daemon=True,
                          name="tp-rank1-watch").start()
-        shards = shard_model_for(lm, mtp, self.devices_tp)
+        shards = self._shard(lm, mtp)
         ll = _LLProc(0, self.devices_tp) if cuda else None
         self.group = ProcGroup(0, self.devices_tp, ll, self._data)
         shard0, head0 = shards[0]
@@ -720,16 +689,11 @@ class ProcTPModel(tpm.TPModel):
         with self._io:
             self._conn.send(("init", init))
         del init, shards, skeleton
-        moved = 0
-        for group in (_by_segment(leaves) if leaves else []):
-            self._send("weights", [(i, leaves[i]) for i in group])
+        moved = sum(t.untyped_storage().nbytes() for t in leaves)
+        if leaves:
+            self._send("weights", list(enumerate(leaves)))
             self._reply("weights_done", REPLY_S)
-            for i in group:
-                moved += leaves[i].untyped_storage().nbytes()
-                leaves[i] = None  # type: ignore[call-overload]
-            torch.cuda.ipc_collect()
-            tpm._empty_cache(self.devices_tp)
-        del leaves
+        self._keep = leaves  # rank 1's weights: the child maps them; they must outlive it
         self._send("weights_end")
         tpm._empty_cache(self.devices_tp)
         ready = self._reply("ready", REPLY_S)
@@ -754,6 +718,31 @@ class ProcTPModel(tpm.TPModel):
         self.capture_mode: str | None = None
         print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1), "
               f"{moved / 2**30:.1f} GiB of weights handed over", flush=True)
+
+    def _shard(self, lm: Any, mtp: Any) -> list:
+        """``shard_model`` with rank 1's copies in their own memory pool (see the module doc)."""
+        dev1 = self.devices_tp[1]
+        pool = None
+        if dev1.type == "cuda" and hasattr(torch.cuda, "MemPool"):
+            pool = torch.cuda.MemPool()
+        self._mem_pool = pool  # kept: the child maps memory of this pool
+        if pool is None:
+            return tpm.shard_model(lm, mtp, self.devices_tp)
+        put = tpm._put
+
+        def put_pooled(t: torch.Tensor, dev: torch.device) -> torch.Tensor:
+            if dev != dev1:
+                return put(t, dev)
+            with torch.cuda.use_mem_pool(pool, device=dev):
+                out = torch.empty(tuple(t.shape), dtype=t.dtype, device=dev)
+            out.copy_(t.detach())
+            return out
+
+        tpm._put = put_pooled
+        try:
+            return tpm.shard_model(lm, mtp, self.devices_tp)
+        finally:
+            tpm._put = put
 
     # ------------------------------------------------------------ the child
 
@@ -1101,11 +1090,6 @@ class ProcTPModel(tpm.TPModel):
             print(f"engine: tensor-parallel capture of bucket {size} (verify={verify}) failed in "
                   f"mode {mode}: {[r for r in results if r]}", flush=True)
         self.graph_error = " | ".join(errors)
-
-
-def shard_model_for(lm: Any, mtp: Any, devices: Sequence[torch.device]) -> list:
-    """``engine.fast.tp.shard_model`` (both ranks' shards, made in this process)."""
-    return tpm.shard_model(lm, mtp, devices)
 
 
 __all__ = ["ProcTPModel", "ProcGroup", "child_main"]

@@ -49,7 +49,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts
+from engine import batching, experts, gdn
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -507,6 +507,7 @@ class Generator:
             **({"config": config} if config is not None else {}),
         )
         lm.eval()
+        kernels = gdn.install(lm)
         if device_map is not None:
             placed = {str(p.device) for p in lm.parameters()}
             if any(d in ("cpu", "meta", "disk") for d in placed):
@@ -538,7 +539,9 @@ class Generator:
                     f"graph_error={fast.graph_error} kv_pages={fast.pool.pages}",
                     flush=True,
                 )
-        return cls(lm, tokenizer, eos_ids, fast=fast, **options)
+        generator = cls(lm, tokenizer, eos_ids, fast=fast, **options)
+        gdn.ready(generator, kernels)
+        return generator
 
     def encode_text(self, prompt: str) -> tuple[int, ...]:
         return tuple(self.tokenizer.encode(prompt))
@@ -602,6 +605,12 @@ class Generator:
         }
 
     # ---------------------------------------------------------------- fast path
+
+    def warmup_fast(self, token_ids: list[int]) -> None:
+        """Run the fast path's prefill variants once in a free slot (see ``FastModel.warmup``)."""
+        self._reclaim()
+        if self._free_slots:
+            self.fast.warmup(self._free_slots[-1], self._chunk, token_ids)
 
     def _reclaim(self) -> None:
         while self._released:

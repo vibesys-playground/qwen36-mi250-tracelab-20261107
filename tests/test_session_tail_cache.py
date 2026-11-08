@@ -236,3 +236,67 @@ def test_a_tail_from_a_batched_decode_holds_only_its_own_rows(loaded: Generator)
                     if isinstance(t, torch.Tensor):
                         assert t._base is None
                         assert t.untyped_storage().nbytes() == t.nbytes
+
+
+# The engine's own forward (engine.fast): a tail is the finished request's slot state.
+
+
+def _fast_generator(model: Generator, budget: int | None, entries: int = 64) -> Generator:
+    from engine.fast.model import FastModel
+
+    fast = FastModel(model.model, slots=4, max_len=4096, use_triton=False, use_graphs=False)
+    return Generator(
+        model.model,
+        model.tokenizer,
+        model.eos_ids,
+        max_model_len=4096,
+        chunk_tokens=CHUNK,
+        prefix_cache_tokens=1 << 20,
+        prefix_cache_entries=entries,
+        prefix_cache_bytes=budget,
+        fast=fast,
+    )
+
+
+def test_fast_path_rounds_resume_from_the_slot_state(loaded: Generator) -> None:
+    gen = _fast_generator(loaded, None)
+    cold = _fast_generator(loaded, None, entries=0)
+    free_at_start = gen.fast.pool.free
+    sessions = {s: _new_tokens(50 + s, 2 * CHUNK + 5) for s in range(2)}
+    outputs: dict[int, list[int]] = {}
+    hits = 0
+    for index, (new, n) in enumerate(_ROUNDS):
+        prompts = [
+            sessions[s] if index == 0 else sessions[s] + outputs[s] + _new_tokens(60 + s + index, new)
+            for s in sessions
+        ]
+        outs, cached = _run(gen, prompts, n)  # both sessions decode together
+        for s, prompt, out, c in zip(sessions, prompts, outs, cached, strict=True):
+            if index:
+                assert c == len(sessions[s]) + len(outputs[s]) - 1
+                hits += 1
+            assert out == _run(cold, [prompt], n)[0][0]
+            assert cold._prefix_cache.tail_hits == 0
+            sessions[s], outputs[s] = prompt, out
+            tail = _tail(gen, prompt + out[:-1])
+            assert tail.snap.length == len(prompt) + len(out) - 1
+            assert tail.nbytes == gen.fast.snapshot_bytes(tail.snap) > 0
+    assert gen._prefix_cache.tail_hits == hits == 2 * (len(_ROUNDS) - 1)
+    # Every page comes back once the cache lets go of its entries.
+    gen._reclaim()
+    while gen._prefix_cache.evict_one():
+        pass
+    assert gen.fast.pool.free == free_at_start
+
+
+def test_fast_path_tails_respect_the_byte_budget(loaded: Generator) -> None:
+    prompts = [_new_tokens(70 + s, 2 * CHUNK + 3) for s in range(3)]
+    n = 6
+    probe = _fast_generator(loaded, None)
+    outs, _ = _run(probe, [prompts[0]], n)
+    tail_bytes = _tail(probe, prompts[0] + outs[0][:-1]).nbytes
+    gen = _fast_generator(loaded, int(2.5 * tail_bytes), entries=64)
+    for p in prompts:
+        _run(gen, [p], n)
+        assert gen._prefix_cache.bytes <= int(2.5 * tail_bytes)
+    assert gen._prefix_cache.evictions > 0

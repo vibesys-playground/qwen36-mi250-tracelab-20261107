@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -150,3 +151,16 @@ def test_attention_reads_the_last_page_of_the_pool() -> None:
     ref = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=False)
     got = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=True)
     assert float((ref.float() - got.float()).abs().max()) < 2e-2
+
+
+@pytest.mark.parametrize("count", [2, 7, 253, 256, 300])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_bucketed_prefill_conv_equals_the_unpadded_conv(count: int, dtype: torch.dtype) -> None:
+    from engine.fast.model import prefill_conv
+
+    torch.manual_seed(count)
+    channels, kernel = 24, 4
+    window = torch.randn(channels, kernel + count, dtype=dtype)
+    weight = torch.randn(channels, 1, kernel, dtype=dtype)
+    expect = F.conv1d(window.unsqueeze(0), weight, None, groups=channels)[0, :, -count:]
+    assert torch.equal(prefill_conv(window, weight, count), expect)

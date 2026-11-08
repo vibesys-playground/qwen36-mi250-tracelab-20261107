@@ -45,6 +45,8 @@ PAGE = 64
 DECODE_EXPERT_TOKENS = 16
 # Bytes of attention scores one prefill attention call may materialize.
 SCORE_BUDGET = 1 << 30
+# Prefill conv inputs are right-padded to a multiple of this many positions (``prefill_conv``).
+CONV_BUCKET = 256
 
 
 class FastPathUnavailable(RuntimeError):
@@ -78,6 +80,23 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     cos, sin = cos[:, None, :], sin[:, None, :]
     x_rot, x_pass = x[..., :rot], x[..., rot:]
     return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass), dim=-1)
+
+
+def prefill_conv(window: torch.Tensor, weight: torch.Tensor, count: int) -> torch.Tensor:
+    """Depthwise conv over ``window`` ``[conv_dim, kernel + count]`` (the slot's conv state,
+    then the chunk's inputs): the last ``count`` outputs ``[conv_dim, count]``, before the
+    activation, as ``F.conv1d(window)[..., -count:]``.
+
+    The input is right-padded with zeros to a multiple of ``CONV_BUCKET`` positions,
+    so MIOpen sees a few problem sizes (compiled by ``FastModel.warmup``) instead of a
+    new one per chunk length; an output only reads inputs at or before its last tap,
+    so the kept outputs are those of the unpadded call.
+    """
+    length = window.shape[-1]
+    valid = length - weight.shape[-1] + 1  # outputs of the unpadded call
+    padded = -(-length // CONV_BUCKET) * CONV_BUCKET
+    x = F.pad(window, (0, padded - length)).unsqueeze(0)
+    return F.conv1d(x, weight, None, groups=window.shape[0])[0, :, valid - count : valid]
 
 
 class PagePool:
@@ -421,6 +440,40 @@ class FastModel:
         snap.released = True
         self._push_table(slot)
 
+    @torch.inference_mode()
+    def warmup(self, slot: int, chunk: int, token_ids: Sequence[int]) -> None:
+        """Run every prefill variant serving uses once, in ``slot`` (free), then reset it.
+
+        Compiles the bucketed prefill conv problems up to ``chunk`` on every device
+        and runs prefills fresh (short, and a whole chunk) and on top of a state,
+        so the GDN chunk kernels, the prefill experts and attention compile and tune
+        before the server answers. Decode is warmed by ``capture_all``.
+        """
+        seen = set()
+        for i, (conv, _) in self.gdn_state.items():
+            weight = self.layers[i].linear_attn.conv1d.weight
+            key = (weight.device, tuple(weight.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            kernel = conv.shape[-1]
+            for length in range(CONV_BUCKET, chunk + kernel + CONV_BUCKET, CONV_BUCKET):
+                window = torch.zeros(
+                    (conv.shape[1], max(length, kernel + 1)), dtype=conv.dtype, device=conv.device
+                )
+                prefill_conv(window, weight, 1)
+        ids = list(token_ids)
+        try:
+            self.prefill(slot, ids[:37], 0)  # fresh, no initial state
+            self.prefill(slot, ids[37:101], 37)  # on top of a state
+            self.reset(slot)
+            self.prefill(slot, ids[:chunk], 0)  # a whole chunk
+        finally:
+            self.reset(slot)
+        for dev in self.devices:
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+
     @staticmethod
     def snapshot_bytes(snap: Snapshot) -> int:
         """Bytes of the snapshot's own Gated DeltaNet state copies (its pages are the pool's)."""
@@ -625,8 +678,7 @@ class FastModel:
         window = torch.cat((conv_state[slot], qkv.transpose(0, 1)), dim=-1)  # [conv_dim, kernel+T]
         kernel = m.conv_kernel_size
         conv_state[slot].copy_(window[:, -kernel:])
-        weight = m.conv1d.weight
-        mixed = F.conv1d(window.unsqueeze(0), weight, None, groups=m.conv_dim)[0, :, -count:]
+        mixed = prefill_conv(window, m.conv1d.weight, count)
         mixed = F.silu(mixed.to(qkv.dtype)).transpose(0, 1)
         q, k, v, g, beta = self._gdn_heads(m, mixed, b, a)
         core, final = hf.torch_chunk_gated_delta_rule(

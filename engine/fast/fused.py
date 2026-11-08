@@ -158,18 +158,27 @@ if triton is not None:
         if KSPLIT == 1:
             y = s.to(tl.bfloat16)
             if CONV:
+                # The [BN] vectors after the reduction are replicated across threads, so the
+                # whole window is read before a barrier and shifted after it (else one warp's
+                # shift can overtake another's read). Sum order as ``_gdn_conv_kernel``.
+                tl.static_assert(KC == 4)
                 crow = nok & (n < CONV_N)
                 slot = tl.load(slot_ptr + r).to(tl.int64)
                 sbase = state_ptr + slot * stride_slot + n * KC
+                wbase = cw_ptr + n * KC
+                s1 = tl.load(sbase + 1, mask=crow, other=0.0)
+                s2 = tl.load(sbase + 2, mask=crow, other=0.0)
+                s3 = tl.load(sbase + 3, mask=crow, other=0.0)
                 cacc = tl.zeros_like(s)
-                for j in tl.static_range(KC - 1):
-                    sj = tl.load(sbase + j + 1, mask=crow, other=0.0)
-                    wj = tl.load(cw_ptr + n * KC + j, mask=crow, other=0.0).to(tl.float32)
-                    cacc += sj.to(tl.float32) * wj
-                    tl.store(sbase + j, sj, mask=crow)
-                wl = tl.load(cw_ptr + n * KC + KC - 1, mask=crow, other=0.0).to(tl.float32)
-                cacc += y.to(tl.float32) * wl
-                tl.store(sbase + KC - 1, y, mask=crow)
+                cacc += s1.to(tl.float32) * tl.load(wbase, mask=crow, other=0.0).to(tl.float32)
+                cacc += s2.to(tl.float32) * tl.load(wbase + 1, mask=crow, other=0.0).to(tl.float32)
+                cacc += s3.to(tl.float32) * tl.load(wbase + 2, mask=crow, other=0.0).to(tl.float32)
+                cacc += y.to(tl.float32) * tl.load(wbase + 3, mask=crow, other=0.0).to(tl.float32)
+                tl.debug_barrier()
+                tl.store(sbase, s1, mask=crow)
+                tl.store(sbase + 1, s2, mask=crow)
+                tl.store(sbase + 2, s3, mask=crow)
+                tl.store(sbase + 3, y, mask=crow)
                 c = cacc.to(tl.bfloat16).to(tl.float32)
                 c = (c * tl.sigmoid(c)).to(tl.bfloat16)
                 y = tl.where(crow, c, y)
@@ -591,6 +600,10 @@ class FusedDecode:
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
         if GEMV and tiles is None:
+            if conv is not None and conv[0].shape[-1] != 4:  # the epilogue is for 4 taps
+                self._gemv(x, w, out)
+                out[:, : conv[3]] = kernels.gdn_conv_(conv[0], conv[1], out[:, : conv[3]], conv[2])
+                return out
             for r0 in range(0, rows, GEMV_MAX_ROWS):
                 r1 = min(rows, r0 + GEMV_MAX_ROWS)
                 cv = None if conv is None else (conv[0], conv[1][r0:r1], conv[2], conv[3])

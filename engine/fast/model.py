@@ -39,7 +39,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import kernels, moe_prefill
+from engine.fast import kernels, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -326,6 +326,9 @@ class FastModel:
             # Prefill routed experts as a sync-free grouped GEMM (``moe_prefill``) instead of
             # the registered experts module (``engine.experts``); ENGINE_MOE_GROUPED=0 for that.
             "moe_prefill": self.use_triton and moe_prefill.enabled(),
+            # Prefill passes through ``prefill_kernels`` (ENGINE_PREFILL_FUSED): paged
+            # attention, residual add + RMSNorm, the MoE block around the grouped experts.
+            "prefill_fused": self.use_triton and prefill_kernels.enabled(),
         }
         self.buckets = sorted(buckets)
         # Tensor parallelism (``engine.fast.tp``): this model is one rank's shard and ``tp`` the
@@ -969,6 +972,14 @@ class FastModel:
         ``moe_prefill`` (no host synchronization either), or, under
         ``ENGINE_MOE_GROUPED=0`` or without Triton, the registered experts module."""
         tokens = x.shape[0]
+        if (
+            not decode
+            and tokens > DECODE_EXPERT_TOKENS
+            and self.triton_kernels["prefill_fused"]
+            and self.triton_kernels["moe_prefill"]
+            and prefill_kernels.moe_supported(x, mlp, self.top_k)
+        ):
+            return prefill_kernels.moe(x, mlp, self.top_k)
         shared = mlp.shared_expert
         shared_out = F.linear(
             F.silu(F.linear(x, shared.gate_proj.weight)) * F.linear(x, shared.up_proj.weight),
@@ -1007,6 +1018,8 @@ class FastModel:
         With the MTP head, the head also runs over the chunk (``_mtp_prefill``): ``follow``
         is the token after the chunk, None for the greedy pick from the returned logits.
         """
+        if self.triton_kernels["prefill_fused"]:
+            return self._prefill_fused(slot, ids, start, follow)
         count = len(ids)
         self._ensure_pages(slot, start + count)
         dev = self.embed.device
@@ -1032,6 +1045,51 @@ class FastModel:
                 hidden, [(slot, ids, start)], [follow], logits, _PackPlan(self, [(slot, ids, start)])
             )
         return logits[0]
+
+    def _prefill_fused(
+        self, slot: int, ids: Sequence[int], start: int, follow: int | None
+    ) -> torch.Tensor:
+        """``prefill`` through ``prefill_kernels``: the same layers, each residual add (after
+        the tensor-parallel sum) fused with the RMSNorm that follows it."""
+        count = len(ids)
+        self._ensure_pages(slot, start + count)
+        dev = self.embed.device
+        x = F.embedding(torch.tensor(list(ids), dtype=torch.long, device=dev), self.embed)
+        h = None
+        for i, layer in enumerate(self.layers):
+            ldev = layer.input_layernorm.weight.device
+            x = x.to(ldev)
+            if h is None:
+                h = prefill_kernels.reduce_rms(x, None, None, layer.input_layernorm.weight, self.eps)[1]
+            h = h.to(ldev)
+            positions = torch.arange(start, start + count, device=ldev)
+            if self.layer_types[i] == "linear_attention":
+                h = self._gdn_prefill(i, h, slot)
+            else:
+                h = self._attn_prefill(i, h, slot, positions, start)
+            x, h = self._reduce_rms(h, x, layer.post_attention_layernorm.weight)
+            nxt = self.layers[i + 1].input_layernorm.weight if i + 1 < len(self.layers) else self.final_norm
+            x, h = self._reduce_rms(self._moe(layer.mlp, h), x, nxt if nxt.device == x.device else None)
+        if h is None:
+            x = x.to(self.final_norm.device)
+            h = prefill_kernels.reduce_rms(x, None, None, self.final_norm, self.eps)[1]
+        hidden = h.to(self.lm_head.device)  # the final norm of every row (a row's own result)
+        logits = F.linear(hidden[-1:], self.lm_head).float()
+        if self.mtp is not None:
+            self._mtp_prefill(
+                hidden, [(slot, ids, start)], [follow], logits, _PackPlan(self, [(slot, ids, start)])
+            )
+        return logits[0]
+
+    def _reduce_rms(
+        self, h: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``_reduce(h, residual)`` and the RMSNorm of the result by ``weight``, one launch."""
+        peer = None
+        if self.tp is not None and not self.tp.solo:
+            h = h.contiguous()
+            peer = self.tp._exchange(self.rank, h)
+        return prefill_kernels.reduce_rms(residual, h, peer, weight, self.eps)
 
     def _gdn_prefill(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:
         m = self.layers[i].linear_attn
@@ -1072,6 +1130,9 @@ class FastModel:
         offset = positions % PAGE
         k_pool[page, :, offset] = k
         v_pool[page, :, offset] = v
+        if self.triton_kernels["prefill_fused"] and prefill_kernels.attention_supported(q, k_pool):
+            out = prefill_kernels.prefill_attention(q, k_pool, v_pool, table, start, gate, m.scaling)
+            return F.linear(out, m.o_proj.weight)
         total = start + count
         used = table[: math.ceil(total / PAGE)]
         heads = k.shape[1]
@@ -1223,6 +1284,14 @@ class FastModel:
         k_pool, v_pool = self.kv[i]
         k_pool[p.pages, :, p.offsets] = k
         v_pool[p.pages, :, p.offsets] = v
+        if self.triton_kernels["prefill_fused"] and prefill_kernels.attention_supported(q, k_pool):
+            out = torch.empty((x.shape[0], q.shape[1] * q.shape[2]), dtype=q.dtype, device=q.device)
+            for (lo, count, total), table in zip(p.spans, p.tables, strict=True):
+                prefill_kernels.prefill_attention(
+                    q[lo : lo + count], k_pool, v_pool, table, total - count, gate[lo : lo + count],
+                    m.scaling, out=out[lo : lo + count],
+                )
+            return F.linear(out, m.o_proj.weight)
         heads = k.shape[1]
         q_heads = q.shape[1]
         outs = []

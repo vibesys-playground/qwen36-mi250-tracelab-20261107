@@ -21,6 +21,11 @@ class _Experts(torch.nn.Module):
         self.down_proj = torch.randn(num_experts, hidden, inter, generator=g).mul(0.1).bfloat16()
         self.act_fn = torch.nn.functional.silu
 
+    def to(self, device):  # plain tensor attributes: nn.Module.to would leave them on the CPU
+        self.gate_up_proj = self.gate_up_proj.to(device)
+        self.down_proj = self.down_proj.to(device)
+        return self
+
 
 def _routing(n, e, k, mode, g):
     logits = torch.randn(n, e, generator=g)

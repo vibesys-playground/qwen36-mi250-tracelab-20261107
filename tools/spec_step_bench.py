@@ -94,14 +94,15 @@ def main() -> None:
     chunk = args.chunk
 
     def prefill(slot: int, prompt: list[int]) -> torch.Tensor:
+        """The prompt in the generator's own passes (``Generator._chunks``: one pass up to
+        ENGINE_PREFILL_ONE_PASS_MAX tokens), so plain decode starts from the same state as
+        the speculative ``Generator`` path it is compared with."""
         fast.reset(slot)
-        body = len(prompt) - 1
-        position = 0
-        while position < body:
-            end = min((position // chunk + 1) * chunk, body)
-            fast.prefill(slot, prompt[position:end], position, prompt[end])
-            position = end
-        return fast.prefill(slot, prompt[body:], body)
+        logits = None
+        for begin, end, _ in g._chunks(tuple(prompt), 0):
+            follow = prompt[end] if end < len(prompt) else None
+            logits = fast.prefill(slot, prompt[begin:end], begin, follow)
+        return logits
 
     # Replay-like pool: Request Factory's synthetic corpus lines (see tools/spec_serve_probe.py).
     def pool(limit: int, nonce: str = "5f0c2a9e1b7d4c3a8e6f0b2d4a6c8e0f") -> list[int]:

@@ -71,6 +71,15 @@ TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
 MOE_ORDER = int(os.environ.get("ENGINE_FUSED_MOE_ORDER", "1"))
 MOE_GRID = int(os.environ.get("ENGINE_FUSED_MOE_GRID", "8"))
 MOE_TILE_ROWS = int(os.environ.get("ENGINE_FUSED_MOE_TILE_ROWS", "4"))
+# Plan 29 glue fusions of the MoE (each bitwise the unfused path; tests/test_fused_glue.py):
+# - ENGINE_GLUE_TOPK=1: no ``_topk_kernel`` launch; every routed gate_up work item recomputes
+#   its row's softmax top-k (``_topk``) from the router logits in its prologue, and the items
+#   of tile 0 and pick 0 write the row's (experts, weights) for the down kernel;
+# - ENGINE_GLUE_NOZERO=1: ``_moe(i, None, h)`` returns the MoE output without a residual (the
+#   down kernel adds a +0.0 constant instead of loading a zero-filled tensor), so tensor
+#   parallelism needs no ``zeros_like`` launch per layer.
+GLUE_TOPK = os.environ.get("ENGINE_GLUE_TOPK", "0") == "1"
+GLUE_NOZERO = os.environ.get("ENGINE_GLUE_NOZERO", "0") == "1"
 
 
 def enabled() -> bool:
@@ -280,12 +289,15 @@ if triton is not None:
 
     @triton.jit
     def _moe_up_kernel(
-        h_ptr, idx_ptr, w_ptr, act_ptr, R, stride_we,
+        h_ptr, idx_ptr, w_ptr, act_ptr, R, stride_we, r_ptr, wt_ptr, N3,
         H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr, BN: tl.constexpr,
-        BK: tl.constexpr, ORDER: tl.constexpr,
+        BK: tl.constexpr, ORDER: tl.constexpr, E: tl.constexpr, TOPKP: tl.constexpr,
+        FUSE_TOPK: tl.constexpr,
     ):
         """act[p, n] = bf16(silu(bf16(Wg[e_p, n] . h)) * bf16(Wu[e_p, n] . h)) over work items
-        (pair p = row * TOPK + j, tile of BN rows); e_p from ``_topk_kernel``. Item order: see
+        (pair p = row * TOPK + j, tile of BN rows); e_p from ``_topk_kernel``, or with
+        FUSE_TOPK from ``_topk`` of the row's router logits in each item (``GLUE_TOPK``), the
+        items of tile 0 and pick 0 storing the row's experts and weights. Item order: see
         ``MOE_ORDER`` (ORDER 1 tile-outer, 0 pair-major)."""
         pid = tl.program_id(0)
         nprog = tl.num_programs(0)
@@ -299,7 +311,16 @@ if triton is not None:
                 pair = t // ntile
                 tile = t % ntile
             row = pair // TOPK
-            expert = tl.load(idx_ptr + pair).to(tl.int64)
+            if FUSE_TOPK:
+                sel_i, sel_w = _topk(r_ptr + row * N3, E, TOPK, TOPKP)
+                kk = tl.arange(0, TOPKP)
+                pick = pair % TOPK
+                expert = tl.sum(tl.where(kk == pick, sel_i, 0), axis=0).to(tl.int64)
+                if (tile == 0) & (pick == 0):
+                    tl.store(idx_ptr + row * TOPK + kk, sel_i, mask=kk < TOPK)
+                    tl.store(wt_ptr + row * TOPK + kk, sel_w, mask=kk < TOPK)
+            else:
+                expert = tl.load(idx_ptr + pair).to(tl.int64)
             rows = tile * BN + tl.arange(0, BN)
             rok = rows < I
             wbase = w_ptr + expert * stride_we
@@ -324,11 +345,12 @@ if triton is not None:
         act_ptr, r_ptr, idx_ptr, wt_ptr, w_ptr, sd_ptr, res_ptr, out_ptr, R, stride_we, N3,
         H: tl.constexpr, I: tl.constexpr, IS: tl.constexpr, E: tl.constexpr,
         TOPK: tl.constexpr, BN: tl.constexpr, BKI: tl.constexpr, BKS: tl.constexpr,
-        ORDER: tl.constexpr,
+        ORDER: tl.constexpr, HAS_RES: tl.constexpr,
     ):
         """out = bf16(res + bf16(routed + bf16(bf16(sigmoid(seg)) * shared))): the routed down
         projection with its weighted combine (``_moe_down_kernel``), the shared expert's down
-        projection of bf16(silu(gate) * up), its sigmoid gate and the layer's residual add."""
+        projection of bf16(silu(gate) * up), its sigmoid gate and the layer's residual add.
+        Without HAS_RES, res is a +0.0 constant: the bits of adding a zero-filled residual."""
         pid = tl.program_id(0)
         nprog = tl.num_programs(0)
         ntile = tl.cdiv(H, BN)
@@ -372,7 +394,10 @@ if triton is not None:
             sg = tl.load(rbase + E + 2 * IS).to(tl.float32)
             sg = tl.sigmoid(sg).to(tl.bfloat16).to(tl.float32)
             moe = (routed + (sg * shared).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
-            res = tl.load(res_ptr + row * H + rows, mask=rok, other=0.0).to(tl.float32)
+            if HAS_RES:
+                res = tl.load(res_ptr + row * H + rows, mask=rok, other=0.0).to(tl.float32)
+            else:
+                res = tl.zeros([BN], dtype=tl.float32)
             tl.store(out_ptr + row * H + rows, (res + moe).to(tl.bfloat16), mask=rok)
 
 
@@ -493,8 +518,8 @@ class FusedDecode:
         )
         return out
 
-    def _moe(self, i: int, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """x + MoE(h) for layer ``i``."""
+    def _moe(self, i: int, x: torch.Tensor | None, h: torch.Tensor) -> torch.Tensor:
+        """x + MoE(h) for layer ``i`` (``x`` None: MoE(h) + 0.0, as a zero ``x`` gives)."""
         fast = self.fast
         mlp = self._layer(i).mlp
         rows, hidden = h.shape
@@ -515,21 +540,24 @@ class FusedDecode:
         grid = MOE_GRID if new else 2
         idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
         wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
-        _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
-                              TOPKP=_pow2(top_k), num_warps=1)
+        fuse_topk = GLUE_TOPK
+        if not fuse_topk:
+            _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
+                                  TOPKP=_pow2(top_k), num_warps=1)
         act = torch.empty((rows * top_k, inter), dtype=h.dtype, device=h.device)
         items = rows * top_k * triton.cdiv(inter, bn)
         _moe_up_kernel[(items if order else min(items, grid * cus),)](
-            h, idx, gu, act, rows, gu.stride(0),
-            H=hidden, I=inter, TOPK=top_k, BN=bn, BK=bk, ORDER=order, num_warps=4,
+            h, idx, gu, act, rows, gu.stride(0), r, wt, w3.shape[0],
+            H=hidden, I=inter, TOPK=top_k, BN=bn, BK=bk, ORDER=order, E=experts,
+            TOPKP=_pow2(top_k), FUSE_TOPK=fuse_topk, num_warps=4,
         )
-        out = torch.empty_like(x)
+        out = torch.empty((rows, hidden), dtype=h.dtype, device=h.device)
         items = rows * triton.cdiv(hidden, bn)
         _moe_down_kernel[(min(items, grid * cus),)](
-            act, r, idx, wt, dn, sd, x, out, rows, dn.stride(0), w3.shape[0],
-            H=hidden, I=inter, IS=shared, E=experts, TOPK=top_k, BN=bn,
+            act, r, idx, wt, dn, sd, x if x is not None else out, out, rows, dn.stride(0),
+            w3.shape[0], H=hidden, I=inter, IS=shared, E=experts, TOPK=top_k, BN=bn,
             BKI=min(1024, _pow2(inter)), BKS=min(1024, _pow2(shared)), ORDER=order,
-            num_warps=4,
+            HAS_RES=x is not None, num_warps=4,
         )
         return out
 

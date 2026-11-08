@@ -68,6 +68,12 @@ MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeou
 SWITCH_S = float(os.environ.get("ENGINE_TP_SWITCH_S", "0.0002"))
 # Seconds an eager all-reduce waits for the peer thread before failing the pass.
 WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
+# Plan 29 item 1 (ENGINE_GLUE_ARRMS=1): in a captured graph, the all-reduce of a partial sum,
+# the residual add and the following RMSNorm in one kernel (``_ll_ar_rms_kernel``), bitwise
+# ``add_rms(res, allreduce(x), w)`` and ``add_rms(allreduce(x, res), None, w)``.
+GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
+RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
+RMS_WIDTH = 2048  # BF16 values per row (the hidden size)
 
 
 def size() -> int:
@@ -127,6 +133,46 @@ if triton is not None:
         tl.store(epoch_ptr + p, e)
 
 
+    @triton.jit(do_not_specialize=["eps"])
+    def _ll_ar_rms_kernel(
+        x_ptr, res_ptr, w_ptr, sum_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr,
+        eps, CAP, N: tl.constexpr, BLOCK: tl.constexpr, MAXIT: tl.constexpr,
+    ):
+        """One row per program: s = bf16(fp32(x_self) + fp32(x_peer)) over the LL exchange
+        (one 8-byte word per BF16 value: its bits and the row's epoch), then exactly
+        ``kernels._add_rms_kernel`` with ``h = s``: sum = bf16(res + s), out = RMSNorm(sum)."""
+        row = tl.program_id(0)
+        e = tl.load(epoch_ptr + row) + 1
+        buf = (e % 2).to(tl.int64) * CAP
+        cols = tl.arange(0, BLOCK)
+        ok = cols < N
+        x = tl.load(res_ptr + row * N + cols, mask=ok, other=0.0).to(tl.float32)
+        mine = tl.load(x_ptr + row * N + cols, mask=ok, other=0.0)
+        bits = mine.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        word = (e.to(tl.int64) << 32) | bits.to(tl.int64)
+        offs = row * N + cols
+        tl.store(recv_peer + buf + offs, word, mask=ok, cache_modifier=".wt")
+        src = recv_local + buf + offs
+        w = tl.load(src, mask=ok, other=0, volatile=True, cache_modifier=".cv")
+        pending = tl.sum((((w >> 32).to(tl.int32) != e) & ok).to(tl.int32), axis=0)
+        it = pending * 0
+        while (pending > 0) & (it < MAXIT):
+            w = tl.load(src, mask=ok, other=0, volatile=True, cache_modifier=".cv")
+            pending = tl.sum((((w >> 32).to(tl.int32) != e) & ok).to(tl.int32), axis=0)
+            it += 1
+        if pending > 0:
+            tl.atomic_add(err_ptr, 1)
+        theirs = ((w & 0xFFFF).to(tl.int32) << 16).to(tl.float32, bitcast=True)
+        h = (mine.to(tl.float32) + theirs).to(tl.bfloat16).to(tl.float32)
+        x = (x + h).to(tl.bfloat16).to(tl.float32)
+        tl.store(sum_ptr + row * N + cols, x.to(tl.bfloat16), mask=ok)
+        var = tl.sum(x * x, axis=0) / N
+        wt = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        y = x * tl.rsqrt(var + eps) * (1.0 + wt)
+        tl.store(out_ptr + row * N + cols, y.to(tl.bfloat16), mask=ok)
+        tl.store(epoch_ptr + row, e)
+
+
 def _hip() -> ctypes.CDLL:
     path = Path(torch.__file__).parent / "lib" / "libamdhip64.so"
     return ctypes.CDLL(str(path) if path.exists() else "libamdhip64.so")
@@ -162,6 +208,19 @@ class _LL:
         self.epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.loop_epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.err = [torch.zeros(1, dtype=torch.int32, device=d) for d in self.devices]
+        self.rms_cap = RMS_ROWS * RMS_WIDTH
+        self.rms_ready = False
+        if GLUE_ARRMS:
+            self.rms_recv = [self._fine(d, 2 * self.rms_cap * 8) for d in self.devices]
+            self.rms_loop = [self._fine(d, 2 * self.rms_cap * 8) for d in self.devices]
+            self.rms_epoch = [torch.zeros(RMS_ROWS, dtype=torch.int32, device=d) for d in self.devices]
+            self.rms_loop_epoch = [torch.zeros(RMS_ROWS, dtype=torch.int32, device=d)
+                                   for d in self.devices]
+            for rank, dev in enumerate(self.devices):
+                x = torch.zeros((1, RMS_WIDTH), dtype=torch.bfloat16, device=dev)
+                self._launch_rms(rank, x, x, x[0], 1e-6, loop=True)
+                torch.cuda.synchronize(dev)
+            self.rms_ready = True
         # Compile and load every variant on both GPUs before any capture: each rank against
         # itself (its own buffers as the "peer"), so no rendezvous is needed.
         for rank, dev in enumerate(self.devices):
@@ -206,6 +265,30 @@ class _LL:
                 MAXIT=MAXIT, num_warps=1,
             )
         return out
+
+    def rms_fits(self, x: torch.Tensor) -> bool:
+        return (self.rms_ready and x.dim() == 2 and x.dtype == torch.bfloat16
+                and x.shape[1] == RMS_WIDTH and x.shape[0] <= RMS_ROWS)
+
+    def _launch_rms(self, rank: int, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                    eps: float, loop: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """(bf16(res + allreduce(x)), its RMSNorm times 1 + weight): ``_ll_ar_rms_kernel``."""
+        x = x.contiguous()
+        residual = residual.contiguous()
+        rows, n = x.shape
+        if n != RMS_WIDTH or rows > RMS_ROWS or x.dtype != torch.bfloat16 or residual.shape != x.shape:
+            raise ValueError(f"fused all-reduce + RMSNorm of {tuple(x.shape)} {x.dtype} is not supported")
+        total = torch.empty_like(x)
+        out = torch.empty_like(x)
+        local = (self.rms_loop if loop else self.rms_recv)[rank]
+        peer = local if loop else self.rms_recv[1 - rank]
+        epoch = (self.rms_loop_epoch if loop else self.rms_epoch)[rank]
+        with torch.cuda.device(x.device):
+            _ll_ar_rms_kernel[(rows,)](
+                x, residual, weight, total, out, local, peer, epoch, self.err[rank], eps,
+                self.rms_cap, N=n, BLOCK=triton.next_power_of_2(n), MAXIT=MAXIT,
+            )
+        return total, out
 
     def timeouts(self) -> int:
         return sum(int(e.item()) for e in self.err)
@@ -289,6 +372,16 @@ class Group:
         theirs = self._exchange(rank, x)
         out = (x.float() + theirs.float()).to(x.dtype)
         return out if residual is None else residual + out
+
+    def allreduce_rms(self, rank: int, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                      eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """``kernels.add_rms(residual, allreduce(x), weight, eps)``: in a captured graph one
+        kernel (``GLUE_ARRMS``), bitwise the two launches it replaces."""
+        x = x.contiguous()
+        if (not self.solo and x.is_cuda and torch.cuda.is_current_stream_capturing()
+                and self.ll is not None and self.ll.rms_fits(x)):
+            return self.ll._launch_rms(rank, x, residual, weight, eps)
+        return kernels.add_rms(residual, self.allreduce(rank, x), weight, eps)
 
     def argmax(self, rank: int, logits: torch.Tensor, offset: int) -> torch.Tensor:
         """The greedy pick per row over both ranks' vocabulary shards (``logits`` is this

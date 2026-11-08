@@ -55,7 +55,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 GLUE = ("1_add_rms", "2_topk", "3_zeros_like", "4_argmax", "4b_logits_f32", "5_mtp_glue")
-ORDER = GLUE + ("5b_mtp_lg_rms", "allreduce", "gemv", "moe", "gdn", "attn", "blas",
+ORDER = GLUE + ("5b_mtp_lg_rms", "allreduce", "allreduce_rms", "gemv", "moe", "gdn", "attn", "blas",
                 "other_torch", "other")
 GPU_CATS = ("kernel", "gpu_memcpy", "gpu_memset")
 LABEL = "glue:"
@@ -66,11 +66,15 @@ def out(msg: str) -> None:
 
 
 def norm_name(name: str) -> str:
+    if "_ll_ar_rms_kernel" in name:
+        return "_ll_ar_rms_kernel"
     return "_ll_allreduce_kernel" if "_ll_allreduce_kernel" in name else name
 
 
 def family(name: str) -> str:
     n = name
+    if "_ll_ar_rms_kernel" in n:
+        return "allreduce_rms"
     if "_ll_allreduce_kernel" in n:
         return "allreduce"
     if "_add_rms_kernel" in n:
@@ -234,6 +238,9 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--configs", default="verify:2,verify:1,decode:2,decode:4")
+    parser.add_argument("--parity", action="store_true",
+                        help="plan 29: logits/picks with the ENGINE_GLUE_* fusions on vs off")
+    parser.add_argument("--parity-steps", type=int, default=24)
     args = parser.parse_args()
     os.environ["HIP_VISIBLE_DEVICES"] = args.devices
     os.environ.setdefault("ENGINE_MTP", "1")
@@ -459,8 +466,74 @@ def main() -> None:
         mean = statistics.mean(v[0] for v in v2.values())
         out(f"RESULT kill_test verify B=2 fusible_us_per_gcd mean={mean:.0f} min={worst:.0f} "
             f"threshold=800 -> {'GO' if mean >= 800 else 'KILL'}")
+    if args.parity:
+        glue_parity(fast, ranks, prefill, ids, plen, args.parity_steps, torch, sync)
     if hasattr(fast, "timeouts"):
         out(f"RESULT tp_allreduce_timeouts={fast.timeouts()}")
+
+
+def glue_parity(fast, ranks, prefill, ids, plen, steps, torch, sync) -> None:
+    """Captured decode (B=2, 4: ``steps`` greedy steps) and verify (B=1, 2, 4: one step from a
+    fresh prefill) with the plan 29 fusions on and off: logits and picks must be bitwise."""
+    from engine.fast import fused as FZ
+    from engine.fast import tp as TP
+
+    def flags(on: bool) -> None:
+        FZ.GLUE_TOPK = FZ.GLUE_NOZERO = on
+        TP.GLUE_ARRMS = on and fast.tp.ll is not None and fast.tp.ll.rms_ready
+        for m in ranks:  # recapture every graph under the new flags
+            for seg in m.segments + m.vsegments:
+                seg.graphs.clear()
+                seg.inputs.clear()
+                seg.outputs.clear()
+            m.__dict__.pop("_glue_next", None)
+        sync()
+
+    def run() -> dict:
+        res = {}
+        for b in (2, 4):
+            slots = list(range(b))
+            cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
+            logs = []
+            for step in range(steps):
+                o = fast.decode(cur, slots, [plen + step] * b).float().cpu()
+                logs.append(o)
+                cur = o.argmax(-1).tolist()
+            res[f"decode B={b}"] = torch.stack(logs)
+        for b in (1, 2, 4):
+            slots = list(range(b))
+            cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
+            drafts = [(c + 17) % 1000 for c in cur]
+            logits, g1, g2, d1, d2 = fast.verify(cur, drafts, slots, [plen] * b)
+            res[f"verify B={b}"] = (logits.float().cpu(), (g1, g2, d1, d2))
+        for s in range(4):
+            fast.reset(s)
+        return res
+
+    saved = (FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS)
+    try:
+        flags(True)
+        on = run()
+        on_flags = (FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS)
+        flags(False)
+        off = run()
+    finally:
+        FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS = saved
+        flags(saved[0])
+        TP.GLUE_ARRMS = saved[2]
+    allsame = True
+    for k in on:
+        if k.startswith("decode"):
+            same = torch.equal(on[k], off[k])
+            diff = (on[k] - off[k]).abs().max().item()
+            out(f"RESULT parity_glue {k} steps={on[k].shape[0]} logits_bitwise={same} max_abs_diff={diff:.3g}")
+        else:
+            same = torch.equal(on[k][0], off[k][0]) and on[k][1] == off[k][1]
+            out(f"RESULT parity_glue {k} logits_and_picks_bitwise={same} picks_on={on[k][1]} "
+                f"picks_off={off[k][1]}")
+        allsame &= same
+    out(f"RESULT parity_glue flags_on(topk,nozero,arrms)={on_flags} graphs={fast.graph_error is None} "
+        f"all_bitwise={allsame}")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,8 @@ def main() -> None:
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--today", default=None, help="spec_step_bench RESULT lines, chain off")
+    parser.add_argument("--baseline-ms", type=float, default=None,
+                        help="a k=1 verify B=2 step time given by the lead (another commit)")
     args = parser.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", args.devices)
     os.environ.setdefault("ENGINE_MTP", "1")
@@ -277,6 +279,12 @@ def main() -> None:
             line["best_vs_today_k1"] = round(rows[best]["tok_per_ms"] / today, 3)
             if name == "replay":
                 line["gate"] = "GO" if rows[best]["tok_per_ms"] / today >= 1.35 else "KILL"
+        if args.baseline_ms and today_e:
+            base = 2 * today_e / args.baseline_ms
+            line["baseline_ms"] = args.baseline_ms
+            line["best_vs_baseline_k1"] = round(rows[best]["tok_per_ms"] / base, 3)
+            if name == "replay":
+                line["gate_vs_baseline"] = "GO" if rows[best]["tok_per_ms"] / base >= 1.35 else "KILL"
         out("tok_per_ms", **line)
     if hasattr(fast, "timeouts"):
         out("tp_allreduce_timeouts", n=fast.timeouts())

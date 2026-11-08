@@ -869,16 +869,15 @@ class FastModel:
             x = x + h
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
             x = x + self._moe(layer.mlp, h)
+        # The logits exactly as without the head (the norm over the last row alone).
+        last = _rms(x[-1:].to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
+        logits = F.linear(last, self.lm_head).float()
         if self.mtp is not None:
             hidden = _rms(x.to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
-            logits = F.linear(hidden[-1:], self.lm_head).float()
             self._mtp_prefill(
                 hidden, [(slot, ids, start)], [follow], logits, _PackPlan(self, [(slot, ids, start)])
             )
-            return logits[0]
-        x = x[-1:].to(self.final_norm.device)
-        x = _rms(x, self.final_norm, self.eps).to(self.lm_head.device)
-        return F.linear(x, self.lm_head).float()[0]
+        return logits[0]
 
     def _gdn_prefill(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:
         m = self.layers[i].linear_attn
@@ -994,14 +993,14 @@ class FastModel:
             x = x + h
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
             x = x + self._moe(layer.mlp, h)
+        # The logits exactly as without the head (the norm over the segments' last rows alone).
+        last = x.index_select(0, plan.on(x.device).last).to(self.final_norm.device)
+        last = _rms(last, self.final_norm, self.eps).to(self.lm_head.device)
+        logits = F.linear(last, self.lm_head).float()
         if self.mtp is not None:
             hidden = _rms(x.to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
-            logits = F.linear(hidden.index_select(0, plan.on(hidden.device).last), self.lm_head).float()
             self._mtp_prefill(hidden, segments, follows, logits, plan)
-            return logits
-        x = x.index_select(0, plan.on(x.device).last).to(self.final_norm.device)
-        x = _rms(x, self.final_norm, self.eps).to(self.lm_head.device)
-        return F.linear(x, self.lm_head).float()
+        return logits
 
     def _gdn_prefill_packed(self, i: int, x: torch.Tensor, p: _PackOnDevice) -> torch.Tensor:
         m = self.layers[i].linear_attn

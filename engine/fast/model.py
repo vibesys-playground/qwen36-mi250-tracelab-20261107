@@ -1361,14 +1361,19 @@ class FastModel:
         h = _rms(z, layer.post_attention_layernorm.weight, self.eps)
         return self._reduce(self._moe(layer.mlp, h, decode=decode), z)
 
-    def _mtp_in(self, hidden: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        """``fc(cat(norm(embed(x[t+1])), norm(H[t])))``: embedding first (``engine.mtp``)."""
+    def _mtp_in(self, hidden: torch.Tensor, tokens: torch.Tensor, gemv: bool = False) -> torch.Tensor:
+        """``fc(cat(norm(embed(x[t+1])), norm(H[t])))``: embedding first (``engine.mtp``).
+        With ``gemv``, ``fc`` through the fused multi-row GEMV (a decode step's rows)."""
         m = self.mtp
         e = _rms(F.embedding(tokens, self.mtp_embed), m.pre_fc_norm_embedding.weight, self.eps)
         h = _rms(hidden, m.pre_fc_norm_hidden.weight, self.eps)
+        if gemv:
+            return self.fused.gemv(torch.cat((e, h), dim=-1), m.fc.weight)
         return F.linear(torch.cat((e, h), dim=-1), m.fc.weight)
 
-    def _mtp_logits(self, z: torch.Tensor) -> torch.Tensor:
+    def _mtp_logits(self, z: torch.Tensor, gemv: bool = False) -> torch.Tensor:
+        if gemv:
+            return self.fused.gemv(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
         return F.linear(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
 
     def _mtp_prefill(
@@ -1410,8 +1415,12 @@ class FastModel:
         n = hidden.shape[0]
         slots, positions = meta.slots[:n], meta.positions[:n]
         if self._fused_rows(n, verify=True):  # the head's layer through the fused kernels
-            z = self._fused_layer(self.mtp_index, self._mtp_in(hidden, tokens), slots, positions, meta)
-            return self._argmax(self._mtp_logits(z))
+            from engine.fast import fused
+
+            gemv = fused.GEMV  # fc and lm_head through the multi-row GEMV too (plan 19)
+            z = self._fused_layer(self.mtp_index, self._mtp_in(hidden, tokens, gemv), slots,
+                                  positions, meta)
+            return self._argmax(self._mtp_logits(z, gemv))
         z = self._mtp_layer(
             self._mtp_in(hidden, tokens),
             lambda h: self._attn_decode(self.mtp_index, h, slots, positions, meta),

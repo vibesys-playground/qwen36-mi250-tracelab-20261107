@@ -5,9 +5,12 @@ thread, so the two ranks take turns on one GIL: an eager prefill pass costs the 
 both ranks' ~5k kernel launches one after the other (j139: a 561-token pass 196 ms with both
 ranks, 130 ms for one rank alone). Here rank 1 is a child process with its own interpreter:
 
-- **Load.** The parent loads and shards the checkpoint as before (``shard_model``); rank 1's
-  shard (weights on its GPU) goes to the child through torch's CUDA IPC, so no weight is
-  copied or read twice, and the child builds its ``FastModel`` on it.
+- **Load.** The parent loads and shards the checkpoint as before (``shard_model``). Rank 1's
+  weights (already on its GPU) move to the child in batches through torch's CUDA IPC: the
+  child copies a batch into its own memory, then the parent frees it and returns emptied
+  allocator segments to the driver. Batches follow the parent's segments, so the GPU ends up
+  the child's (j150: weights left mapped from the parent pinned ~14 GB of freed blocks in
+  their segments, and rank 1's KV pool no longer fit).
 - **Commands.** The parent keeps every piece of host state (page pool and page lists, state
   banks, prefix-cache snapshots) and sends rank 1 what changes, in program order, over a
   pipe: page-table rows, resets, bank flips, page copies, snapshot copies of rank 1's Gated
@@ -206,6 +209,82 @@ class _LLProc(tpm._LL):
         return int(self.err[self.rank].item())
 
 
+# ================================================================================ weights
+
+
+class _Leaf:
+    """Where a CUDA tensor of rank 1's shard sat in the tree (sent separately)."""
+
+    __slots__ = ("i",)
+
+    def __init__(self, i: int) -> None:  # noqa: D107
+        self.i = i
+
+
+def _strip(obj: Any, leaves: list[torch.Tensor], index: dict[int, int]) -> Any:
+    """``obj`` with every CUDA tensor replaced by a ``_Leaf`` (namespaces edited in place)."""
+    if isinstance(obj, torch.Tensor):
+        if not obj.is_cuda:
+            return obj
+        if id(obj) not in index:
+            index[id(obj)] = len(leaves)
+            leaves.append(obj)
+        return _Leaf(index[id(obj)])
+    if isinstance(obj, list):
+        return [_strip(x, leaves, index) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_strip(x, leaves, index) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _strip(v, leaves, index) for k, v in obj.items()}
+    if isinstance(obj, (tpm.NS, tpm._Experts)):
+        for k, v in list(vars(obj).items()):
+            setattr(obj, k, _strip(v, leaves, index))
+    return obj
+
+
+def _fill(obj: Any, table: dict[int, torch.Tensor]) -> Any:
+    """``_strip`` undone with this process's copies."""
+    if isinstance(obj, _Leaf):
+        return table[obj.i]
+    if isinstance(obj, list):
+        return [_fill(x, table) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_fill(x, table) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _fill(v, table) for k, v in obj.items()}
+    if isinstance(obj, (tpm.NS, tpm._Experts)):
+        for k, v in list(vars(obj).items()):
+            setattr(obj, k, _fill(v, table))
+    return obj
+
+
+def _by_segment(leaves: list[torch.Tensor]) -> list[list[int]]:
+    """Leaves grouped by the caching-allocator segment holding them, the segments with the
+    most memory that is not theirs (freed blocks) first: sending those frees the most."""
+    import bisect
+
+    segs = sorted(
+        (s["device"], s["address"], s["total_size"]) for s in torch.cuda.memory_snapshot()
+    )
+    starts = [(d, a) for d, a, _ in segs]
+    groups: dict[tuple[int, int], list[int]] = {}
+    live: dict[tuple[int, int], int] = {}
+    total: dict[tuple[int, int], int] = {}
+    for i, t in enumerate(leaves):
+        key = (t.device.index, t.untyped_storage().data_ptr())
+        at = bisect.bisect_right(starts, key) - 1
+        if at >= 0 and segs[at][0] == key[0] and segs[at][1] <= key[1] < segs[at][1] + segs[at][2]:
+            seg = (segs[at][0], segs[at][1])
+            total[seg] = segs[at][2]
+        else:
+            seg = key
+            total[seg] = t.untyped_storage().nbytes()
+        groups.setdefault(seg, []).append(i)
+        live[seg] = live.get(seg, 0) + t.untyped_storage().nbytes()
+    order = sorted(groups, key=lambda g: live[g] - total[g])
+    return [groups[g] for g in order]
+
+
 # ================================================================================ the group
 
 
@@ -331,7 +410,9 @@ class _Rank1:
             self.ll = _LLProc(1, devices)
             self.ll.connect(init["handles"])
         self.group = ProcGroup(1, devices, self.ll, data)
-        shard, head = init["shard"], init["head"]
+        table = self._weights()
+        shard, head = _fill(init["shard"], table), _fill(init["head"], table)
+        del table
         model = FastModel(shard, mtp=head, **init["options"])
         model.tp, model.rank, model.vocab_offset = self.group, 1, shard.vocab_offset
         if len(model.segments) != 1:
@@ -347,6 +428,24 @@ class _Rank1:
             "row_bytes": _row_bytes(model),
             "pid": os.getpid(),
         }
+
+    def _weights(self) -> dict[int, torch.Tensor]:
+        """Rank 1's weights, batch by batch: each copied into this process's memory before the
+        parent frees its own (it waits for ``weights_done``)."""
+        table: dict[int, torch.Tensor] = {}
+        while True:
+            msg = self.conn.recv()
+            if msg[0] == "weights_end":
+                return table
+            if msg[0] != "weights":
+                raise RuntimeError(f"rank 1 expected weights, got {msg[0]!r}")
+            for i, t in msg[2]:
+                table[i] = t.clone()
+                del t
+            del msg  # drop the mapped originals: the parent frees them after ``weights_done``
+            if self.dev.type == "cuda":
+                torch.cuda.synchronize(self.dev)
+            self.conn.send(("weights_done", None))
 
     def _ensure_pages(self, slot: int, length: int) -> None:
         if len(self.model.slot_pages[slot]) * PAGE < length:
@@ -605,19 +704,33 @@ class ProcTPModel(tpm.TPModel):
         options = dict(slots=slots, max_len=max_len, use_triton=use_triton, use_graphs=use_graphs,
                        buckets=tuple(buckets),
                        kv_tokens=(r0.pool.pages - 1) * PAGE if kv_tokens is None else kv_tokens)
+        leaves: list[torch.Tensor] = []
+        index: dict[int, int] = {}
+        skeleton = _strip(list(shards[1]), leaves, index)
+        del index
         init = {
             "devices": [str(d) for d in self.devices_tp],
-            "shard": shards[1][0],
-            "head": shards[1][1],
+            "shard": skeleton[0],
+            "head": skeleton[1],
             "options": options,
             "gdn": _gdn_globals(),
             "attn_splits": attn_splits,
             "handles": ll.handles() if ll is not None else None,
         }
-        self._keep = shards[1]  # rank 1's weights: this process's memory, mapped by the child
         with self._io:
             self._conn.send(("init", init))
-        del init, shards
+        del init, shards, skeleton
+        moved = 0
+        for group in (_by_segment(leaves) if leaves else []):
+            self._send("weights", [(i, leaves[i]) for i in group])
+            self._reply("weights_done", REPLY_S)
+            for i in group:
+                moved += leaves[i].untyped_storage().nbytes()
+                leaves[i] = None  # type: ignore[call-overload]
+            torch.cuda.ipc_collect()
+            tpm._empty_cache(self.devices_tp)
+        del leaves
+        self._send("weights_end")
         tpm._empty_cache(self.devices_tp)
         ready = self._reply("ready", REPLY_S)
         if ll is not None:
@@ -639,7 +752,8 @@ class ProcTPModel(tpm.TPModel):
         self.last_drafts: torch.Tensor | None = None
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
-        print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1)", flush=True)
+        print(f"engine: tensor-parallel rank 1 in process {ready['pid']} (ENGINE_TP_PROC=1), "
+              f"{moved / 2**30:.1f} GiB of weights handed over", flush=True)
 
     # ------------------------------------------------------------ the child
 

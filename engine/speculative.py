@@ -30,12 +30,13 @@ row as before; their drafts are never accepted.
 ``ENGINE_MTP=0`` turns it off (plain captured decode), as does a checkpoint
 without ``mtp.*`` tensors.
 
-Chained drafts (plan 31, ``ENGINE_SPEC_CHAIN=1``, off by default): each step feeds every
+Chained drafts (plan 31, ``ENGINE_SPEC_CHAIN=1``, the default): each step feeds every
 running request's last token and k drafts (``FastModel.verify_chain``), the MTP head applied
 to its own output k times. A request emits the target's picks up to and including the first
 one that differs from the draft fed after it, so every emitted token is again the target's
 own greedy pick, and its slot's state ring advances by the drafts it accepted. k is one per
-step for the whole batch, chosen from {1, 3, 7} (``ENGINE_SPEC_K`` fixes it) to maximize the
+step for the whole batch, chosen from {1, 3, 7} up to ``ENGINE_SPEC_KMAX`` (default 3;
+``ENGINE_SPEC_K`` fixes it) to maximize the
 predicted tokens per millisecond: per request the expected tokens per step at its own
 running per-draft acceptance (an exponentially decayed count of its accepted and rejected
 drafts, starting from a prior), over the step cost of k (``ENGINE_SPEC_COST``, ms per
@@ -87,9 +88,10 @@ def eligible(sampling: Sampling) -> bool:
 
 
 def chain_enabled(generator: Generator) -> bool:
-    from engine.fast import mfma
-
-    return mfma.CHAIN and generator.fast is not None and generator.fast.mtp is not None
+    fast = generator.fast
+    return fast is not None and fast.mtp is not None and getattr(fast, "chain", False) and (
+        fast.fused is not None
+    )
 
 
 KS = (1, 3, 7)

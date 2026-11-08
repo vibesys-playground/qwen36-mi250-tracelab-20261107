@@ -1,6 +1,7 @@
 """Plan 31: matrix-core (MFMA, ``tl.dot``) decode GEMVs and the chained verify's GDN kernels.
 
-Behind ``ENGINE_SPEC_CHAIN=1`` (off by default), which turns on:
+On by default (``ENGINE_SPEC_CHAIN=1``; =0 restores the two-row verify), with at most
+``ENGINE_SPEC_KMAX`` (default 3) drafts per slot; it turns on:
 
 - ``gemv``: every fused decode GEMV (the dense projections, the router|shared GEMV, the
   lm_head and the MTP head's fc and lm_head) as one zero-padded 16-row ``tl.dot`` tile per
@@ -30,10 +31,12 @@ from engine.fast import kernels
 
 triton, tl = kernels.triton, kernels.tl
 
-CHAIN = os.environ.get("ENGINE_SPEC_CHAIN", "0") == "1"
+CHAIN = os.environ.get("ENGINE_SPEC_CHAIN", "1") == "1"
 GEMV = CHAIN or os.environ.get("ENGINE_MFMA_GEMV", "0") == "1"
 # Most drafts per slot of a chained verify step (the GDN ring holds KMAX + 1 states per slot).
-KMAX = int(os.environ.get("ENGINE_SPEC_KMAX", "7"))
+# 3 by default (plan 31 stage 1, j161: k = 3 the best tokens/ms on replay-like text); 7 for
+# experiments.
+KMAX = int(os.environ.get("ENGINE_SPEC_KMAX", "3"))
 RING = KMAX + 1
 BM = 16  # the fixed row tile
 

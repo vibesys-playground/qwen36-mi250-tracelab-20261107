@@ -79,7 +79,10 @@ GEMV_TILES = {
     (1281, 2048): (16, 256, 8, 1, 2, {1: 2, 2: 1, 4: 4, 8: 0}),      # router|shared
     (248320, 2048): (64, 128, 8, 1, 1, {1: 1, 2: 1, 4: 0, 8: 2}),    # lm_head
     # One rank's shard under ENGINE_TP=2 (``engine.fast.tp``); the MTP fc stays replicated
-    # (2048, 4096). Provisional until the sweep of tools/gemv_bw_bench.py --tp2.
+    # (2048, 4096). These are the tiles j133 checked end to end (GPU tests, spec == plain).
+    # Its sweep (tools/gemv_bw_bench.py --tp2) found at 4 rows: in_proj as here; out_proj
+    # (32, 256, 8, 1, 1) 13.7 us vs 15.1; q|k|v (32, 128, 4, 2, 1) 22.4 us vs 25.6;
+    # router|shared (4, 2048, 4, 1, 1) 9.0 us vs 9.9; lm_head as here. Untested in the engine.
     (6176, 2048): (32, 128, 4, 1, 2, {1: 2, 2: 2, 4: 8, 8: 0}),      # GDN in_proj (+ conv)
     (2048, 2048): (32, 128, 4, 2, 2, {1: 4, 2: 8, 4: 0, 8: 2}),      # out_proj, o_proj
     (4608, 2048): (16, 256, 8, 1, 1, {1: 2, 2: 2, 4: 2, 8: 2}),      # attention q|k|v

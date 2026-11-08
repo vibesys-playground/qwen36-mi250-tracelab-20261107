@@ -449,12 +449,12 @@ def gemv_part(torch, args) -> None:
                 for r in ROWS
             )
             out(f"RESULT mr_best shape={name} N={n} K={k} cfg(BN,BK,warps,mode,ksplit,stages)={cfg} {desc}")
-        else:
-            out(f"RESULT mr_best shape={name} none (no invariant config completed)")
             if args.tp2 and name != "mtp_fc":  # the replicated MTP fc keeps its entry
                 bn, bk, warps, _, ks, stages = cfg
                 grids = ",".join(str(per_r[r][1]) for r in ROWS)
                 tiles_env.append(f"{n}x{k}={bn},{bk},{warps},{ks},{stages},{grids}")
+        else:
+            out(f"RESULT mr_best shape={name} none (no invariant config completed)")
         # the current pair kernel's invariance (reference)
         check_invariance_cur(torch, ws[0], k, n, cur_launch, cur_tiles, get_x, name)
 

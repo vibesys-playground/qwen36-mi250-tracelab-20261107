@@ -728,7 +728,11 @@ class ProcTPModel(tpm.TPModel):
         dev1 = self.devices_tp[1]
         pool = None
         if dev1.type == "cuda" and hasattr(torch.cuda, "MemPool"):
-            pool = torch.cuda.MemPool()
+            # A MemPool registers (and holds a reference) on the device current when it is made;
+            # made on another device, each ``use_mem_pool`` exit on ``dev1`` drops the pool there
+            # and the next entry trips the allocator's ``use_count > 0`` assert.
+            with torch.cuda.device(dev1):
+                pool = torch.cuda.MemPool()
         self._mem_pool = pool  # kept: the child maps memory of this pool
         if pool is None:
             return tpm.shard_model(lm, mtp, self.devices_tp)

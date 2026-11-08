@@ -77,6 +77,13 @@ WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
 # 80 fused calls took ~1,020 us per GCD per verify B=2 step against ~820 us for the all-reduce
 # and add_rms launches they replace, and tests/test_fused_glue.py did not pass for it.
 GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
+# Plan 29 item 4 (ENGINE_GLUE_ARGMAX=1, default on): ``Group.argmax`` as three launches: one
+# Triton pass per row over this rank's logits shard (its max and first index, packed with the
+# zeros of the peer's columns), the fp32 all-reduce, one Triton pick. The same bits as the torch
+# ops (cast, argmax, gather, zeros, 2 stores, add, all-reduce, where, long): a max and the first
+# index of it do not depend on the order of the scan.
+GLUE_ARGMAX = os.environ.get("ENGINE_GLUE_ARGMAX", "1") == "1"
+ARGMAX_BLOCK = 8192
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)
 
@@ -176,6 +183,61 @@ if triton is not None:
         y = x * tl.rsqrt(var + eps) * (1.0 + wt)
         tl.store(out_ptr + row * N + cols, y.to(tl.bfloat16), mask=ok)
         tl.store(epoch_ptr + row, e)
+
+
+    @triton.jit
+    def _argmax_pack_kernel(l_ptr, both_ptr, V, stride, offset, RANK: tl.constexpr,
+                            BLOCK: tl.constexpr):
+        """both[row] = this rank's (max, first index + offset) in columns 2 RANK, 2 RANK + 1 of
+        four, zeros in the peer's two (``Group.argmax``)."""
+        row = tl.program_id(0)
+        base = l_ptr + row.to(tl.int64) * stride
+        lanes = tl.arange(0, BLOCK)
+        best = tl.full([BLOCK], float("-inf"), tl.float32)
+        bidx = tl.zeros([BLOCK], dtype=tl.int32)
+        for v0 in range(0, V, BLOCK):
+            cols = v0 + lanes
+            x = tl.load(base + cols, mask=cols < V, other=float("-inf")).to(tl.float32)
+            upd = x > best  # strict: each lane keeps the first column of its max
+            best = tl.where(upd, x, best)
+            bidx = tl.where(upd, cols, bidx)
+        m = tl.max(best, axis=0)
+        i = tl.min(tl.where(best == m, bidx, V), axis=0)
+        i = tl.where(m == float("-inf"), 0, i)  # an all -inf row: index 0, as torch.argmax
+        k = tl.arange(0, 4)
+        val = tl.where(k == 2 * RANK, m, tl.where(k == 2 * RANK + 1, (i + offset).to(tl.float32), 0.0))
+        tl.store(both_ptr + row * 4 + k, val)
+
+    @triton.jit
+    def _argmax_pick_kernel(both_ptr, out_ptr, R, RB: tl.constexpr):
+        """out[row] = int64(both[row, 1] if both[row, 0] >= both[row, 2] else both[row, 3])."""
+        r = tl.arange(0, RB)
+        ok = r < R
+        a0 = tl.load(both_ptr + r * 4, mask=ok, other=0.0)
+        a1 = tl.load(both_ptr + r * 4 + 1, mask=ok, other=0.0)
+        a2 = tl.load(both_ptr + r * 4 + 2, mask=ok, other=0.0)
+        a3 = tl.load(both_ptr + r * 4 + 3, mask=ok, other=0.0)
+        tl.store(out_ptr + r, tl.where(a0 >= a2, a1, a3).to(tl.int64), mask=ok)
+
+
+def argmax_pack(logits: torch.Tensor, rank: int, offset: int) -> torch.Tensor:
+    """The ``[rows, 4]`` fp32 block ``Group.argmax`` all-reduces, in one launch."""
+    logits = logits.contiguous()
+    rows, v = logits.shape
+    both = torch.empty((rows, 4), dtype=torch.float32, device=logits.device)
+    with kernels.on_device(logits):
+        _argmax_pack_kernel[(rows,)](logits, both, v, logits.stride(0), offset, RANK=rank,
+                                     BLOCK=ARGMAX_BLOCK, num_warps=8)
+    return both
+
+
+def argmax_pick(both: torch.Tensor) -> torch.Tensor:
+    rows = both.shape[0]
+    out = torch.empty((rows,), dtype=torch.long, device=both.device)
+    with kernels.on_device(both):
+        _argmax_pick_kernel[(1,)](both, out, rows, RB=max(16, triton.next_power_of_2(rows)),
+                                  num_warps=1)
+    return out
 
 
 def _hip() -> ctypes.CDLL:
@@ -391,6 +453,9 @@ class Group:
     def argmax(self, rank: int, logits: torch.Tensor, offset: int) -> torch.Tensor:
         """The greedy pick per row over both ranks' vocabulary shards (``logits`` is this
         rank's, its first row ``offset``): the larger max, ties to rank 0 (the lower index)."""
+        if (GLUE_ARGMAX and logits.is_cuda and triton is not None and logits.dim() == 2
+                and logits.shape[0] > 0 and logits.dtype in (torch.float32, torch.bfloat16)):
+            return argmax_pick(self.allreduce(rank, argmax_pack(logits, rank, offset)))
         logits = logits.float()
         index = logits.argmax(-1)
         best = logits.gather(-1, index[:, None])[:, 0]

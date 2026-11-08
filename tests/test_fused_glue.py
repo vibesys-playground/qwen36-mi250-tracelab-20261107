@@ -3,6 +3,9 @@
 - ``ENGINE_GLUE_NOZERO``: ``FusedDecode._moe(i, None, h)`` equals ``_moe(i, zeros_like, h)``.
 - ``ENGINE_GLUE_TOPK``: the routed gate_up kernel's own top-k (``_topk`` per work item) gives
   the same experts, weights and MoE output as ``_topk_kernel``, on router logits with ties.
+- ``ENGINE_GLUE_ARGMAX``: ``Group.argmax``'s packed (max, first index) per rank and its final
+  pick equal the torch ops' (ties, all -inf rows, fp32 and BF16 logits), and the pick over two
+  shards is ``argmax`` over the whole vocabulary.
 - ``ENGINE_GLUE_ARRMS``: ``_ll_ar_rms_kernel`` on two GPUs equals the LL all-reduce followed by
   ``kernels.add_rms`` (both forms the layers use: residual in the add_rms, or in the
   all-reduce), and both ranks get the same bits.
@@ -124,6 +127,62 @@ def test_moe_glue_is_bitwise() -> None:
 
 def test_topk_on_tied_router_rows() -> None:
     _topk_mass()
+
+
+# ------------------------------------------------------------------ greedy pick
+
+
+def _torch_pack(logits: torch.Tensor, rank: int, offset: int) -> torch.Tensor:
+    """``Group.argmax``'s torch ops before the all-reduce."""
+    logits = logits.float()
+    index = logits.argmax(-1)
+    best = logits.gather(-1, index[:, None])[:, 0]
+    both = torch.zeros((logits.shape[0], 4), dtype=torch.float32, device=logits.device)
+    both[:, 2 * rank] = best
+    both[:, 2 * rank + 1] = (index + offset).float()
+    return both
+
+
+def _argmax_cases() -> list[str]:
+    from engine.fast import tp
+
+    g = torch.Generator(device="cpu").manual_seed(11)
+    lines = []
+    shards = (124160, 124160) if GPU else (300, 257)
+    for dtype in (torch.float32, torch.bfloat16):
+        for R in (1, 2, 4, 8, 16):
+            parts = []
+            for v in shards:
+                x = torch.randn(R, v, generator=g) * 3
+                if R > 1:
+                    x[1] = torch.round(x[1])  # many exact ties, the max among them
+                if R > 2:
+                    x[2] = 0.0  # all tied: index 0
+                    x[2, v // 2] = -0.0
+                if R > 3:
+                    x[3] = float("-inf")  # an all -inf row
+                if R > 4:
+                    x[4, 5] = x[4, v - 3] = x[4].max() + 1  # the same max twice
+                parts.append(x.to(dtype).to(DEV))
+            offs = (0, shards[0])
+            packs = []
+            for rank, (x, off) in enumerate(zip(parts, offs)):
+                got = tp.argmax_pack(x, rank, off)
+                ref = _torch_pack(x, rank, off)
+                assert torch.equal(got, ref), ("pack", dtype, R, rank, got, ref)
+                packs.append(got)
+            both = packs[0] + packs[1]  # what the fp32 all-reduce adds
+            pick = tp.argmax_pick(both)
+            ref = torch.where(both[:, 0] >= both[:, 2], both[:, 1], both[:, 3]).long()
+            whole = torch.cat([p.float() for p in parts], dim=-1).argmax(-1)
+            assert torch.equal(pick, ref), ("pick", dtype, R)
+            assert torch.equal(pick.cpu(), whole.cpu()), ("whole vocabulary", dtype, R, pick, whole)
+            lines.append(f"dtype={dtype} R={R} pack=bitwise pick=bitwise whole_vocab_argmax=equal")
+    return lines
+
+
+def test_argmax_is_bitwise() -> None:
+    _argmax_cases()
 
 
 # ------------------------------------------------------------------ all-reduce + RMSNorm
@@ -248,6 +307,7 @@ if __name__ == "__main__":
         sys.exit(0)
     ok = True
     for name, fn in (("moe", _moe_cases), ("topk_mass", lambda: [_topk_mass()]),
+                     ("argmax", _argmax_cases),
                      ("ar_rms", _ar_rms_two_gpus if TWO_GPUS else
                       (_ar_rms_interpret if kernels.INTERPRET else (lambda: ["SKIPPED (one GPU)"])))):
         try:

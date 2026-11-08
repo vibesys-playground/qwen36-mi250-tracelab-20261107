@@ -94,14 +94,16 @@ if triton is not None:
             m = m_new
         return m, l, acc
 
-    @triton.jit(do_not_specialize=["T", "start"])
+    @triton.jit(do_not_specialize=["T", "start", "nsplit"])
     def _flash_prefill_kernel(
         q_ptr, k_ptr, v_ptr, table_ptr, gate_ptr, out_ptr, ws_acc, ws_ml, T, start, qk_scale,
-        stride_page, stride_head, stride_tok,
+        stride_page, stride_head, stride_tok, nsplit,
         QH: tl.constexpr, GROUP: tl.constexpr, BLOCK_R: tl.constexpr, D: tl.constexpr,
         PAGE: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT: tl.constexpr, KT: tl.constexpr,
         WIDEN: tl.constexpr,
     ):
+        """SPLIT (constexpr) says whether the keys are split; ``nsplit`` (runtime, so a new
+        split count compiles nothing) how many ways."""
         tile = tl.program_id(0)
         kvh = tl.program_id(1)
         split = tl.program_id(2)
@@ -123,11 +125,11 @@ if triton is not None:
         m = tl.full([M], float("-inf"), dtype=tl.float32)
         l = tl.zeros([M], dtype=tl.float32)
         acc = tl.zeros([M, D], dtype=tl.float32)
-        if SPLIT == 1:
+        if not SPLIT:
             lo = n_all * 0
             hi = n_all
         else:
-            per = tl.cdiv(n_all, SPLIT)
+            per = tl.cdiv(n_all, nsplit)
             lo = tl.minimum(split * per, n_all)
             hi = tl.minimum(lo + per, n_all)
         m, l, acc = _blocks(
@@ -140,7 +142,7 @@ if triton is not None:
             tl.maximum(lo, n_full), hi, stride_page, stride_head, stride_tok,
             D, PAGE, BLOCK_N, True, KT, WIDEN,
         )
-        if SPLIT == 1:
+        if not SPLIT:
             o = _bf16(acc / l[:, None], WIDEN)  # SDPA's BF16 output
             g = tl.load(gate_ptr + qo, mask=r_ok[:, None], other=0.0).to(tl.float32)
             sig = _bf16(tl.sigmoid(g), WIDEN)  # torch.sigmoid on BF16
@@ -152,20 +154,20 @@ if triton is not None:
             tl.store(ws_ml + (base + row) * 2, m, mask=r_ok)
             tl.store(ws_ml + (base + row) * 2 + 1, l, mask=r_ok)
 
-    @triton.jit(do_not_specialize=["T"])
+    @triton.jit(do_not_specialize=["T", "nsplit"])
     def _flash_combine_kernel(
-        ws_acc, ws_ml, gate_ptr, out_ptr, T,
-        QH: tl.constexpr, D: tl.constexpr, SPLIT: tl.constexpr, WIDEN: tl.constexpr,
+        ws_acc, ws_ml, gate_ptr, out_ptr, T, nsplit,
+        QH: tl.constexpr, D: tl.constexpr, WIDEN: tl.constexpr,
     ):
         """One (row, head): the SPLIT partials summed in split order, then the epilogue."""
         row = tl.program_id(0).to(tl.int64)
         d = tl.arange(0, D)
         mx = tl.load(ws_ml + row * 2)  # split 0 always holds key 0: finite
-        for s in range(1, SPLIT):
+        for s in range(1, nsplit):
             mx = tl.maximum(mx, tl.load(ws_ml + (s * T * QH + row) * 2))
         l = mx * 0.0
         acc = tl.zeros([D], dtype=tl.float32)
-        for s in range(SPLIT):
+        for s in range(nsplit):
             ms = tl.load(ws_ml + (s * T * QH + row) * 2)
             w = tl.exp2(ms - mx)  # 0 for an empty split (ms = -inf)
             l += w * tl.load(ws_ml + (s * T * QH + row) * 2 + 1)
@@ -261,14 +263,37 @@ def flash_prefill_attention(
     with on_device(q):
         _flash_prefill_kernel[(triton.cdiv(count, block_r), heads, split)](
             q, k_pool, v_pool, table, gate, out, ws_acc, ws_ml, count, start, scale * LOG2E,
-            k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+            k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), split,
             QH=q_heads, GROUP=group, BLOCK_R=block_r, D=dim, PAGE=page, BLOCK_N=block_n,
-            SPLIT=split, KT=kt, WIDEN=_WIDEN, num_warps=num_warps, num_stages=num_stages,
+            SPLIT=split > 1, KT=kt, WIDEN=_WIDEN, num_warps=num_warps, num_stages=num_stages,
             **launch,
         )
         if split > 1:
             _flash_combine_kernel[(count * q_heads,)](
-                ws_acc, ws_ml, gate, out, count, QH=q_heads, D=dim, SPLIT=split, WIDEN=_WIDEN,
+                ws_acc, ws_ml, gate, out, count, split, QH=q_heads, D=dim, WIDEN=_WIDEN,
                 num_warps=4,
             )
     return out
+
+
+def warm(k_pool: torch.Tensor, v_pool: torch.Tensor, q_heads: int) -> None:
+    """Compile every kernel ``choose`` can launch on this pool's device (each tile of the table,
+    split and unsplit, and the combine), before serving: reads page 0 of the pool, writes
+    nothing to it."""
+    heads, page, dim = k_pool.shape[1], k_pool.shape[2], k_pool.shape[3]
+    dev = k_pool.device
+    count, start = 16, 8 * page
+    q = torch.zeros((count, q_heads, dim), dtype=k_pool.dtype, device=dev)
+    gate = torch.zeros((count, q_heads * dim), dtype=k_pool.dtype, device=dev)
+    table = torch.zeros(-(-(start + count) // page), dtype=torch.long, device=dev)
+    seen = set()
+    for _, rows, keys, wpe, _ in _TABLE:
+        if (rows, keys, wpe) in seen:
+            continue
+        seen.add((rows, keys, wpe))
+        launch = {} if wpe is None else {"waves_per_eu": wpe}
+        for split in (1, 2):
+            flash_prefill_attention(
+                q, k_pool, v_pool, table, start, gate, 1.0,
+                block_r=max(rows, 16 // (q_heads // heads)), block_n=keys, split=split, **launch,
+            )

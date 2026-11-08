@@ -1005,6 +1005,7 @@ class ProcTPModel(tpm.TPModel):
     # ------------------------------------------------------------ decode and verify
 
     def _load_inputs(self, host: torch.Tensor) -> None:
+        self._host = host
         for meta in self.ranks[0].devices.values():
             meta.packed.copy_(host)
         self._send("inputs", host.numpy())
@@ -1017,6 +1018,7 @@ class ProcTPModel(tpm.TPModel):
             segs = r0.vsegments if verify else r0.segments
             if size not in segs[0].graphs:
                 self.capture(size, verify)
+                self._load_inputs(self._host)  # the warm-up overwrote them, on both ranks
             if self.graph_error is None:
                 self._send("replay", size, verify)
                 self._step += 1

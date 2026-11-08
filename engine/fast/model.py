@@ -1396,7 +1396,12 @@ class FastModel:
         eagerly over ``rows`` rows; the last segment's output (and a verify's picks)."""
         if self.use_graphs and self.graph_error is None:
             if size not in segments[0].graphs:
+                # Capturing warms up on the dummy slot through the same input buffers: put
+                # this step's inputs back afterwards (graph or eager fallback alike).
+                saved = [(meta, meta.packed.clone()) for meta in self.devices.values()]
                 self.capture(size, verify)
+                for meta, packed in saved:
+                    meta.packed.copy_(packed)
             if self.graph_error is None:
                 x = None
                 for seg in segments:

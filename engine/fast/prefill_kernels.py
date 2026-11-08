@@ -150,17 +150,6 @@ if triton is not None:
         tl.store(i_ptr + row * K + kk, top_i.to(tl.int64))
         tl.atomic_add(counts_ptr + top_i, tl.full([K], 1, tl.int32))
 
-    @triton.jit
-    def _expert_offsets_kernel(
-        counts_ptr, starts_ptr, cursor_ptr, tile_ends_ptr, E: tl.constexpr, BLOCK_M: tl.constexpr
-    ):
-        e = tl.arange(0, E)
-        c = tl.load(counts_ptr + e)
-        ends = tl.cumsum(c, axis=0)
-        tl.store(starts_ptr + e, ends - c)
-        tl.store(cursor_ptr + e, ends - c)
-        tl.store(tile_ends_ptr + e, tl.cumsum((c + BLOCK_M - 1) // BLOCK_M, axis=0))
-
     @triton.jit(do_not_specialize=["P"])
     def _expert_order_kernel(ids_ptr, cursor_ptr, order_ptr, P, BLOCK: tl.constexpr):
         """Each pair takes the next row of its expert's run. The order within an expert's
@@ -183,16 +172,19 @@ if triton is not None:
 
     @triton.jit
     def _moe_combine_kernel(
-        pairs_ptr, sg_ptr, shared_ptr, out_ptr, H: tl.constexpr, K: tl.constexpr,
+        pairs_ptr, wt_ptr, sg_ptr, shared_ptr, out_ptr, H: tl.constexpr, K: tl.constexpr,
         BLOCK: tl.constexpr, WIDEN: tl.constexpr,
     ):
-        """bf16(sum_k pairs[t, k]) + bf16(bf16(sigmoid(sg[t])) * shared[t]), rounded as eager."""
+        """bf16(sum_k w[t, k] * pairs[t, k]) + bf16(bf16(sigmoid(sg[t])) * shared[t]), rounded as
+        eager. ``pairs`` holds each pair's bf16 expert output; w (BF16) times it is exact in fp32,
+        so the fp32 sum is the one over ``bf16(acc) * w`` rows."""
         row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         ok = cols < H
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         for k in tl.static_range(K):
-            acc += tl.load(pairs_ptr + (row * K + k) * H + cols, mask=ok, other=0.0)
+            w = tl.load(wt_ptr + row * K + k).to(tl.float32)
+            acc += tl.load(pairs_ptr + (row * K + k) * H + cols, mask=ok, other=0.0).to(tl.float32) * w
         routed = _bf16(acc, WIDEN)
         gate = _bf16(tl.sigmoid(tl.load(sg_ptr + row).to(tl.float32)), WIDEN)
         shared = tl.load(shared_ptr + row * H + cols, mask=ok, other=0.0).to(tl.float32)
@@ -444,35 +436,36 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int) -> torch.Tensor:
     experts, two_i, _ = gate_up.shape
     inter = two_i // 2
     pairs = tokens * top_k
-    bm, bn1, bk1, bn2, bk2, warps, stages = moe_prefill.config(pairs, experts)
-    bn1, bk2 = min(bn1, inter), min(bk2, inter)
-    bk1, bn2 = min(bk1, hidden), min(bn2, hidden)
-    meta = torch.empty((3, experts), dtype=torch.int32, device=dev)
-    starts, cursor, tile_ends = meta[0], meta[1], meta[2]
+    cfg = moe_prefill.config(pairs, experts)
+    bm = cfg.bm
+    bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
+    bn2, bk2 = min(cfg.down.bn, hidden), min(cfg.down.bk, inter)
+    meta = torch.empty((2, experts), dtype=torch.int32, device=dev)
+    starts, cursor = meta[0], meta[1]
+    max_tiles = triton.cdiv(pairs, bm) + experts
+    table = torch.empty(3 * max_tiles + 1, dtype=torch.int32, device=dev)
     order = torch.empty(pairs, dtype=torch.int32, device=dev)
     act_r = torch.empty((pairs, inter), dtype=torch.bfloat16, device=dev)
-    out_r = torch.empty((pairs, hidden), dtype=torch.float32, device=dev)
-    max_tiles = triton.cdiv(pairs, bm) + experts
-    log_e = max(1, (experts - 1).bit_length())
+    out_r = torch.empty((pairs, hidden), dtype=torch.bfloat16, device=dev)
     y = torch.empty_like(x)
     block = min(1024, triton.next_power_of_2(hidden))
     with on_device(x):
-        _expert_offsets_kernel[(1,)](counts, starts, cursor, tile_ends, E=experts, BLOCK_M=bm)
+        moe_prefill._tiles_kernel[(triton.cdiv(max_tiles, moe_prefill.TILE_BLOCK),)](
+            counts, starts, cursor, table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=moe_prefill.TILE_BLOCK,
+        )
         _expert_order_kernel[(triton.cdiv(pairs, 1024),)](top_i, cursor, order, pairs, BLOCK=1024)
         moe_prefill._gate_up_kernel[(max_tiles, triton.cdiv(inter, bn1))](
-            x, gate_up, order, tile_ends, counts, starts, act_r,
-            gate_up.stride(0), gate_up.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e, TOP_K=top_k,
-            BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            x, gate_up, order, table, act_r, gate_up.stride(0), gate_up.stride(1), max_tiles,
+            H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
+            **moe_prefill.launch_options(cfg.gate_up),
         )
         moe_prefill._down_kernel[(max_tiles, triton.cdiv(hidden, bn2))](
-            act_r, down, top_w.reshape(-1), order, tile_ends, counts, starts, out_r,
-            down.stride(0), down.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e,
-            BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            act_r, down, order, table, out_r, down.stride(0), down.stride(1), max_tiles,
+            H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN,
+            **moe_prefill.launch_options(cfg.down),
         )
         _moe_combine_kernel[(tokens, triton.cdiv(hidden, block))](
-            out_r, sg, shared_out.contiguous(), y, H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
+            out_r, top_w.reshape(-1), sg, shared_out.contiguous(), y, H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
         )
     return y
 

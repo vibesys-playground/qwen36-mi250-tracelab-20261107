@@ -727,7 +727,22 @@ class Generator:
             # One-pass prefill runs spans up to ``_one_pass_max`` tokens: warm the bucketed
             # conv and prefill-expert shapes up to that length too.
             longest = max(self._chunk, self._one_pass_max)
-            self.fast.warmup(self._free_slots[-1], longest, token_ids, other)
+            self.fast.warmup(
+                self._free_slots[-1], longest, token_ids, other,
+                pack_tokens=self.warmup_tokens if other is not None else None,
+            )
+
+    @property
+    def warmup_tokens(self) -> int:
+        """The most tokens one prefill pass can hold: the longest span, or a packed pass
+        up to ``ENGINE_PREFILL_PACK_TOKENS`` (the oldest request always fits, so a pass is
+        never longer than the larger of the two). ``gdn.warmup`` makes this many ids."""
+        if self.fast is None:
+            return self._chunk
+        longest = max(self._chunk, self._one_pass_max)
+        if not self.packing:
+            return longest
+        return max(longest, int(os.environ.get("ENGINE_PREFILL_PACK_TOKENS", "8192")))
 
     def _reclaim(self) -> None:
         while self._released:

@@ -39,7 +39,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import kernels, moe_prefill, prefill_kernels
+from engine.fast import fla_pin, kernels, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -330,6 +330,9 @@ class FastModel:
             # attention, residual add + RMSNorm, the MoE block around the grouped experts.
             "prefill_fused": self.use_triton and prefill_kernels.enabled(),
         }
+        # fla's autotuned prefill kernels: one fixed config each, the same in every process
+        # (``fla_pin``; timing picks differ between processes and so would greedy outputs).
+        self.fla_pins = fla_pin.apply() if self.use_triton else {}
         self.buckets = sorted(buckets)
         # Tensor parallelism (``engine.fast.tp``): this model is one rank's shard and ``tp`` the
         # group whose all-reduces join the partial sums; None runs the whole model here.

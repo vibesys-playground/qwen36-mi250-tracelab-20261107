@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--ref", default="/tmp/tp_ref.pt")
     parser.add_argument("--steps", type=int, default=96)
     parser.add_argument("--chunk", type=int, default=2048)
+    parser.add_argument("--dump-fla", default=None, help="write fla's autotune picks (JSON) here")
     args = parser.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", "0,1")
     os.environ.setdefault("ENGINE_MTP", "0")  # plain decode steps; the head does not change picks
@@ -45,6 +46,8 @@ def main() -> None:
     tok = g.tokenizer
     print(f"RESULT {args.mode} tp={os.environ.get('ENGINE_TP', '1')} graphs={fast.use_graphs} "
           f"graph_error={fast.graph_error} kv_pages={fast.pool.pages}", flush=True)
+    print(f"RESULT fla_pins={getattr(fast, 'fla_pins', None)} "
+          f"prefill_fused={os.environ.get('ENGINE_PREFILL_FUSED', '1')}", flush=True)
 
     def prefill(slot: int, prompt: list[int]) -> torch.Tensor:
         fast.reset(slot)
@@ -146,6 +149,14 @@ def main() -> None:
 
         if mode == "ref" and args.mode == "repeat":
             saved = record
+
+    if args.dump_fla:
+        import json
+
+        from engine.fast import fla_pin
+
+        Path(args.dump_fla).write_text(json.dumps(fla_pin.snapshot(), indent=1, sort_keys=True))
+        print(f"RESULT fla_snapshot written {args.dump_fla}", flush=True)
 
 
 if __name__ == "__main__":

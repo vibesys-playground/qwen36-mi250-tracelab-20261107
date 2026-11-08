@@ -197,6 +197,8 @@ class FastModel:
         self.use_graphs = (on_gpu and self.use_triton) if use_graphs is None else use_graphs
         if self.use_graphs and not self.use_triton:
             raise ValueError("graph capture needs the Triton kernels (the references synchronize)")
+        # Per kernel, for isolating one kernel's numerics against its reference.
+        self.triton_kernels = {"moe": self.use_triton, "gdn": self.use_triton, "attn": self.use_triton}
         self.buckets = sorted(buckets)
         self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
@@ -412,7 +414,7 @@ class FastModel:
             h = self._attn_decode(i, h, slots, positions, meta)
         x = x + h
         h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
-        return x + self._moe(layer.mlp, h)
+        return x + self._moe(layer.mlp, h, decode=True)
 
     def _gdn_project(self, m: torch.nn.Module, x: torch.Tensor):
         return (
@@ -461,7 +463,7 @@ class FastModel:
         qf = hf.l2norm(q.float(), dim=-1, eps=1e-6) * (q.shape[-1] ** -0.5)
         kf = hf.l2norm(k.float(), dim=-1, eps=1e-6)
         core = kernels.gdn_recurrent_(
-            rec_state, slots, qf, kf, v.float(), g, beta.float(), use_triton=self.use_triton
+            rec_state, slots, qf, kf, v.float(), g, beta.float(), use_triton=self.triton_kernels["gdn"]
         ).to(x.dtype)
         return self._gdn_out(m, core, z)
 
@@ -496,12 +498,15 @@ class FastModel:
             slots,
             (positions + 1).to(torch.int32),
             m.scaling,
-            use_triton=self.use_triton,
+            use_triton=self.triton_kernels["attn"],
         )
         out = out.reshape(x.shape[0], -1) * torch.sigmoid(gate)
         return F.linear(out, m.o_proj.weight)
 
-    def _moe(self, mlp: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def _moe(self, mlp: torch.nn.Module, x: torch.Tensor, decode: bool = False) -> torch.Tensor:
+        """Shared plus routed experts. Decode steps always use the in-place expert kernel,
+        which never synchronizes with the host, so every batch bucket can be captured;
+        prefill chunks above ``DECODE_EXPERT_TOKENS`` use the registered experts module."""
         tokens = x.shape[0]
         shared = mlp.shared_expert
         shared_out = F.linear(
@@ -513,9 +518,14 @@ class FastModel:
         top_w, top_i = torch.topk(probs, self.top_k, dim=-1)
         top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).to(router.dtype)
         experts = mlp.experts
-        if tokens <= DECODE_EXPERT_TOKENS:
+        if decode or tokens <= DECODE_EXPERT_TOKENS:
             routed = kernels.moe_decode(
-                x, top_i, top_w, experts.gate_up_proj, experts.down_proj, use_triton=self.use_triton
+                x,
+                top_i,
+                top_w,
+                experts.gate_up_proj,
+                experts.down_proj,
+                use_triton=self.triton_kernels["moe"],
             )
         else:  # prefill: the experts implementation the engine registered with Transformers
             routed = experts(x, top_i, top_w)

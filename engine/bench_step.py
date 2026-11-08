@@ -163,18 +163,18 @@ def main(argv: list[str] | None = None) -> int:
         placement[str(p.device)] = placement.get(str(p.device), 0) + p.numel() * p.element_size()
     print("weights_GB_per_device", {k: round(v / 1e9, 2) for k, v in sorted(placement.items())})
 
+    from engine.fast import kernels
     from engine.fast.model import FastModel
 
     t0 = time.perf_counter()
     fast = FastModel(lm, slots=args.slots, max_len=args.max_len)
+    graphs_wanted = fast.use_graphs
+    fast.use_graphs = False  # diagnostics first, uncaptured; capture right before timing
     print(
-        f"fast: triton={fast.use_triton} graphs={fast.use_graphs} kv_pages={fast.pool.pages} "
+        f"fast: triton={fast.use_triton} graphs={graphs_wanted} kv_pages={fast.pool.pages} "
         f"(={fast.pool.pages * 64} tokens per attention layer) segments="
-        f"{[str(s.device) for s in fast.segments]}"
+        f"{[str(s.device) for s in fast.segments]} build_s={time.perf_counter() - t0:.1f}"
     )
-    fast.capture_all()
-    _sync()
-    print(f"RESULT capture_s={time.perf_counter() - t0:.1f} capture_mode={fast.capture_mode} graph_error={fast.graph_error}")
     if torch.cuda.is_available():
         for d in range(torch.cuda.device_count()):
             free, total = torch.cuda.mem_get_info(d)
@@ -188,64 +188,95 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.perf_counter()
         reference.append(_greedy(generator, prompt, args.steps))
         print(f"hf prompt {len(prompt)}: {time.perf_counter() - t0:.1f} s")
-    # Top-1 agreement on every token the reference chose: the prefill's logits chose token 0,
-    # the logits after feeding token j-1 chose token j (teacher forcing, all prompts in one batch).
-    agree, total, nan, max_diff, prefill_diff = 0, 0, False, 0.0, 0.0
-    for slot, prompt in enumerate(prompts):
-        fast.reset(slot)
-        t0 = time.perf_counter()
-        logits = _fast_prefill(fast, slot, prompt, args.chunk).float().cpu()
-        _sync()
-        print(f"fast prefill {len(prompt)}: {time.perf_counter() - t0:.2f} s")
-        ref = reference[slot][1][0]
-        prefill_diff = max(prefill_diff, float((logits - ref).abs().max()))
-        nan |= bool(torch.isnan(logits).any())
-        total += 1
-        agree += int(int(logits.argmax()) == reference[slot][0][0])
     rows = list(range(len(prompts)))
-    step_diff = []
-    for step in range(args.steps - 1):
-        tokens = [reference[r][0][step] for r in rows]
-        out = fast.decode(tokens, rows, [len(prompts[r]) + step for r in rows]).float().cpu()
-        for r in rows:
-            ref = reference[r][1][step + 1]
-            total += 1
-            agree += int(int(out[r].argmax()) == reference[r][0][step + 1])
-            nan |= bool(torch.isnan(out[r]).any())
-            max_diff = max(max_diff, float((out[r] - ref).abs().max()))
-        step_diff.append(max(float((out[r] - reference[r][1][step + 1]).abs().max()) for r in rows))
-    agree_pct = 100.0 * agree / total
-    print(
-        "RESULT decode_logit_diff_by_step first4="
-        f"{[round(d, 3) for d in step_diff[:4]]} last4={[round(d, 3) for d in step_diff[-4:]]}"
-    )
-    # The decode attention kernel alone, on the slots the parity run filled (1k-4k tokens).
-    try:
-        from engine.fast import kernels
 
+    nonlocal_nan = [False]  # NaN in the served path's logits
+
+    def teacher_forced(label: str) -> float:
+        """Top-1 agreement on every token the reference chose (prefill logits chose token 0,
+        the logits after feeding token j-1 chose token j), all prompts in one decode batch."""
+        agree, total, nan, max_diff, prefill_diff = 0, 0, False, 0.0, 0.0
+        for slot, prompt in enumerate(prompts):
+            fast.reset(slot)
+            logits = _fast_prefill(fast, slot, prompt, args.chunk).float().cpu()
+            prefill_diff = max(prefill_diff, float((logits - reference[slot][1][0]).abs().max()))
+            nan |= bool(torch.isnan(logits).any())
+            total += 1
+            agree += int(int(logits.argmax()) == reference[slot][0][0])
+        step_diff = []
+        for step in range(args.steps - 1):
+            tokens = [reference[r][0][step] for r in rows]
+            out = fast.decode(tokens, rows, [len(prompts[r]) + step for r in rows]).float().cpu()
+            diffs = []
+            for r in rows:
+                ref = reference[r][1][step + 1]
+                total += 1
+                agree += int(int(out[r].argmax()) == reference[r][0][step + 1])
+                nan |= bool(torch.isnan(out[r]).any())
+                diffs.append(float((out[r] - ref).abs().max()))
+            max_diff = max(max_diff, *diffs)
+            step_diff.append(max(diffs))
+        pct = 100.0 * agree / total
+        if label == "triton":
+            nonlocal_nan[0] = nan
+        mean_diff = sum(step_diff) / len(step_diff)
+        print(
+            f"RESULT parity[{label}] top1_pct={pct:.2f} ({agree}/{total}) nan={nan} "
+            f"decode_max_diff={max_diff:.3f} decode_mean_step_max_diff={mean_diff:.3f} "
+            f"prefill_max_diff={prefill_diff:.3f} first4={[round(d, 3) for d in step_diff[:4]]} "
+            f"last4={[round(d, 3) for d in step_diff[-4:]]}"
+        )
+        return pct
+
+    # Each Triton kernel against its PyTorch reference, inside the whole forward.
+    triton_all = dict(fast.triton_kernels)
+    variants = [("triton", triton_all)]
+    if fast.use_triton:
+        variants += [
+            ("all_reference", {k: False for k in triton_all}),
+            ("reference_attn", {**triton_all, "attn": False}),
+            ("reference_gdn", {**triton_all, "gdn": False}),
+            ("reference_moe", {**triton_all, "moe": False}),
+        ]
+    agree_pct = 0.0
+    for label, config in variants:
+        fast.triton_kernels = dict(config)
+        try:
+            pct = teacher_forced(label)
+        except Exception as exc:  # noqa: BLE001 - report and go on
+            print(f"RESULT parity[{label}] error={type(exc).__name__}: {exc}")
+            pct = 0.0
+        if label == "triton":
+            agree_pct = pct
+    fast.triton_kernels = dict(triton_all)
+    print(f"RESULT parity_top1_pct={agree_pct:.2f} (the served path: all Triton kernels)")
+
+    # The decode attention kernel alone on the real caches the parity run filled (1k-4k tokens).
+    # Random inputs are made on the CPU: no device RNG state is touched.
+    try:
         attn = next(i for i, t in enumerate(fast.layer_types) if t == "full_attention")
         k_pool, v_pool = fast.kv[attn]
         meta = fast.devices[k_pool.device]
         m = fast.layers[attn].self_attn
-        q = torch.randn(len(rows), m.config.num_attention_heads, m.head_dim, device=k_pool.device)
-        q = q.to(torch.bfloat16)
+        gen = torch.Generator().manual_seed(0)
+        q = torch.randn(len(rows), m.config.num_attention_heads, m.head_dim, generator=gen)
+        q = (q * 3).to(torch.bfloat16).to(k_pool.device)
         slots_t = torch.tensor(rows, device=k_pool.device)
-        lens_t = torch.tensor(
-            [len(prompts[r]) + args.steps - 1 for r in rows], dtype=torch.int32, device=k_pool.device
-        )
-        with torch.inference_mode():
-            a = kernels.paged_decode_attention(
-                q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=True
+        for extra in (0, args.steps - 1):
+            lens_t = torch.tensor(
+                [len(prompts[r]) + extra for r in rows], dtype=torch.int32, device=k_pool.device
             )
-            b = kernels.paged_decode_attention(
-                q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=False
-            )
-        err = float((a.float() - b.float()).abs().max() / b.float().abs().max())
-        print(f"RESULT attn_kernel_vs_sdpa rel_err={err:.4f} lengths={lens_t.tolist()}")
+            with torch.inference_mode():
+                a = kernels.paged_decode_attention(
+                    q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=True
+                )
+                b = kernels.paged_decode_attention(
+                    q, k_pool, v_pool, meta.page_table, slots_t, lens_t, m.scaling, use_triton=False
+                )
+            err = float((a.float() - b.float()).abs().max() / b.float().abs().max())
+            print(f"RESULT attn_kernel_vs_sdpa rel_err={err:.4f} lengths={lens_t.tolist()}")
     except Exception as exc:  # noqa: BLE001 - informational only
         print(f"RESULT attn_kernel_vs_sdpa error={type(exc).__name__}: {exc}")
-    print(f"RESULT parity_top1_pct={agree_pct:.2f} ({agree}/{total} tokens) nan={nan} "
-          f"max_abs_logit_diff_decode={max_diff:.3f} max_abs_logit_diff_prefill={prefill_diff:.3f}")
 
     # Free-running greedy on the fast path, batch of four: tokens equal to the reference's.
     free_tokens = [[] for _ in prompts]
@@ -265,6 +296,31 @@ def main(argv: list[str] | None = None) -> int:
             n += 1
         same_prefix.append(n)
     print(f"RESULT free_running_identical_prefix={same_prefix} of {args.steps}")
+
+    # ---------------------------------------------------------------- graph capture
+    fast.use_graphs = graphs_wanted
+    t0 = time.perf_counter()
+    fast.capture_all()
+    _sync()
+    print(
+        f"RESULT capture_s={time.perf_counter() - t0:.1f} capture_mode={fast.capture_mode} "
+        f"graph_error={fast.graph_error}"
+    )
+    if fast.use_graphs and fast.graph_error is None:
+        # Graph replay against the eager path on the same inputs.
+        for slot, prompt in enumerate(prompts):
+            fast.reset(slot)
+            _fast_prefill(fast, slot, prompt, args.chunk)
+        positions = [len(p) for p in prompts]
+        tokens = [reference[r][0][0] for r in rows]
+        replayed = fast.decode(tokens, rows, positions).float().cpu().clone()
+        for slot, prompt in enumerate(prompts):
+            fast.reset(slot)
+            _fast_prefill(fast, slot, prompt, args.chunk)
+        fast.use_graphs = False
+        eager = fast.decode(tokens, rows, positions).float().cpu()
+        fast.use_graphs = True
+        print(f"RESULT graph_vs_eager max_abs_diff={float((replayed - eager).abs().max()):.4f}")
 
     # ---------------------------------------------------------------- step time
     timing_prompts = _prompts(generator, [args.timing_length] * 8)
@@ -327,13 +383,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if torch.cuda.is_available():
             from engine import experts as base_experts
-            from engine.fast import kernels
 
             layer = next(i for i, t in enumerate(fast.layer_types) if t == "full_attention")
             mlp = fast.layers[layer].mlp
             dev = mlp.experts.gate_up_proj.device
-            x = torch.randn(8, text_cfg.hidden_size, device=dev, dtype=torch.bfloat16)
-            probs = torch.softmax(torch.randn(8, text_cfg.num_experts, device=dev), -1)
+            gen = torch.Generator().manual_seed(1)  # CPU RNG: no device RNG state is touched
+            x = torch.randn(8, text_cfg.hidden_size, generator=gen).to(dev, torch.bfloat16)
+            probs = torch.softmax(torch.randn(8, text_cfg.num_experts, generator=gen), -1).to(dev)
             w, idx = torch.topk(probs, text_cfg.num_experts_per_tok, dim=-1)
             w = (w / w.sum(-1, keepdim=True)).to(torch.bfloat16)
             with torch.inference_mode():
@@ -365,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     need = 5.0 if graph_ok else 3.0
     checks = {
         "parity_top1>=97%": agree_pct >= 97.0,
-        "no_nan": not nan,
+        "no_nan": not nonlocal_nan[0],
         f"b8_speedup>={need:.0f}x": speedup >= need,
         "b8_step<40ms": b8 < 40.0,
     }

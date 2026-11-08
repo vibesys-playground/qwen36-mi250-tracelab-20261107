@@ -38,7 +38,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import kernels
+from engine.fast import kernels, moe_prefill
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -312,6 +312,9 @@ class FastModel:
             "attn": self.use_triton,
             # Fused launches: residual add + RMSNorm, and the whole DeltaNet step.
             "fused": self.use_triton and os.environ.get("ENGINE_FUSED", "1") == "1",
+            # Prefill routed experts as a sync-free grouped GEMM (``moe_prefill``) instead of
+            # the registered experts module (``engine.experts``); ENGINE_MOE_GROUPED=0 for that.
+            "moe_prefill": self.use_triton and moe_prefill.enabled(),
         }
         self.buckets = sorted(buckets)
         self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
@@ -542,6 +545,8 @@ class FastModel:
         compile and tune before the server answers. Decode is warmed by
         ``capture_all``.
         """
+        if self.triton_kernels["moe_prefill"]:
+            self._warm_moe_prefill(chunk)
         seen = set()
         for i, (conv, _) in self.gdn_state.items():
             weight = self.layers[i].linear_attn.conv1d.weight
@@ -579,6 +584,32 @@ class FastModel:
         for dev in self.devices:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
+
+    def _warm_moe_prefill(self, chunk: int) -> None:
+        """Compile the grouped prefill experts for every tile shape up to ``chunk`` tokens
+        (and twice that, a packed pass), on every device that holds experts."""
+        seen = set()
+        for layer in self.layers:
+            experts = layer.mlp.experts
+            gate_up, down = experts.gate_up_proj, experts.down_proj
+            key = (gate_up.device, tuple(gate_up.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            num, _, hidden = gate_up.shape
+            shapes = {}
+            tokens = DECODE_EXPERT_TOKENS + 1
+            while tokens <= 2 * max(chunk, DECODE_EXPERT_TOKENS + 1):
+                shapes.setdefault(moe_prefill.config(tokens * self.top_k, num), tokens)
+                tokens *= 2
+            for tokens in shapes.values():
+                x = torch.zeros((tokens, hidden), dtype=gate_up.dtype, device=gate_up.device)
+                ids = torch.arange(tokens * self.top_k, device=gate_up.device) % num
+                weights = torch.full((tokens, self.top_k), 1.0 / self.top_k, device=gate_up.device)
+                if moe_prefill.supported(x, gate_up, down):
+                    moe_prefill.moe_prefill(
+                        x, ids.view(tokens, self.top_k), weights.to(x.dtype), gate_up, down
+                    )
 
     @staticmethod
     def snapshot_bytes(snap: Snapshot) -> int:
@@ -744,6 +775,10 @@ class FastModel:
                 experts.down_proj,
                 use_triton=self.triton_kernels["moe"],
             )
+        elif self.triton_kernels["moe_prefill"] and moe_prefill.supported(
+            x, experts.gate_up_proj, experts.down_proj
+        ):  # prefill: the sync-free grouped GEMM over the real (token, expert) rows
+            routed = moe_prefill.moe_prefill(x, top_i, top_w, experts.gate_up_proj, experts.down_proj)
         else:  # prefill: the experts implementation the engine registered with Transformers
             routed = experts(x, top_i, top_w)
         return routed + torch.sigmoid(F.linear(x, mlp.shared_expert_gate.weight)) * shared_out

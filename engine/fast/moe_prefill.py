@@ -33,7 +33,7 @@ rounded to BF16 once.
 ``moe_prefill_reference`` is the same math in PyTorch (the per-expert loop),
 for CPU tests. Specialized to what Qwen3.6-35B-A3B needs (BF16 weights laid out
 ``[experts, 2 * inter, hidden]`` and ``[experts, hidden, inter]``, dimensions
-multiples of the K blocks); ``supported`` says when it applies.
+powers of two or multiples of 128); ``supported`` says when it applies.
 """
 
 from __future__ import annotations
@@ -223,6 +223,11 @@ def config(pairs: int, experts: int) -> tuple[int, int, int, int, int, int, int]
     raise AssertionError
 
 
+def _aligned(dim: int) -> bool:
+    """Every block size (a power of two up to 128, clamped to ``dim``) divides ``dim``."""
+    return dim >= 16 and (dim % 128 == 0 or dim & (dim - 1) == 0)
+
+
 def supported(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor) -> bool:
     """Shapes and layouts the kernels handle: BF16, row-major experts, block-aligned dims."""
     if triton is None or x.dtype != torch.bfloat16:
@@ -235,8 +240,8 @@ def supported(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor) -> boo
         and down.shape == (experts, hidden, inter)
         and gate_up.stride(-1) == 1
         and down.stride(-1) == 1
-        and hidden % 64 == 0
-        and inter % 64 == 0
+        and _aligned(hidden)
+        and _aligned(inter)
     )
 
 
@@ -253,6 +258,8 @@ def moe_prefill(
     inter = two_i // 2
     pairs = tokens * top_k
     bm, bn1, bk1, bn2, bk2, warps, stages = config(pairs, experts)
+    bn1, bk2 = min(bn1, inter), min(bk2, inter)
+    bk1, bn2 = min(bk1, hidden), min(bn2, hidden)
     dev = x.device
     x = x.contiguous()
     ids = top_k_index.reshape(-1)

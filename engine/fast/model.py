@@ -810,22 +810,44 @@ class FastModel:
         verify: bool = False,
     ) -> torch.Tensor:
         """``FusedDecode.layer``; under tensor parallelism the same kernels on this rank's shard,
-        with the mixer's and the MoE's partial sums all-reduced (the MoE kernel gets a zero
-        residual, the all-reduce adds the real one)."""
+        with the mixer's and the MoE's partial sums all-reduced (the MoE kernel adds no
+        residual: a +0.0 constant, or a zero tensor with ENGINE_GLUE_NOZERO=0; the all-reduce
+        adds the real one)."""
         if self.tp is None:
             return self.fused.layer(i, x, slots, positions, meta, states, verify)
+        from engine.fast import fused as fused_mod
+        from engine.fast import tp as tp_mod
+
         fused = self.fused
         layer = fused._layer(i)
         states = slots if states is None else states
+        arrms = tp_mod.GLUE_ARRMS
+        # Plan 29: the previous layer's MoE all-reduce already normed x for this layer.
+        pending = self.__dict__.pop("_glue_next", None)
         with kernels.on_device(x):
-            _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
+            if arrms and pending is not None and pending[0] == i and pending[1] is x:
+                h = pending[2]
+            else:
+                _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
             if fused._is_gdn(i):
                 h = fused._gdn_verify(i, h, states) if verify else fused._gdn(i, h, states)
             else:
                 h = fused._attn(i, h, slots, positions, meta)
-            h = self._reduce(h)
-            x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
-            return self._reduce(fused._moe(i, torch.zeros_like(x), h), x)
+            if arrms:
+                x, h = self.tp.allreduce_rms(self.rank, h, x, layer.post_attention_layernorm.weight,
+                                             self.eps)
+            else:
+                h = self._reduce(h)
+                x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
+            moe = fused._moe(i, None if fused_mod.GLUE_NOZERO else torch.zeros_like(x), h)
+            if arrms and i + 1 < len(self.layers):
+                # The next layer's input RMSNorm in the same kernel as this all-reduce.
+                x, h = self.tp.allreduce_rms(
+                    self.rank, moe, x, fused._layer(i + 1).input_layernorm.weight, self.eps
+                )
+                self._glue_next = (i + 1, x, h)
+                return x
+            return self._reduce(moe, x)
 
     def _reduce(self, h: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         """``residual + h`` (or ``h``) with ``h`` summed over the tensor-parallel ranks."""

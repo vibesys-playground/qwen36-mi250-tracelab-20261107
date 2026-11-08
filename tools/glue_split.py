@@ -239,7 +239,7 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--configs", default="verify:2,verify:1,decode:2,decode:4")
     parser.add_argument("--parity", action="store_true",
-                        help="plan 29: logits/picks with the ENGINE_GLUE_* fusions on vs off")
+                        help="plan 29: hashes of captured logits and picks under the ENGINE_GLUE_* flags")
     parser.add_argument("--parity-steps", type=int, default=24)
     args = parser.parse_args()
     os.environ["HIP_VISIBLE_DEVICES"] = args.devices
@@ -474,67 +474,37 @@ def main() -> None:
 
 def glue_parity(fast, ranks, prefill, ids, plen, steps, torch, sync) -> None:
     """Captured decode (B=2, 4: ``steps`` greedy steps) and verify (B=1, 2, 4: one step from a
-    fresh prefill) with the plan 29 fusions on and off: logits and picks must be bitwise."""
+    fresh prefill) under this process's ENGINE_GLUE_* flags: a SHA-256 of the fp32 logits and
+    the picks of each, to compare bitwise with a run under other flags (another process)."""
+    import hashlib
+
     from engine.fast import fused as FZ
     from engine.fast import tp as TP
 
-    def flags(on: bool) -> None:
-        FZ.GLUE_TOPK = FZ.GLUE_NOZERO = on
-        TP.GLUE_ARRMS = on and fast.tp.ll is not None and fast.tp.ll.rms_ready
-        for m in ranks:  # recapture every graph under the new flags
-            for seg in m.segments + m.vsegments:
-                seg.graphs.clear()
-                seg.inputs.clear()
-                seg.outputs.clear()
-            m.__dict__.pop("_glue_next", None)
-        sync()
+    def digest(t) -> str:
+        return hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
-    def run() -> dict:
-        res = {}
-        for b in (2, 4):
-            slots = list(range(b))
-            cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
-            logs = []
-            for step in range(steps):
-                o = fast.decode(cur, slots, [plen + step] * b).float().cpu()
-                logs.append(o)
-                cur = o.argmax(-1).tolist()
-            res[f"decode B={b}"] = torch.stack(logs)
-        for b in (1, 2, 4):
-            slots = list(range(b))
-            cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
-            drafts = [(c + 17) % 1000 for c in cur]
-            logits, g1, g2, d1, d2 = fast.verify(cur, drafts, slots, [plen] * b)
-            res[f"verify B={b}"] = (logits.float().cpu(), (g1, g2, d1, d2))
-        for s in range(4):
-            fast.reset(s)
-        return res
-
-    saved = (FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS)
-    try:
-        flags(True)
-        on = run()
-        on_flags = (FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS)
-        flags(False)
-        off = run()
-    finally:
-        FZ.GLUE_TOPK, FZ.GLUE_NOZERO, TP.GLUE_ARRMS = saved
-        flags(saved[0])
-        TP.GLUE_ARRMS = saved[2]
-    allsame = True
-    for k in on:
-        if k.startswith("decode"):
-            same = torch.equal(on[k], off[k])
-            diff = (on[k] - off[k]).abs().max().item()
-            out(f"RESULT parity_glue {k} steps={on[k].shape[0]} logits_bitwise={same} max_abs_diff={diff:.3g}")
-        else:
-            same = torch.equal(on[k][0], off[k][0]) and on[k][1] == off[k][1]
-            out(f"RESULT parity_glue {k} logits_and_picks_bitwise={same} picks_on={on[k][1]} "
-                f"picks_off={off[k][1]}")
-        allsame &= same
-    out(f"RESULT parity_glue flags_on(topk,nozero,arrms)={on_flags} graphs={fast.graph_error is None} "
-        f"all_bitwise={allsame}")
-
+    flags = f"topk={int(FZ.GLUE_TOPK)} nozero={int(FZ.GLUE_NOZERO)} arrms={int(TP.GLUE_ARRMS)}"
+    for b in (2, 4):
+        slots = list(range(b))
+        cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
+        logs, toks = [], []
+        for step in range(steps):
+            o = fast.decode(cur, slots, [plen + step] * b).float().cpu()
+            logs.append(o)
+            cur = o.argmax(-1).tolist()
+            toks.append(cur)
+        out(f"RESULT parity_hash decode B={b} steps={steps} {flags} graphs={fast.graph_error is None} "
+            f"logits={digest(torch.stack(logs))} tokens={digest(torch.tensor(toks))}")
+    for b in (1, 2, 4):
+        slots = list(range(b))
+        cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
+        drafts = [(c + 17) % 1000 for c in cur]
+        logits, g1, g2, d1, d2 = fast.verify(cur, drafts, slots, [plen] * b)
+        out(f"RESULT parity_hash verify B={b} {flags} graphs={fast.graph_error is None} "
+            f"logits={digest(logits.float().cpu())} picks={(g1, g2, d1, d2)}")
+    for s in range(4):
+        fast.reset(s)
 
 if __name__ == "__main__":
     main()

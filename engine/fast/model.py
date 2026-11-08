@@ -804,8 +804,9 @@ class FastModel:
         verify: bool = False,
     ) -> torch.Tensor:
         """``FusedDecode.layer``; under tensor parallelism the same kernels on this rank's shard,
-        with the mixer's and the MoE's partial sums all-reduced (the MoE kernel gets a zero
-        residual, the all-reduce adds the real one)."""
+        with the mixer's and the MoE's partial sums all-reduced (the MoE kernel adds no
+        residual: a +0.0 constant, or a zero tensor with ENGINE_GLUE_NOZERO=0; the all-reduce
+        adds the real one)."""
         if self.tp is None:
             return self.fused.layer(i, x, slots, positions, meta, states, verify)
         from engine.fast import fused as fused_mod

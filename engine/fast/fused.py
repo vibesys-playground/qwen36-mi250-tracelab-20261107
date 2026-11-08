@@ -71,15 +71,19 @@ TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
 MOE_ORDER = int(os.environ.get("ENGINE_FUSED_MOE_ORDER", "1"))
 MOE_GRID = int(os.environ.get("ENGINE_FUSED_MOE_GRID", "8"))
 MOE_TILE_ROWS = int(os.environ.get("ENGINE_FUSED_MOE_TILE_ROWS", "4"))
-# Plan 29 glue fusions of the MoE (each bitwise the unfused path; tests/test_fused_glue.py):
-# - ENGINE_GLUE_TOPK=1: no ``_topk_kernel`` launch; every routed gate_up work item recomputes
-#   its row's softmax top-k (``_topk``) from the router logits in its prologue, and the items
-#   of tile 0 and pick 0 write the row's (experts, weights) for the down kernel;
-# - ENGINE_GLUE_NOZERO=1: ``_moe(i, None, h)`` returns the MoE output without a residual (the
-#   down kernel adds a +0.0 constant instead of loading a zero-filled tensor), so tensor
-#   parallelism needs no ``zeros_like`` launch per layer.
+# Plan 29 glue fusions of the MoE (each bitwise the unfused path; tests/test_fused_glue.py,
+# j141 on gfx90a):
+# - ENGINE_GLUE_NOZERO=1 (default): ``_moe(i, None, h)`` returns the MoE output without a
+#   residual (the down kernel adds a +0.0 constant instead of loading a zero-filled tensor), so
+#   tensor parallelism needs no ``zeros_like`` launch per layer (41 fills, ~190 us per GCD per
+#   verify B=2 step);
+# - ENGINE_GLUE_TOPK=1 (default off): no ``_topk_kernel`` launch; every routed gate_up work
+#   item recomputes its row's softmax top-k (``_topk``) from the router logits in its
+#   prologue, and the items of tile 0 and pick 0 write the row's (experts, weights) for the
+#   down kernel. Bitwise, but slower: the prologue added ~740 us to the MoE kernels per
+#   verify B=2 step for the ~415 us of top-k launches it removed (j141).
 GLUE_TOPK = os.environ.get("ENGINE_GLUE_TOPK", "0") == "1"
-GLUE_NOZERO = os.environ.get("ENGINE_GLUE_NOZERO", "0") == "1"
+GLUE_NOZERO = os.environ.get("ENGINE_GLUE_NOZERO", "1") == "1"
 
 
 def enabled() -> bool:

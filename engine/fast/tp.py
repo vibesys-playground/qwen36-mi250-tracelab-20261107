@@ -68,9 +68,11 @@ MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeou
 SWITCH_S = float(os.environ.get("ENGINE_TP_SWITCH_S", "0.0002"))
 # Seconds an eager all-reduce waits for the peer thread before failing the pass.
 WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
-# Plan 29 item 1 (ENGINE_GLUE_ARRMS=1): in a captured graph, the all-reduce of a partial sum,
-# the residual add and the following RMSNorm in one kernel (``_ll_ar_rms_kernel``), bitwise
-# ``add_rms(res, allreduce(x), w)`` and ``add_rms(allreduce(x, res), None, w)``.
+# Plan 29 item 1 (ENGINE_GLUE_ARRMS=1, default off): in a captured graph, the all-reduce of a
+# partial sum, the residual add and the following RMSNorm in one kernel (``_ll_ar_rms_kernel``,
+# one program per row), meant to be bitwise ``add_rms(res, allreduce(x), w)``. Off: in j141 the
+# 80 fused calls took ~1,020 us per GCD per verify B=2 step against ~820 us for the all-reduce
+# and add_rms launches they replace, and tests/test_fused_glue.py did not pass for it.
 GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)

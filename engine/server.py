@@ -34,7 +34,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import experts, protocol, router
+from engine import cpu_place, experts, protocol, router
 from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
 from engine.protocol import (
     ChatRequest,
@@ -142,6 +142,7 @@ class Worker:
         events.close()  # type: ignore[attr-defined]
 
     def _loop(self) -> None:
+        cpu_place.pin_rank(0)  # this thread drives rank 0 (and the whole replica on one GPU)
         g = self._generator
         packer = PackedPrefill(g) if g.packing else None
         prefilling: dict[int, tuple[Job, Iterator[Any]]] = {}

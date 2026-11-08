@@ -52,6 +52,10 @@ python -m engine.server --host 127.0.0.1 --port <port>
 ```
 
 Its readiness URL is `/health`; the port opens once the weights are loaded.
+With several replicas, the router gives each replica process a disjoint slice of
+host cores (on its GPUs' NUMA node, away from CPU 0's L3 group) and each rank
+thread a dedicated core, read from the running system's topology
+([`engine/cpu_place.py`](engine/cpu_place.py)); `ENGINE_CPU_PIN=0` turns this off.
 On Modal, [`main.py`](main.py) deploys the same command on two H100s with a
 persistent Hugging Face cache volume.
 [`.vibesys/shared/cpu_check/`](.vibesys/shared/cpu_check/) checks the HTTP contract

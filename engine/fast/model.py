@@ -31,6 +31,7 @@ import os
 import threading
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -1156,8 +1157,144 @@ class FastModel:
         peer = None
         if self.tp is not None and not self.tp.solo:
             h = h.contiguous()
+            if h.is_cuda and torch.cuda.is_current_stream_capturing():
+                # A captured prefill pass (plan 33): the in-graph all-reduce gives the same
+                # bits as the exchange below (``bf16(mine + theirs)``), then the residual add.
+                return prefill_kernels.reduce_rms(residual, self.tp.allreduce(self.rank, h), None,
+                                                  weight, self.eps)
             peer = self.tp._exchange(self.rank, h)
         return prefill_kernels.reduce_rms(residual, h, peer, weight, self.eps)
+
+    # ---------------------------------------------------------------- captured prefill
+
+    # A prefill pass captured once per padded size (``tp.TPModel.capture_prefill``, plan 33):
+    # the inputs live in one int64 device buffer per size, ``_pg_inputs``, filled with one copy
+    # per pass: ids [size], the MTP head's next tokens [size], then PG_META scalars.
+    PG_META = 6  # count, start, slot, Gated DeltaNet state row, pick (follow is None), count - 1
+
+    def _pg_inputs(self, size: int) -> torch.Tensor:
+        return torch.zeros(2 * size + self.PG_META, dtype=torch.long, device=self.embed.device)
+
+    @staticmethod
+    def pg_host(size: int, ids: Sequence[int], start: int, follow: int | None, slot: int,
+                state_row: int) -> torch.Tensor:
+        """The host side of ``_pg_inputs`` for one single-segment pass of ``len(ids)`` <=
+        ``size`` tokens (rows past it are padding: token 0)."""
+        count = len(ids)
+        host = torch.zeros(2 * size + FastModel.PG_META, dtype=torch.long)
+        host[:count] = torch.tensor(list(ids), dtype=torch.long)
+        nxt = list(ids[1:]) + [0 if follow is None else follow]
+        host[size : size + count] = torch.tensor(nxt, dtype=torch.long)
+        host[2 * size :] = torch.tensor(
+            [count, start, slot, state_row, 1 if follow is None else 0, count - 1], dtype=torch.long
+        )
+        return host
+
+    def _pg_body(self, buf: torch.Tensor, size: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``_prefill_fused`` of one segment from the device inputs ``buf`` (``_pg_inputs``),
+        over ``size`` rows of which the first ``count`` are real: no host value of the pass is
+        read, so it can be captured once and replayed for any slot, start and count <= size.
+
+        Padding rows change no state and no real row: their keys and values go to the dummy
+        slot's page; in Gated DeltaNet layers their k, v, g (log decay) and beta are zero, so
+        the recurrent update over them is the identity, and the conv state is taken after the
+        real rows (``gdn_conv_``'s device count); attention reads keys up to the real end
+        (``prefill_attention``'s device count). Rows are otherwise independent. Real rows may
+        differ from an eager pass of ``count`` rows only as GEMMs and the expert kernels at
+        M = size differ from M = count (accumulation order), the same for every pass of a size.
+        Returns this rank's fp32 logits of the last real row and, with the MTP head, its draft.
+        """
+        dev = self.embed.device
+        m0 = 2 * size
+        ids, nxt = buf[:size], buf[size:m0]
+        meta = buf[m0 : m0 + 2]  # [count, start]: the kernels' device-side count
+        count, start, pick = buf[m0], buf[m0 + 1], buf[m0 + 4]
+        slot, grow, last = buf[m0 + 2 : m0 + 3], buf[m0 + 3 : m0 + 4], buf[m0 + 5 : m0 + 6]
+        rows = torch.arange(size, device=dev)
+        keep = rows < count
+        positions = start + torch.minimum(rows, count - 1)
+        table = self.devices[dev].page_table.index_select(0, slot)[0].long()
+        scratch = self.slot_pages[self.dummy][0]
+        st = SimpleNamespace(
+            meta=meta, keep=keep, grow=grow, table=table, positions=positions,
+            page=torch.where(keep, table[positions // PAGE], scratch),
+            offset=torch.where(keep, positions % PAGE, rows % PAGE),
+        )
+        x = F.embedding(ids, self.embed)
+        h = prefill_kernels.reduce_rms(x, None, None, self.layers[0].input_layernorm.weight, self.eps)[1]
+        for i, layer in enumerate(self.layers):
+            if self.layer_types[i] == "linear_attention":
+                h = self._pg_gdn(i, h, st)
+            else:
+                h = self._pg_attn(i, h, st)
+            x, h = self._reduce_rms(h, x, layer.post_attention_layernorm.weight)
+            nxt_w = self.layers[i + 1].input_layernorm.weight if i + 1 < len(self.layers) else self.final_norm
+            x, h = self._reduce_rms(self._moe(layer.mlp, h), x, nxt_w)
+        hidden = h
+        logits = F.linear(hidden.index_select(0, last), self.lm_head).float()
+        drafts = None
+        if self.mtp is not None:
+            # The head's next token at the last real row: ``follow``, or the greedy pick.
+            tokens = torch.where((rows == last) & (pick != 0), self._argmax(logits), nxt)
+            z = self._mtp_layer(
+                self._mtp_in(hidden, tokens), lambda h: self._pg_attn(self.mtp_index, h, st), decode=False
+            )
+            drafts = self._argmax(self._mtp_logits(z.index_select(0, last)))
+        return logits[0], drafts
+
+    def _pg_gdn(self, i: int, x: torch.Tensor, st: SimpleNamespace) -> torch.Tensor:
+        """``_gdn_prefill_fused`` on the device state row ``st.grow`` with padding rows."""
+        m = self.layers[i].linear_attn
+        conv_state, rec_state = self.gdn_state[i]
+        tokens = x.shape[0]
+        qkv, z, b, a = self._gdn_project(m, x)
+        conv = conv_state.index_select(0, st.grow)[0]
+        mixed = prefill_kernels.gdn_conv_(qkv, conv, m.conv1d.weight, meta=st.meta)
+        conv_state.index_copy_(0, st.grow, conv[None])
+        q, k, v = torch.split(mixed, [m.key_dim, m.key_dim, m.value_dim], dim=-1)
+        q = q.reshape(tokens, -1, m.head_k_dim)
+        k = k.reshape(tokens, -1, m.head_k_dim)
+        v = v.reshape(tokens, -1, m.head_v_dim)
+        ratio = m.num_v_heads // m.num_k_heads
+        q = q.repeat_interleave(ratio, dim=1) if ratio > 1 else q.contiguous()
+        k = k.repeat_interleave(ratio, dim=1) if ratio > 1 else k
+        g, beta = prefill_kernels.gdn_gates(a, b, m.A_log, m.dt_bias)
+        keep = st.keep
+        k = torch.where(keep[:, None, None], k, 0.0)
+        v = torch.where(keep[:, None, None], v, 0.0)
+        g = torch.where(keep[:, None], g, 0.0)
+        beta = torch.where(keep[:, None], beta, 0.0)
+        core, final = hf.torch_chunk_gated_delta_rule(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), g=g.unsqueeze(0), beta=beta.unsqueeze(0),
+            initial_state=rec_state.index_select(0, st.grow), output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        rec_state.index_copy_(0, st.grow, final.to(rec_state.dtype))
+        out = prefill_kernels.gated_rms(core[0], z, m.norm.weight, m.norm.variance_epsilon)
+        return F.linear(out, m.out_proj.weight)
+
+    def _pg_attn(self, i: int, x: torch.Tensor, st: SimpleNamespace) -> torch.Tensor:
+        """``_attn_prefill`` (fused) at device positions: padding rows' KV to the dummy page."""
+        m, q, k, v, gate = self._qkv(i, x, st.positions)
+        k_pool, v_pool = self.kv[i]
+        k_pool[st.page, :, st.offset] = k
+        v_pool[st.page, :, st.offset] = v
+        out = prefill_kernels.prefill_attention(q, k_pool, v_pool, st.table, 0, gate, m.scaling, meta=st.meta)
+        return F.linear(out, m.o_proj.weight)
+
+    def pg_supported(self) -> bool:
+        """Whether ``_pg_body`` can run here: one device, the fused prefill kernels."""
+        if not (self.use_graphs and self.triton_kernels["prefill_fused"] and self.embed.is_cuda):
+            return False
+        devs = {self.embed.device, self.lm_head.device, self.final_norm.device}
+        devs |= {layer.input_layernorm.weight.device for layer in self.layers}
+        if len(devs) != 1:
+            return False
+        for i, t in enumerate(self.layer_types):
+            if t == "linear_attention":
+                if not prefill_kernels.gdn_supported(self.layers[i].linear_attn, self.gdn_state[i][0]):
+                    return False
+        return True
 
     def _gdn_prefill(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:
         m = self.layers[i].linear_attn

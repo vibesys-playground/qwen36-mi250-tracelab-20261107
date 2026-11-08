@@ -182,6 +182,19 @@ class Log:
             gdn.fla_chunk = hf.torch_chunk_gated_delta_rule
         self.wrap(moe_prefill, "moe_prefill", "routed")
         self.wrap(tp.Group, "_exchange", "exchange")
+        # The fused prefill path (plan 26, ENGINE_PREFILL_FUSED), where the head has it.
+        for attr, label in (("_prefill_fused", "fused"), ("_reduce_rms", "reduce"), ("_gdn_prefill_fused", "gdn")):
+            if hasattr(FM, attr):
+                self.wrap(FM, attr, label)
+        try:
+            from engine.fast import prefill_kernels as pk
+        except ImportError:
+            pk = None
+        if pk is not None:
+            for attr, label in (("prefill_attention", "sdpa"), ("route", "route"), ("gdn_conv_", "conv"),
+                                ("gdn_gates", "heads"), ("gated_rms", "gate_norm")):
+                if hasattr(pk, attr):
+                    self.wrap(pk, attr, label)
 
     def uninstall(self) -> None:
         for owner, attr, orig in reversed(self.restore):
@@ -240,7 +253,13 @@ def bucket(path: str, cls: str) -> str:
         if cls in ("reduce",) or cls == "elementwise":
             return pre + "MoE tail (pair sum, cast)"
         return pre + "MoE routing index prep (argsort/scatter/cumsum)"
+    if leaf == "route":
+        return pre + "router softmax/topk"
+    if leaf == "fused":
+        return "lm_head GEMM" if cls == "gemm" else "prefill other (embed, to, arange)"
     if leaf == "moe":
+        if cls == "moe_kernel":
+            return pre + "MoE expert kernels"
         if cls == "gemm":
             return pre + "MoE shared+router+shared-gate GEMMs"
         if cls in ("softmax", "topk"):

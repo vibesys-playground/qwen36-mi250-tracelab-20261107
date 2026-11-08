@@ -1099,6 +1099,8 @@ class FastModel:
             slots = torch.tensor([slot], device=x.device)
             return self._gdn_decode(i, x, slots)
         conv_state, rec_state = self.gdn_state[i]
+        if self.triton_kernels["prefill_fused"] and prefill_kernels.gdn_supported(m, conv_state):
+            return self._gdn_prefill_fused(i, x, slot)
         qkv, z, b, a = self._gdn_project(m, x)
         window = torch.cat((conv_state[slot], qkv.transpose(0, 1)), dim=-1)  # [conv_dim, kernel+T]
         kernel = m.conv_kernel_size
@@ -1118,6 +1120,36 @@ class FastModel:
         )
         rec_state[slot].copy_(final[0])
         return self._gdn_out(m, core[0], z)
+
+    def _gdn_prefill_fused(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:
+        """``_gdn_prefill`` (more than one token, state row ``slot``) with the convolution and
+        its state update, the decay and beta, and the gated norm through ``prefill_kernels``."""
+        m = self.layers[i].linear_attn
+        conv_state, rec_state = self.gdn_state[i]
+        tokens = x.shape[0]
+        qkv, z, b, a = self._gdn_project(m, x)
+        mixed = prefill_kernels.gdn_conv_(qkv, conv_state[slot], m.conv1d.weight)
+        q, k, v = torch.split(mixed, [m.key_dim, m.key_dim, m.value_dim], dim=-1)
+        q = q.reshape(tokens, -1, m.head_k_dim)
+        k = k.reshape(tokens, -1, m.head_k_dim)
+        v = v.reshape(tokens, -1, m.head_v_dim).contiguous()
+        ratio = m.num_v_heads // m.num_k_heads
+        q = q.repeat_interleave(ratio, dim=1) if ratio > 1 else q.contiguous()
+        k = k.repeat_interleave(ratio, dim=1) if ratio > 1 else k.contiguous()
+        g, beta = prefill_kernels.gdn_gates(a, b, m.A_log, m.dt_bias)
+        core, final = hf.torch_chunk_gated_delta_rule(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=rec_state[slot : slot + 1],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        rec_state[slot].copy_(final[0])
+        out = prefill_kernels.gated_rms(core[0], z, m.norm.weight, m.norm.variance_epsilon)
+        return F.linear(out, m.out_proj.weight)
 
     def _attn_prefill(
         self, i: int, x: torch.Tensor, slot: int, positions: torch.Tensor, start: int

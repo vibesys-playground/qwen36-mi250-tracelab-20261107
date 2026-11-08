@@ -200,6 +200,79 @@ if triton is not None:
         tl.store(out_ptr + row * H + cols, y.to(tl.bfloat16), mask=ok)
 
 
+if triton is not None:
+
+    # ------------------------------------------------------------------------- Gated DeltaNet
+
+    @triton.jit(do_not_specialize=["T"])
+    def _gdn_conv_kernel(
+        qkv_ptr, state_ptr, w_ptr, out_ptr, T, C, K: tl.constexpr, BLOCK_T: tl.constexpr,
+        BLOCK_C: tl.constexpr, WIDEN: tl.constexpr,
+    ):
+        """silu(causal depthwise conv) of [T, C] inputs after the slot's last K inputs (its
+        conv state [C, K]): token t reads inputs t-K+1..t. The state is not changed here."""
+        t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+        c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+        ok = (t < T)[:, None] & (c < C)[None, :]
+        acc = tl.zeros([BLOCK_T, BLOCK_C], dtype=tl.float32)
+        for j in tl.static_range(K):
+            src = t + 1 + j - K  # the input row; < 0: the state's column src + K
+            from_x = (src >= 0)[:, None]
+            xv = tl.load(qkv_ptr + src.to(tl.int64)[:, None] * C + c[None, :], mask=ok & from_x, other=0.0)
+            sv = tl.load(state_ptr + c[None, :] * K + (src + K)[:, None], mask=ok & (~from_x), other=0.0)
+            w = tl.load(w_ptr + c * K + j, mask=c < C, other=0.0).to(tl.float32)
+            acc += tl.where(from_x, xv, sv).to(tl.float32) * w[None, :]
+        y = _bf16(acc, WIDEN)  # the BF16 convolution output
+        y = _bf16(y * tl.sigmoid(y), WIDEN)  # F.silu on BF16
+        tl.store(out_ptr + t.to(tl.int64)[:, None] * C + c[None, :], y.to(tl.bfloat16), mask=ok)
+
+    @triton.jit(do_not_specialize=["T"])
+    def _gdn_conv_state_kernel(qkv_ptr, state_ptr, T, C, K: tl.constexpr, BLOCK_C: tl.constexpr):
+        """The conv state after T inputs: the last K of (state ++ inputs)."""
+        c = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
+        i = tl.arange(0, K)
+        src = T - K + i  # input row of new column i; < 0: old column T + i
+        c_ok = (c < C)[:, None]
+        from_x = (src >= 0)[None, :]
+        xv = tl.load(qkv_ptr + src.to(tl.int64)[None, :] * C + c[:, None], mask=c_ok & from_x, other=0.0)
+        sv = tl.load(state_ptr + c[:, None] * K + (T + i)[None, :], mask=c_ok & (~from_x), other=0.0)
+        tl.store(state_ptr + c[:, None] * K + i[None, :], tl.where(from_x, xv, sv), mask=c_ok)
+
+    @triton.jit(do_not_specialize=["NUMEL"])
+    def _gdn_gates_kernel(
+        a_ptr, b_ptr, alog_ptr, dtb_ptr, g_ptr, beta_ptr, NUMEL, HV: tl.constexpr,
+        BLOCK: tl.constexpr, WIDEN: tl.constexpr,
+    ):
+        """g = -exp(A_log) * softplus(a + dt_bias) (fp32), beta = sigmoid(b) (BF16)."""
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = i < NUMEL
+        h = i % HV
+        a = tl.load(a_ptr + i, mask=ok, other=0.0).to(tl.float32) + tl.load(dtb_ptr + h, mask=ok, other=0.0).to(tl.float32)
+        softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        g = -tl.exp(tl.load(alog_ptr + h, mask=ok, other=0.0).to(tl.float32)) * softplus
+        tl.store(g_ptr + i, g, mask=ok)
+        b = tl.load(b_ptr + i, mask=ok, other=0.0).to(tl.float32)
+        tl.store(beta_ptr + i, _bf16(tl.sigmoid(b), WIDEN).to(tl.bfloat16), mask=ok)
+
+    @triton.jit(do_not_specialize=["ROWS"])
+    def _gated_rms_kernel(
+        x_ptr, z_ptr, w_ptr, out_ptr, ROWS, eps, D: tl.constexpr, BLOCK_R: tl.constexpr,
+        ROUND_Y: tl.constexpr, WIDEN: tl.constexpr,
+    ):
+        """``_gated_rms`` per D-wide row: normalize (fp32, rounded), * weight, * silu(z)."""
+        r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        d = tl.arange(0, D)
+        ok = (r < ROWS)[:, None]
+        offs = r.to(tl.int64)[:, None] * D + d[None, :]
+        x = tl.load(x_ptr + offs, mask=ok, other=0.0).to(tl.float32)
+        n = _bf16(x * tl.rsqrt(tl.sum(x * x, axis=1) / D + eps)[:, None], WIDEN)
+        y = tl.load(w_ptr + d).to(tl.float32)[None, :] * n
+        if ROUND_Y:
+            y = _bf16(y, WIDEN)
+        z = tl.load(z_ptr + offs, mask=ok, other=0.0).to(tl.float32)
+        tl.store(out_ptr + offs, _bf16(y * (z * tl.sigmoid(z)), WIDEN).to(tl.bfloat16), mask=ok)
+
+
 # ================================================================================ attention
 
 
@@ -402,3 +475,83 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int) -> torch.Tensor:
             out_r, sg, shared_out.contiguous(), y, H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
         )
     return y
+
+
+# ============================================================================ Gated DeltaNet
+
+
+def gdn_conv_reference(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor):
+    """``FastModel._gdn_prefill``'s convolution: (silu(conv) [T, C], new state [C, K])."""
+    from engine.fast.model import prefill_conv
+
+    count = qkv.shape[0]
+    window = torch.cat((state, qkv.transpose(0, 1)), dim=-1)
+    mixed = prefill_conv(window, weight, count)
+    return F.silu(mixed.to(qkv.dtype)).transpose(0, 1), window[:, -state.shape[-1]:].clone()
+
+
+def gdn_conv_(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """silu(causal conv) of ``qkv`` [T, C] after ``state`` [C, K] (a slot's conv state, updated
+    in place to its last K inputs); weight [C, 1, K]. [T, C] BF16, two launches."""
+    count, channels = qkv.shape
+    kernel = state.shape[-1]
+    assert state.stride(-1) == 1 and state.stride(-2) == kernel and kernel & (kernel - 1) == 0
+    qkv = qkv.contiguous()
+    out = torch.empty_like(qkv)
+    with on_device(qkv):
+        _gdn_conv_kernel[(triton.cdiv(count, 16), triton.cdiv(channels, 128))](
+            qkv, state, weight.contiguous(), out, count, channels, K=kernel, BLOCK_T=16,
+            BLOCK_C=128, WIDEN=_WIDEN,
+        )
+        _gdn_conv_state_kernel[(triton.cdiv(channels, 256),)](
+            qkv, state, count, channels, K=kernel, BLOCK_C=256,
+        )
+    return out
+
+
+def gdn_gates_reference(a, b, a_log, dt_bias):
+    beta = b.sigmoid()
+    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
+    return g, beta
+
+
+def gdn_gates(a: torch.Tensor, b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor):
+    """(g fp32 [T, HV], beta [T, HV] in ``b``'s dtype), as ``gdn_gates_reference``, one launch."""
+    a, b = a.contiguous(), b.contiguous()
+    g = torch.empty(a.shape, dtype=torch.float32, device=a.device)
+    beta = torch.empty_like(b)
+    numel = a.numel()
+    with on_device(a):
+        _gdn_gates_kernel[(triton.cdiv(numel, 1024),)](
+            a, b, a_log, dt_bias, g, beta, numel, HV=a.shape[-1], BLOCK=1024, WIDEN=_WIDEN,
+        )
+    return g, beta
+
+
+def gated_rms(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """``_gated_rms`` over rows of ``weight``'s width: x [T, heads, D] (or any [.., D] rows),
+    z [T, heads * D]; [T, heads * D] in ``z``'s dtype, one launch."""
+    dim = weight.shape[0]
+    tokens = z.shape[0]
+    x = x.reshape(-1, dim).contiguous()
+    z = z.reshape(-1, dim).contiguous()
+    rows = x.shape[0]
+    out = torch.empty_like(z)
+    with on_device(x):
+        _gated_rms_kernel[(triton.cdiv(rows, 16),)](
+            x, z, weight, out, rows, eps, D=dim, BLOCK_R=16,
+            ROUND_Y=weight.dtype == torch.bfloat16, WIDEN=_WIDEN,
+        )
+    return out.reshape(tokens, -1)
+
+
+def gdn_supported(m: torch.nn.Module, state: torch.Tensor) -> bool:
+    k = state.shape[-1]
+    d = m.head_v_dim
+    return (
+        triton is not None
+        and state.dtype == torch.bfloat16
+        and k & (k - 1) == 0
+        and d & (d - 1) == 0
+        and m.norm.weight.shape[0] == d
+    )

@@ -149,6 +149,44 @@ def test_moe_block_matches_eager(tokens):
     assert torch.equal(got, again)  # deterministic despite the atomic expert order
 
 
+@pytest.mark.parametrize("count", [2, 3, 37, 70])
+def test_gdn_conv_matches_eager(count):
+    dev = _device()
+    g = torch.Generator().manual_seed(count)
+    channels, kernel = 200, 4
+    qkv = torch.randn(count, channels, generator=g).bfloat16().to(dev)
+    state = torch.randn(3, channels, kernel, generator=g).bfloat16().to(dev)
+    weight = (torch.randn(channels, 1, kernel, generator=g) * 0.5).bfloat16().to(dev)
+    ref, ref_state = pk.gdn_conv_reference(qkv, state[1].clone(), weight)
+    before = state.clone()
+    got = pk.gdn_conv_(qkv, state[1], weight)
+    _close(got, ref)
+    assert torch.equal(state[1], ref_state)
+    assert torch.equal(state[0], before[0]) and torch.equal(state[2], before[2])
+
+
+def test_gdn_gates_and_gated_norm_match_eager():
+    dev = _device()
+    g = torch.Generator().manual_seed(9)
+    tokens, heads, dim = 37, 4, 16
+    a = (torch.randn(tokens, heads, generator=g) * 4).bfloat16().to(dev)
+    b = torch.randn(tokens, heads, generator=g).bfloat16().to(dev)
+    a_log = torch.randn(heads, generator=g).to(dev)
+    dt_bias = torch.randn(heads, generator=g).to(dev)
+    rg, rb = pk.gdn_gates_reference(a, b, a_log, dt_bias)
+    gg, gb = pk.gdn_gates(a, b, a_log, dt_bias)
+    assert gg.dtype == torch.float32 and gb.dtype == b.dtype
+    _close(gg, rg, 1e-4)
+    _close(gb, rb, 1e-2)
+    from engine.fast.model import _gated_rms
+
+    core = torch.randn(tokens, heads, dim, generator=g).bfloat16().to(dev)
+    z = torch.randn(tokens, heads * dim, generator=g).bfloat16().to(dev)
+    for w in ((torch.randn(dim, generator=g) * 0.2 + 1).bfloat16().to(dev), torch.ones(dim).to(dev)):
+        ref = _gated_rms(core.reshape(-1, dim), z.reshape(-1, dim), w, 1e-6).reshape(tokens, -1)
+        _close(pk.gated_rms(core, z, w, 1e-6), ref)
+
+
 # ------------------------------------------------------------------------- the whole prefill
 
 

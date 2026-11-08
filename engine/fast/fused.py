@@ -56,18 +56,21 @@ GRID = int(os.environ.get("ENGINE_FUSED_GRID", "2"))
 # Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
 # From a sweep on one gfx90a GCD (j71): 4 x 2048 beat 8 x 1024 and 16 x 512 at 4 and 8 rows.
 TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
-# Work order of the routed-expert kernels (ENGINE_FUSED_MOE_ORDER, plan 22):
-# - 1 (default): the gate_up kernel runs tile-outer (item t -> tile t // P, pair t % P for the
-#   step's P = rows x top_k pairs), one program per item, so all pairs of one weight tile are in
-#   flight together and rows that share an expert read its tile once from HBM and again from
-#   L2; the down kernel runs output tile, then row (t -> tile t // R, row t % R) on
-#   ``MOE_DOWN_GRID`` programs per CU, so rows of one tile (which may share experts) are on
-#   adjacent programs;
+# Work order and grid of the routed-expert kernels (ENGINE_FUSED_MOE_ORDER, plan 22):
+# - 1 (default): ``MOE_GRID`` programs per CU for both kernels, and from ``MOE_TILE_ROWS`` rows
+#   on, tile-outer order: the gate_up kernel maps item t -> (tile t // P, pair t % P) for the
+#   step's P = rows x top_k pairs with one program per item, so all pairs of one weight tile
+#   are in flight together and rows that share an expert read its tile once from HBM and
+#   again from L2; the down kernel maps t -> (tile t // R, row t % R), so the rows of one
+#   output tile (which may share experts) are on adjacent programs. Below ``MOE_TILE_ROWS``
+#   rows sharing is rare and plan 11's order is faster;
 # - 0: plan 11's order (pair-major, row-major), 2 programs per CU each.
-# The arithmetic of a work item is the same in both, so the outputs are bitwise equal (from a
-# sweep on one gfx90a GCD with real routing, j112: up+down at 4 rows 173.8 -> 146.2 us).
+# The arithmetic of a work item (BN 8, BK 1024, 4 warps) is the same in every order and grid,
+# so the outputs are bitwise equal and a row's output never depends on the row count. From a
+# sweep on one gfx90a GCD with real routing (j112 whole experts, j117 the TP2 shard).
 MOE_ORDER = int(os.environ.get("ENGINE_FUSED_MOE_ORDER", "1"))
-MOE_DOWN_GRID = int(os.environ.get("ENGINE_FUSED_MOE_DOWN_GRID", "4"))
+MOE_GRID = int(os.environ.get("ENGINE_FUSED_MOE_GRID", "8"))
+MOE_TILE_ROWS = int(os.environ.get("ENGINE_FUSED_MOE_TILE_ROWS", "4"))
 
 
 def enabled() -> bool:
@@ -507,20 +510,22 @@ class FusedDecode:
         bn = TILES["moe_bn"]
         bk = min(1024, _pow2(hidden))
         cus = self._cus(h.device)
-        order = 1 if MOE_ORDER == 1 else 0
+        new = MOE_ORDER == 1
+        order = 1 if new and rows >= MOE_TILE_ROWS else 0
+        grid = MOE_GRID if new else 2
         idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
         wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
         _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
                               TOPKP=_pow2(top_k), num_warps=1)
         act = torch.empty((rows * top_k, inter), dtype=h.dtype, device=h.device)
         items = rows * top_k * triton.cdiv(inter, bn)
-        _moe_up_kernel[(items if order else min(items, 2 * cus),)](
+        _moe_up_kernel[(items if order else min(items, grid * cus),)](
             h, idx, gu, act, rows, gu.stride(0),
             H=hidden, I=inter, TOPK=top_k, BN=bn, BK=bk, ORDER=order, num_warps=4,
         )
         out = torch.empty_like(x)
         items = rows * triton.cdiv(hidden, bn)
-        _moe_down_kernel[(min(items, (MOE_DOWN_GRID if order else 2) * cus),)](
+        _moe_down_kernel[(min(items, grid * cus),)](
             act, r, idx, wt, dn, sd, x, out, rows, dn.stride(0), w3.shape[0],
             H=hidden, I=inter, IS=shared, E=experts, TOPK=top_k, BN=bn,
             BKI=min(1024, _pow2(inter)), BKS=min(1024, _pow2(shared)), ORDER=order,

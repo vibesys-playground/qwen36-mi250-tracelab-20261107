@@ -163,3 +163,23 @@ def test_warmup_leaves_the_pool_and_results_unchanged(one: FastModel, two: tp.TP
     _close(_prefill(one, 0, PROMPTS[1]), _prefill(two, 0, PROMPTS[1]))
     one.reset(0)
     two.reset(0)
+
+
+def test_lockstep_prefill_matches_threads(two: tp.TPModel, monkeypatch: pytest.MonkeyPatch) -> None:
+    want = [_prefill(two, s, p) for s, p in enumerate(PROMPTS[:2])]
+    drafts = []
+    for s, p in enumerate(PROMPTS[:2]):
+        _prefill(two, s, p)
+        drafts.append(int(two.last_drafts[0]))
+    monkeypatch.setattr(tp, "LOCKSTEP", True)
+    for s, p in enumerate(PROMPTS[:2]):
+        got = _prefill(two, s, p)
+        _close(want[s], got)
+        assert int(got.argmax()) == int(want[s].argmax())
+        assert int(two.last_drafts[0]) == drafts[s]
+    for s in range(2):
+        two.reset(s)
+    packed = two.prefill_packed([(0, PROMPTS[0], 0), (1, PROMPTS[1], 0)])
+    for s in range(2):
+        _close(want[s], packed[s])
+        two.reset(s)

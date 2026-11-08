@@ -998,14 +998,18 @@ class FastModel:
             self._ensure_pages(slot, position + 1)
         size = self.bucket(batch) if self.use_graphs else batch
         pad = size - batch
-        longest = self._rows
-        host = torch.zeros((3, longest), dtype=torch.long)
-        host[1].fill_(self.dummy)
+        host = self._stage(batch)
         host[0, :batch] = torch.tensor(list(tokens), dtype=torch.long)
         host[1, :batch] = torch.tensor(list(slots), dtype=torch.long)
         host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
+        pinned = host.is_pinned()
         for meta in self.devices.values():
-            meta.packed.copy_(host)
+            meta.packed.copy_(host, non_blocking=pinned)
+        if pinned:
+            events = [torch.cuda.Event() for _ in self.devices]
+            for event, dev in zip(events, self.devices, strict=True):
+                event.record(torch.cuda.current_stream(dev))
+            self._staged_events[self._staged_at] = events
         if self.use_graphs and self.graph_error is None:
             if size not in self.segments[0].graphs:
                 self.capture(size)
@@ -1022,6 +1026,37 @@ class FastModel:
         for seg in self.segments:
             x = seg.run(x.to(seg.device), self.devices[seg.device])
         return x[:batch]
+
+    def _stage(self, batch: int) -> torch.Tensor:
+        """A host buffer [3, rows] for one step's tokens, slots and positions, padded with the dummy slot.
+
+        With ``ENGINE_ZERO_SYNC`` on a GPU it is one of two pinned buffers used
+        in turn, so the copies to the devices do not block the host; a buffer
+        is refilled only after the copies from it, two steps back, completed.
+        Otherwise a fresh pageable tensor, as before.
+        """
+        from engine.generator import zero_sync_enabled
+
+        longest = self._rows
+        pin = self.__dict__.get("_pin_staging")
+        if pin is None:
+            pin = torch.cuda.is_available() and zero_sync_enabled()
+            pin = self._pin_staging = pin and all(d.type == "cuda" for d in self.devices)
+        if not pin:
+            host = torch.zeros((3, longest), dtype=torch.long)
+            host[1].fill_(self.dummy)
+            return host
+        staged = self.__dict__.get("_staged")
+        if staged is None:
+            staged = [torch.zeros((3, longest), dtype=torch.long, pin_memory=True) for _ in range(2)]
+            self._staged, self._staged_events, self._staged_at = staged, [None, None], 1
+        self._staged_at ^= 1
+        for event in self._staged_events[self._staged_at] or ():
+            event.synchronize()
+        host = staged[self._staged_at]
+        host.zero_()
+        host[1].fill_(self.dummy)
+        return host
 
     def capture(self, size: int) -> None:
         """Capture every segment's graph for batch ``size``; on failure record why and run eagerly.

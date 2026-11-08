@@ -18,7 +18,7 @@ FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce
 
 ARG ROCM_VERSION=6.4.1
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3.12 python3-pip python-is-python3 \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3.12 python3-pip python-is-python3 gcc python3-dev \
  && mkdir -p /etc/apt/keyrings \
  && curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" > /etc/apt/sources.list.d/rocm.list \
@@ -42,5 +42,7 @@ RUN pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://downlo
 
 # A job runs as the invoking user, whose HOME may not exist; the image's files are read-only
 # under Apptainer, so caches (Triton, Hugging Face modules) go under /tmp.
+# Triton's AMD driver compiles a small C helper (Python.h) at its first kernel launch.
+ENV CC=gcc
 ENV PYTHONUNBUFFERED=1 HOME=/tmp HF_HOME=/vibesys/mounts/hf HF_HUB_OFFLINE=1 \
     HF_MODULES_CACHE=/tmp/hf-modules

@@ -17,12 +17,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import importlib.util
+import sys
+
 import httpx
 import pytest
 import torch
-from conftest import Server, serve
 from engine.generator import Generator, zero_sync_enabled
 from engine.protocol import Sampling
+
+# This directory's conftest by path: run together with the cpu_check suite, ``conftest`` is that one.
+_spec = importlib.util.spec_from_file_location("engine_tests_conftest", Path(__file__).with_name("conftest.py"))
+_conftest = sys.modules.setdefault(_spec.name, importlib.util.module_from_spec(_spec))
+_spec.loader.exec_module(_conftest)
+Server, serve = _conftest.Server, _conftest.serve
 
 _TIMEOUT = 120
 

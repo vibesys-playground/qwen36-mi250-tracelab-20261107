@@ -12,7 +12,8 @@ new tokens, so the prefix cache is exercised. Prompt text is the source of the
 installed Transformers package (nothing from the benchmark). It prints, per
 setting, output tokens/s over the wall time, TPOT and TTFT percentiles, cached
 prompt tokens and /health, then (for two settings) how many requests produced
-identical tokens in both. A hint for the lead, not the task's metric.
+identical tokens in it and in the first setting. A hint for the lead, not the
+task's metric. A setting may repeat with a dummy KEY=VALUE added (an A/B/A/B).
 """
 
 from __future__ import annotations
@@ -194,15 +195,16 @@ def main() -> None:
     for setting in args.settings.split(","):
         outputs[setting] = serve_and_run(None if setting == "default" else setting, args.port, args, pool)
     names = list(outputs)
-    if len(names) == 2:
-        a, b = outputs[names[0]], outputs[names[1]]
+    for other in names[1:]:  # every setting against the first
+        a, b = outputs[names[0]], outputs[other]
         same = sum(a[k] == b[k] for k in a)
         first_div = []
         for k in a:
             n = next((i for i, (x, y) in enumerate(zip(a[k], b[k])) if x != y), None)
             if n is not None:
                 first_div.append(n)
-        print(json.dumps({"event": "agreement", "identical_requests": same, "requests": len(a),
+        print(json.dumps({"event": "agreement", "settings": [names[0], other],
+                          "identical_requests": same, "requests": len(a),
                           "first_divergence_positions": sorted(first_div)[:16]}), flush=True)
 
 

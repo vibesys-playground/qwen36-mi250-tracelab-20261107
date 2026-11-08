@@ -36,6 +36,12 @@ Every task except `mi2508x-tracelab-sglang` starts from the baseline engine in
   that the next round of a multi-round session resumes from). Usage reports
   the reused tokens as `prompt_tokens_details.cached_tokens`, which TraceLab's
   prefix-cache preflight requires.
+- Greedy requests decode speculatively with the checkpoint's own MTP head
+  (`engine/mtp.py`, `engine/speculative.py`): each step feeds the last token
+  and the head's draft of the next, and accepts the draft only if it equals the
+  model's own greedy pick; a rejected draft is rolled back (attention KV
+  cropped, Gated DeltaNet states restored). `ENGINE_MTP=0` turns it off;
+  `/health` reports `mtp_proposed` and `mtp_accepted`.
 - It serves `GET /health`, `GET /v1/models`, and streaming or non-streaming
   `POST /v1/completions` and `POST /v1/chat/completions`. It honors exact
   `max_tokens` with `ignore_eos`, `min_tokens`, stop strings, and greedy decoding at

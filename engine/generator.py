@@ -37,7 +37,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts
+from engine import batching, experts, speculative
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -225,6 +225,8 @@ class Generation:
         self._count = 0
         self.last_token: int | None = None
         self.done = False
+        # The MTP head's state when this request decodes speculatively (greedy, head loaded).
+        self.mtp: speculative.MTPState | None = None
         self._rng = None
         if sampling.seed is not None:
             self._rng = torch.Generator(device=logits.device).manual_seed(sampling.seed)
@@ -243,6 +245,17 @@ class Generation:
         self.done = finish is not None
         return Step(token, emit=True, finish=finish)
 
+    @property
+    def sampling(self) -> Sampling:
+        return self._sampling
+
+    def picked_count(self) -> int:
+        return self._count
+
+    def tokens(self) -> list[int]:
+        """The prompt and every picked token."""
+        return [*self._prompt, *self._picked]
+
     def retire(self) -> None:
         """Hand this finished request's cache to the prefix cache as a session tail.
 
@@ -252,8 +265,11 @@ class Generation:
         """
         if self.cache is None or not self._prompt or not self._picked:
             return
+        speculative.Speculator.settle(self)
         key = self._prompt + tuple(self._picked[:-1])
         cache, self.cache = self.cache, None
+        if self.mtp is not None:
+            cache.mtp_state = self.mtp  # travels with the tail to the next round
         self._generator.keep_tail(key, cache)
 
 
@@ -281,6 +297,7 @@ class Generator:
             chunk_tokens, prefix_cache_tokens, prefix_cache_entries, prefix_cache_bytes
         )
         self._device = model.get_input_embeddings().weight.device
+        self.spec: speculative.Speculator | None = None
         # Prompt counters, shown on /health: tokens run through prefill vs reused from the cache.
         self.prefilled_tokens = 0
         self.cached_tokens = 0
@@ -328,7 +345,9 @@ class Generator:
         if eos is None:
             eos = lm.config.eos_token_id
         eos_ids = frozenset([eos] if isinstance(eos, int) else (eos or []))
-        return cls(lm, tokenizer, eos_ids, **options)
+        generator = cls(lm, tokenizer, eos_ids, **options)
+        generator.spec = speculative.Speculator.load(generator, model, revision)
+        return generator
 
     def encode_text(self, prompt: str) -> tuple[int, ...]:
         return tuple(self.tokenizer.encode(prompt))
@@ -359,15 +378,27 @@ class Generator:
                 f"prompt ({len(prompt)} tokens) plus max_tokens ({sampling.max_tokens}) "
                 f"exceeds the context length {self.max_model_len}"
             )
+        speculate = self.spec is not None and sampling.temperature == 0.0
         with torch.inference_mode():
             reused, cache = self._prefix_cache.lookup(prompt)
+            carried = None
             if cache is None:
                 cache = DynamicCache(config=self.model.config)
-            logits = self.prefill(prompt, reused, cache)
+            else:
+                carried = cache.__dict__.pop("mtp_state", None)
+            if speculate:
+                self.spec.capture()
+            try:
+                logits = self.prefill(prompt, reused, cache)
+            finally:
+                hidden = self.spec.captured() if speculate else None
         self.cached_tokens += reused
         self.prefilled_tokens += len(prompt) - reused
         max_tokens = sampling.max_tokens if sampling.max_tokens is not None else budget
-        return Generation(self, sampling, reused, cache, logits, max_tokens, prompt)
+        generation = Generation(self, sampling, reused, cache, logits, max_tokens, prompt)
+        if speculate:
+            generation.mtp = self.spec.new_state(carried, reused, hidden)
+        return generation
 
     def keep_tail(self, key: tuple[int, ...], cache: DynamicCache) -> None:
         """Keep a finished request's ``cache``, covering exactly ``key``, for the next round."""
@@ -387,6 +418,8 @@ class Generator:
             "prefix_cache_entries": len(pc),
             "prefix_cache_bytes": pc.bytes,
             "prefix_cache_evictions": pc.evictions,
+            "mtp": int(self.spec is not None),
+            **(self.spec.stats() if self.spec is not None else {}),
         }
 
     def decode(self, generations: list[Generation]) -> None:
@@ -394,8 +427,26 @@ class Generator:
 
         One request runs alone on its own cache. Several are stacked into one
         batch: left-padded attention keys and values, a padding mask, and each
-        request's own position.
+        request's own position. With the MTP head loaded, greedy requests feed
+        their last token and a draft (``engine.speculative``); a request whose
+        draft was accepted last step takes its queued logits and is not fed.
         """
+        if self.spec is not None:
+            fed = [g for g in generations if not self.spec.take_queued(g)]
+            plain = [g for g in fed if g.mtp is None]
+            drafted = [g for g in fed if g.mtp is not None]
+            if drafted:
+                self.decode_steps += 1
+                self.decoded_tokens += 2 * len(drafted)
+                self.largest_batch = max(self.largest_batch, len(drafted))
+                with torch.inference_mode():
+                    self.spec.step(drafted)
+            if plain:
+                self._decode(plain)
+            return
+        self._decode(generations)
+
+    def _decode(self, generations: list[Generation]) -> None:
         self.decode_steps += 1
         self.decoded_tokens += len(generations)
         self.largest_batch = max(self.largest_batch, len(generations))

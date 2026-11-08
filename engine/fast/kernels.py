@@ -477,3 +477,141 @@ def paged_decode_attention(
     w = torch.exp(m - top)
     out = (acc * w[..., None]).sum(dim=2) / (l * w).sum(dim=-1)[..., None]
     return out.to(q.dtype)
+
+
+# --------------------------------------------------------------------------------------------
+# Fused decode kernels: fewer launches per layer (a captured step is launch-bound otherwise)
+# --------------------------------------------------------------------------------------------
+
+if triton is not None:
+
+    @triton.jit
+    def _add_rms_kernel(
+        x_ptr, h_ptr, w_ptr, sum_ptr, out_ptr, eps, N: tl.constexpr, BLOCK: tl.constexpr,
+        HAS_H: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        ok = cols < N
+        x = tl.load(x_ptr + row * N + cols, mask=ok, other=0.0).to(tl.float32)
+        if HAS_H:  # the residual add, rounded to BF16 as the BF16 tensor add rounds
+            h = tl.load(h_ptr + row * N + cols, mask=ok, other=0.0).to(tl.float32)
+            x = (x + h).to(tl.bfloat16).to(tl.float32)
+            tl.store(sum_ptr + row * N + cols, x.to(tl.bfloat16), mask=ok)
+        var = tl.sum(x * x, axis=0) / N
+        w = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        y = x * tl.rsqrt(var + eps) * (1.0 + w)
+        tl.store(out_ptr + row * N + cols, y.to(tl.bfloat16), mask=ok)
+
+    @triton.jit
+    def _gdn_conv_kernel(
+        state_ptr, slot_ptr, x_ptr, w_ptr, out_ptr, C, stride_slot, K: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Short causal convolution step: shift the slot's window, append x, silu(conv)."""
+        row = tl.program_id(0)
+        block = tl.program_id(1)
+        slot = tl.load(slot_ptr + row).to(tl.int64)
+        c = block * BLOCK + tl.arange(0, BLOCK)
+        ok = c < C
+        base = state_ptr + slot * stride_slot + c * K
+        xn = tl.load(x_ptr + row * C + c, mask=ok, other=0.0)
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for j in tl.static_range(K - 1):
+            sj = tl.load(base + j + 1, mask=ok, other=0.0)
+            acc += sj.to(tl.float32) * tl.load(w_ptr + c * K + j, mask=ok, other=0.0).to(tl.float32)
+            tl.store(base + j, sj, mask=ok)
+        acc += xn.to(tl.float32) * tl.load(w_ptr + c * K + K - 1, mask=ok, other=0.0).to(tl.float32)
+        tl.store(base + K - 1, xn, mask=ok)
+        y = acc.to(tl.bfloat16).to(tl.float32)
+        y = (y * tl.sigmoid(y)).to(tl.bfloat16)
+        tl.store(out_ptr + row * C + c, y, mask=ok)
+
+    @triton.jit
+    def _gdn_fused_kernel(
+        state_ptr, slot_ptr, mixed_ptr, a_ptr, b_ptr, z_ptr, alog_ptr, dtb_ptr, nw_ptr, out_ptr,
+        C, V_HEADS, stride_slot, stride_head, eps, scale, RATIO: tl.constexpr,
+        KEY_DIM: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+    ):
+        """One v-head of one sequence: q/k L2 norm, decay and beta, the delta rule on the slot's
+        fp32 state (in place), and the gated RMSNorm of the output with z."""
+        row = tl.program_id(0)
+        head = tl.program_id(1)
+        k_head = head // RATIO
+        slot = tl.load(slot_ptr + row).to(tl.int64)
+        kk = tl.arange(0, DK)
+        vv = tl.arange(0, DV)
+        base_in = mixed_ptr + row * C
+        q = tl.load(base_in + k_head * DK + kk).to(tl.float32)
+        k = tl.load(base_in + KEY_DIM + k_head * DK + kk).to(tl.float32)
+        v = tl.load(base_in + 2 * KEY_DIM + head * DV + vv).to(tl.float32)
+        q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) * scale
+        k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
+        rh = row * V_HEADS + head
+        beta = tl.sigmoid(tl.load(b_ptr + rh).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        a = tl.load(a_ptr + rh).to(tl.float32) + tl.load(dtb_ptr + head).to(tl.float32)
+        softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        g = -tl.exp(tl.load(alog_ptr + head).to(tl.float32)) * softplus
+        sbase = state_ptr + slot * stride_slot + head * stride_head + kk[:, None] * DV + vv[None, :]
+        s = tl.load(sbase) * tl.exp(g)
+        kv_mem = tl.sum(s * k[:, None], axis=0)
+        delta = (v - kv_mem) * beta
+        s = s + k[:, None] * delta[None, :]
+        o = tl.sum(s * q[:, None], axis=0)
+        tl.store(sbase, s)
+        o = o.to(tl.bfloat16).to(tl.float32)
+        n = (o * tl.rsqrt(tl.sum(o * o, axis=0) / DV + eps)).to(tl.bfloat16).to(tl.float32)
+        y = (tl.load(nw_ptr + vv).to(tl.float32) * n).to(tl.bfloat16).to(tl.float32)
+        zz = tl.load(z_ptr + rh * DV + vv).to(tl.float32)
+        tl.store(out_ptr + rh * DV + vv, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16))
+
+
+def add_rms(
+    x: torch.Tensor, h: torch.Tensor | None, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(x + h, RMSNorm(x + h) * (1 + weight)) in one launch; ``h`` None skips the add."""
+    rows, n = x.shape
+    out = torch.empty_like(x)
+    total = torch.empty_like(x) if h is not None else x
+    _add_rms_kernel[(rows,)](
+        x, h if h is not None else x, weight, total, out, eps, N=n,
+        BLOCK=triton.next_power_of_2(n), HAS_H=h is not None,
+    )
+    return total, out
+
+
+def gdn_conv_(
+    state: torch.Tensor, slots: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Convolution step for [batch, conv_dim] ``x`` on ``state[slots]`` (updated in place)."""
+    batch, channels = x.shape
+    kernel = state.shape[-1]
+    out = torch.empty_like(x)
+    block = 256
+    _gdn_conv_kernel[(batch, triton.cdiv(channels, block))](
+        state, slots, x.contiguous(), weight.contiguous(), out, channels, state.stride(0),
+        K=kernel, BLOCK=block,
+    )
+    return out
+
+
+def gdn_fused_(
+    state: torch.Tensor,
+    slots: torch.Tensor,
+    mixed: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    m: torch.nn.Module,
+) -> torch.Tensor:
+    """Gated DeltaNet decode after the convolution, for module ``m``: [batch, v_heads * v_dim]."""
+    batch = mixed.shape[0]
+    heads, dk, dv = m.num_v_heads, m.head_k_dim, m.head_v_dim
+    out = torch.empty((batch, heads * dv), dtype=mixed.dtype, device=mixed.device)
+    _gdn_fused_kernel[(batch, heads)](
+        state, slots, mixed.contiguous(), a.contiguous(), b.contiguous(), z.contiguous(),
+        m.A_log, m.dt_bias, m.norm.weight, out, mixed.shape[1], heads, state.stride(0),
+        state.stride(1), m.norm.variance_epsilon, dk ** -0.5,
+        RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
+    )
+    return out

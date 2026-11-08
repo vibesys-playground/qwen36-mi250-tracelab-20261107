@@ -198,7 +198,13 @@ class FastModel:
         if self.use_graphs and not self.use_triton:
             raise ValueError("graph capture needs the Triton kernels (the references synchronize)")
         # Per kernel, for isolating one kernel's numerics against its reference.
-        self.triton_kernels = {"moe": self.use_triton, "gdn": self.use_triton, "attn": self.use_triton}
+        self.triton_kernels = {
+            "moe": self.use_triton,
+            "gdn": self.use_triton,
+            "attn": self.use_triton,
+            # Fused launches: residual add + RMSNorm, and the whole DeltaNet step.
+            "fused": self.use_triton and os.environ.get("ENGINE_FUSED", "1") == "1",
+        }
         self.buckets = sorted(buckets)
         self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
@@ -407,13 +413,20 @@ class FastModel:
         self, i: int, x: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor, meta: _Device
     ) -> torch.Tensor:
         layer = self.layers[i]
-        h = _rms(x, layer.input_layernorm.weight, self.eps)
+        fused = self.triton_kernels["fused"]
+        if fused:
+            _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
+        else:
+            h = _rms(x, layer.input_layernorm.weight, self.eps)
         if self.layer_types[i] == "linear_attention":
             h = self._gdn_decode(i, h, slots)
         else:
             h = self._attn_decode(i, h, slots, positions, meta)
-        x = x + h
-        h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
+        if fused:
+            x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
+        else:
+            x = x + h
+            h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
         return x + self._moe(layer.mlp, h, decode=True)
 
     def _gdn_project(self, m: torch.nn.Module, x: torch.Tensor):
@@ -453,6 +466,9 @@ class FastModel:
         m = self.layers[i].linear_attn
         conv_state, rec_state = self.gdn_state[i]
         qkv, z, b, a = self._gdn_project(m, x)
+        if self.triton_kernels["fused"] and self.triton_kernels["gdn"]:
+            mixed = kernels.gdn_conv_(conv_state, slots, qkv, m.conv1d.weight)
+            return F.linear(kernels.gdn_fused_(rec_state, slots, mixed, a, b, z, m), m.out_proj.weight)
         # Short causal convolution over the last ``kernel`` inputs (the slot's state holds them).
         window = torch.cat((conv_state.index_select(0, slots)[:, :, 1:], qkv.unsqueeze(-1)), dim=-1)
         conv_state.index_copy_(0, slots, window)

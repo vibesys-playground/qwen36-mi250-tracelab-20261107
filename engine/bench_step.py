@@ -237,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             ("reference_attn", {**triton_all, "attn": False}),
             ("reference_gdn", {**triton_all, "gdn": False}),
             ("reference_moe", {**triton_all, "moe": False}),
+            ("unfused", {**triton_all, "fused": False}),
         ]
     agree_pct = 0.0
     for label, config in variants:

@@ -93,21 +93,34 @@ def _alloc(hip, dev: int, nbytes: int, fine: bool) -> int:
 
 def _export(hip, ptr: int) -> bytes:
     h = _Handle()
+    hip.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), ctypes.c_void_p]
+    hip.hipIpcGetMemHandle.restype = ctypes.c_int
     rc = hip.hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr))
     if rc != 0:
         raise RuntimeError(f"hipIpcGetMemHandle failed: {rc}")
     return bytes(h.reserved)
 
 
-def _open(hip, handle: bytes) -> int:
+def _open(hip, handle: bytes, info: dict) -> int:
+    """Open a peer's handle: the prototype declared (the 64-byte handle is passed by value),
+    with hipIpcMemLazyEnablePeerAccess (1), then with no flags; every failure is recorded."""
+    fn = hip.hipIpcOpenMemHandle
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), _Handle, ctypes.c_uint]
+    fn.restype = ctypes.c_int
     h = _Handle()
     ctypes.memmove(h.reserved, handle, 64)
-    ptr = ctypes.c_void_p()
-    # hipIpcMemLazyEnablePeerAccess = 1
-    rc = hip.hipIpcOpenMemHandle(ctypes.byref(ptr), h, ctypes.c_uint(1))
-    if rc != 0:
-        raise RuntimeError(f"hipIpcOpenMemHandle failed: {rc}")
-    return ptr.value
+    tried = []
+    for flags in (1, 0):
+        ptr = ctypes.c_void_p()
+        rc = fn(ctypes.byref(ptr), h, flags)
+        if rc == 0:
+            info.setdefault("open_flags", []).append(flags)
+            return ptr.value
+        hip.hipGetErrorName.restype = ctypes.c_char_p
+        name = (hip.hipGetErrorName(rc) or b"").decode()
+        tried.append(f"flags={flags}: rc={rc} {name}")
+        hip.hipGetLastError()
+    raise RuntimeError("hipIpcOpenMemHandle failed: " + "; ".join(tried))
 
 
 def _ipc_worker(rank: int, conn, barrier, port: int) -> None:
@@ -130,6 +143,7 @@ def _ipc_worker(rank: int, conn, barrier, port: int) -> None:
 
 def _ipc_body(rank: int, conn, barrier, port: int, emit) -> None:
     import torch
+    import torch.multiprocessing  # noqa: F401 - registers the CUDA tensor reductions for the pipe
 
     from engine.fast import tp as tpm
 
@@ -152,27 +166,51 @@ def _ipc_body(rank: int, conn, barrier, port: int, emit) -> None:
         barrier.wait(timeout=300)
 
     # ---------------------------------------------------------------- share the buffers
-    kinds = [("fine", True), ("coarse", False)]
+    # fine: hipExtMallocWithFlags(fine-grained) + hipIpc via ctypes; coarse: hipMalloc + hipIpc
+    # via ctypes; torch: torch's allocator, shared by torch.multiprocessing (its own hipIpc).
     shared = None
-    for name, fine in kinds:
+    keep = []
+    for name in ("fine", "coarse", "torch"):
         info = {"mem": name}
+        hs = hb = None
         try:
-            small = _alloc(hip, rank, 2 * cap_small * 8, fine)
-            big = _alloc(hip, rank, 2 * cap_big * 8, fine)
-            t0 = time.perf_counter()
-            hs, hb = _export(hip, small), _export(hip, big)
-            info["export_us"] = round((time.perf_counter() - t0) * 1e6, 1)
+            if name == "torch":
+                small_t = torch.zeros(2 * cap_small, dtype=torch.int64, device=dev)
+                big_t = torch.zeros(2 * cap_big, dtype=torch.int64, device=dev)
+                keep += [small_t, big_t]
+                small, big = small_t.data_ptr(), big_t.data_ptr()
+                hs, hb = small_t, big_t
+            else:
+                small = _alloc(hip, rank, 2 * cap_small * 8, name == "fine")
+                big = _alloc(hip, rank, 2 * cap_big * 8, name == "fine")
+                t0 = time.perf_counter()
+                hs, hb = _export(hip, small), _export(hip, big)
+                info["export_us"] = round((time.perf_counter() - t0) * 1e6, 1)
             ok = True
         except Exception as exc:  # noqa: BLE001
             info["export_error"] = f"{type(exc).__name__}: {exc}"
             hs = hb = None
             ok = False
-        conn.send((ok, hs, hb))
-        peer_ok, phs, phb = conn.recv()
+        torch.cuda.synchronize(dev)
+        try:
+            conn.send((ok, hs, hb))
+            peer_ok, phs, phb = conn.recv()
+        except Exception as exc:  # noqa: BLE001
+            info["send_error"] = f"{type(exc).__name__}: {exc}"
+            conn.send(False)
+            conn.recv()
+            info["ok"] = False
+            emit("ipc_share", **info)
+            continue
         if ok and peer_ok:
             try:
                 t0 = time.perf_counter()
-                psmall, pbig = _open(hip, phs), _open(hip, phb)
+                if name == "torch":
+                    keep += [phs, phb]
+                    info["peer_tensor_device"] = str(phs.device)
+                    psmall, pbig = phs.data_ptr(), phb.data_ptr()
+                else:
+                    psmall, pbig = _open(hip, phs, info), _open(hip, phb, info)
                 info["open_us"] = round((time.perf_counter() - t0) * 1e6, 1)
             except Exception as exc:  # noqa: BLE001
                 info["open_error"] = f"{type(exc).__name__}: {exc}"
@@ -182,6 +220,7 @@ def _ipc_body(rank: int, conn, barrier, port: int, emit) -> None:
         info["ok"] = bool(ok and peer_ok and peer_open)
         emit("ipc_share", **info)
         hip.hipSetDevice(rank)
+        torch.cuda.set_device(rank)
         if info["ok"]:
             shared = (name, small, big, psmall, pbig)
             break
@@ -625,8 +664,11 @@ def run_all(args) -> int:
     env.pop("CUDA_VISIBLE_DEVICES", None)
     env["ENGINE_TP"] = "2"
     me = str(Path(__file__).resolve())
-    rows = _child([sys.executable, me, "ipc", "--timeout", "900"], env, 1000)
-    rows += _child([sys.executable, me, "passes", "--reps", str(args.reps)], env, 5400)
+    rows = []
+    if "ipc" in args.parts:
+        rows += _child([sys.executable, me, "ipc", "--timeout", "900"], env, 1000)
+    if "passes" in args.parts:
+        rows += _child([sys.executable, me, "passes", "--reps", str(args.reps)], env, 5400)
     by = defaultdict(list)
     for r in rows:
         by[r["kind"]].append(r)
@@ -672,6 +714,7 @@ def main() -> int:
     p_all = sub.add_parser("all")
     p_all.add_argument("--devices", default="0,1")
     p_all.add_argument("--reps", type=int, default=12)
+    p_all.add_argument("--parts", default="ipc,passes")
     p_ipc = sub.add_parser("ipc")
     p_ipc.add_argument("--timeout", type=int, default=900)
     p_pass = sub.add_parser("passes")

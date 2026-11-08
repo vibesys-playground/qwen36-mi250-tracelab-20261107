@@ -199,6 +199,18 @@ def main() -> None:
 
     accept: dict[tuple[str, str], dict] = {}
     parity_total = parity_same = 0
+    # Per-depth acceptance on this path: every verify_chain call's k and accepted counts.
+    calls: list[tuple[int, list[int]]] = []
+    depth_n: dict = {}
+    depth_a: dict = {}
+    real_verify_chain = fast.verify_chain
+
+    def logged(tokens, drafts, slots_, positions):
+        res = real_verify_chain(tokens, drafts, slots_, positions)
+        calls.append((len(drafts[0]), list(res[2])))
+        return res
+
+    fast.verify_chain = logged
     for kname in ("1", "3", "7", ""):
         os.environ["ENGINE_SPEC_K"] = kname
         for name in groups:
@@ -209,6 +221,7 @@ def main() -> None:
                 idx = [p0, p0 + 1]
                 want = plain(name, idx)
                 before = (g.verify_steps, g.mtp_proposed, g.mtp_accepted)
+                first_call = len(calls)
                 gens = [g.start(tuple(groups[name][i]), Sampling(max_tokens=n, temperature=0.0, ignore_eos=True))
                         for i in idx]
                 spec: list[list[int]] = [[] for _ in idx]
@@ -229,6 +242,16 @@ def main() -> None:
                     if live:
                         g.decode([gens[i] for i in live])
                 g._reclaim()
+                # conditional acceptance by depth, the first step after prefill left out (its
+                # drafts beyond the first are padding) and the last steps (max_tokens) too
+                for kk, accs in calls[first_call + 1 : -3]:
+                    for a in accs:
+                        for j in range(1, kk + 1):
+                            depth_n[(kname, name, j)] = depth_n.get((kname, name, j), 0) + 1
+                            if a >= j:
+                                depth_a[(kname, name, j)] = depth_a.get((kname, name, j), 0) + 1
+                            else:
+                                break
                 steps = g.verify_steps - before[0]
                 proposed += g.mtp_proposed - before[1]
                 accepted += g.mtp_accepted - before[2]
@@ -244,11 +267,15 @@ def main() -> None:
                         out("parity_diverges", k=kname or "adaptive", set=name, prompt=idx[r], at=at)
             e = tot_tokens / max(1, tot_steps)
             accept[(kname, name)] = {"E": e, "rate": accepted / max(1, proposed)}
+            p_j = [round(depth_a.get((kname, name, j), 0) / depth_n[(kname, name, j)], 4)
+                   for j in range(1, 8) if depth_n.get((kname, name, j))]
             out("accept", k=kname or "adaptive", set=name, identical=f"{same}/{2 * args.pairs}",
+                p_j=p_j,
                 verify_steps=tot_steps, tokens_per_slot_step=round(e, 3),
                 drafts_checked=proposed, drafts_accepted=accepted,
                 per_draft_rate=round(accepted / max(1, proposed), 4))
     os.environ["ENGINE_SPEC_K"] = ""
+    fast.verify_chain = real_verify_chain
     out("parity_summary", identical=f"{parity_same}/{parity_total}", verdict="PASS" if parity_same == parity_total else "FAIL")
 
     # ------------------------------------------------------------ 4. tokens/ms

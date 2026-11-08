@@ -1061,7 +1061,11 @@ class TPModel:
         if r0.use_graphs and self.graph_error is None:
             segs = [m._segs(verify, chain) for m in self.ranks]
             if size not in segs[0][0].graphs:
+                # Capturing fills the step inputs with the dummy slot: keep the caller's.
+                saved = [(meta, meta.packed.clone()) for m in self.ranks for meta in m.devices.values()]
                 self.capture(size, verify, chain)
+                for meta, packed in saved:
+                    meta.packed.copy_(packed)
             if self.graph_error is None:
                 outs = []
                 for model, seg in zip(self.ranks, segs, strict=True):

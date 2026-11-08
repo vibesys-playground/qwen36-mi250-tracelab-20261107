@@ -998,7 +998,10 @@ class TPModel:
                 def cap(m: FastModel, mode: str, size: int = size, bufs: list = bufs):
                     dev = m.embed.device
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.device(dev), torch.inference_mode():
+                    # no_grad, not inference_mode (as the decode graphs): the first capture of
+                    # a process creates torch's generator graph state, and created as inference
+                    # tensors it would fail every later capture outside inference mode.
+                    with torch.cuda.device(dev), torch.no_grad():
                         with torch.cuda.graph(graph, pool=pools[dev], stream=streams[dev],
                                               capture_error_mode=mode):
                             logits, drafts = m._pg_body(bufs[m.rank], size)

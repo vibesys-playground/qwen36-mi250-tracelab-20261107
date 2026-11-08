@@ -30,10 +30,10 @@ P=tools/tp_parity.py
 ( ENGINE_PREFILL_GRAPH=1 timeout 2400 python tools/spec_step_bench.py --devices 6,7 --iters 10 --max-new 128 ) > $L/spec.log 2>&1 &
 wait
 
-echo "=== teacher-forced top-1, GRAPH=1 vs GRAPH=0 reference"; grep -E "RESULT|Error|^---|engine: prefill" $L/parity.log | tail -14
-echo "=== cross-process, GRAPH=1 vs GRAPH=1"; grep -E "RESULT|Error|^---|engine: prefill" $L/cross.log | tail -14
+echo "=== teacher-forced top-1, GRAPH=1 vs GRAPH=0 reference"; grep -E "RESULT|Error|^---|engine: prefill|engine: fast path|failed in mode" $L/parity.log | tail -14
+echo "=== cross-process, GRAPH=1 vs GRAPH=1"; grep -E "RESULT|Error|^---|engine: prefill|engine: fast path|failed in mode" $L/cross.log | tail -14
 echo "=== in-process repeat + bench"; grep -E "RESULT|Error|^---|engine: prefill|^ +[0-9]+ |^===|N +size" $L/bench.log | cut -c1-1500 | tail -40
-echo "=== spec == plain (GRAPH=1)"; grep -E "RESULT|Error|Traceback|engine: prefill" $L/spec.log | tail -30
+echo "=== spec == plain (GRAPH=1)"; grep -E "RESULT|Error|Traceback|engine: prefill|engine: fast path|failed in mode" $L/spec.log | tail -30
 
 if [ "$1" = "serve" ]; then
   timeout 5400 python tools/serve_probe.py --sessions 48 --concurrency 8 --rounds 6.3 --first 1800 --grow 480 \

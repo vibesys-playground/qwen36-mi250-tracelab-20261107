@@ -128,6 +128,7 @@ class Worker:
         while True:
             block = not running and not prefilling
             ready: list[tuple[Job, Iterator[Any], Generation]] = []
+            serial: list[tuple[Job, Iterator[Any], Prefill]] = []
             while True:
                 try:
                     job = self._jobs.get(block=block)
@@ -141,10 +142,7 @@ class Worker:
                         self._fail(job, events, RuntimeError("job decoded before its prefill"))
                     continue
                 if packer is None:
-                    try:
-                        ready.append((job, events, g.start(want.prompt, want.sampling)))
-                    except Exception as exc:  # noqa: BLE001 - this request only
-                        self._fail(job, events, exc)
+                    serial.append((job, events, want))
                 else:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
             if packer is not None:
@@ -163,6 +161,17 @@ class Worker:
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
             for job, events, generation in ready:
+                want = self._advance(job, events, generation)
+                if isinstance(want, AwaitDecode):
+                    waiting.append((job, events, want.generation))
+            # Unpacked: each new job is prefilled and emits its first token before the next
+            # job's prefill, after the running jobs' tokens (the order the base engine used).
+            for job, events, prefill in serial:
+                try:
+                    generation = g.start(prefill.prompt, prefill.sampling)
+                except Exception as exc:  # noqa: BLE001 - this request only
+                    self._fail(job, events, exc)
+                    continue
                 want = self._advance(job, events, generation)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))

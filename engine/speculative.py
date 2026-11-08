@@ -98,9 +98,9 @@ DECAY = 0.95
 
 
 def _cost() -> dict[int, float]:
-    """``ENGINE_SPEC_COST`` "1:10.7,3:15.3,7:22.0": ms per step of 2 slots by k (default:
-    plan 31 step 0's projection, j143)."""
-    spec = os.environ.get("ENGINE_SPEC_COST", "1:10.7,3:15.3,7:22.0")
+    """``ENGINE_SPEC_COST`` "1:9.2,3:13.7,7:23.2": ms per step of 2 slots by k (default: the
+    measured ``verify_chain`` step under TP2, plan 31 stage 1, j161)."""
+    spec = os.environ.get("ENGINE_SPEC_COST", "1:9.2,3:13.7,7:23.2")
     return {int(k): float(v) for k, v in (item.split(":") for item in spec.split(",") if item)}
 
 

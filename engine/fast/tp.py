@@ -73,6 +73,11 @@ LOCKSTEP = os.environ.get("ENGINE_TP_PREFILL", "threads") == "lockstep"
 WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
 
 
+def proc_enabled() -> bool:
+    """``ENGINE_TP_PROC=1``: rank 1 runs in its own host process (``engine.fast.tp_proc``)."""
+    return os.environ.get("ENGINE_TP_PROC", "0") == "1"
+
+
 def size() -> int:
     """``ENGINE_TP``: 2 (default) for tensor parallelism over a replica's two GPUs, 1 for the
     layer split (one GPU's layers after the other's)."""
@@ -966,10 +971,14 @@ class TPModel:
             host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
         self._load_inputs(host)
         outs, out = self._run(size, rows, verify=True)
-        logits = self._gather([o[:batch] for o in outs])
+        logits = self._verify_logits(outs, batch)
         picks = out.cpu().tolist()
         g, d = picks[0], picks[1]
         return logits, g[:batch], g[size : size + batch], d[:batch], d[size : size + batch]
+
+    def _verify_logits(self, outs: Sequence[torch.Tensor], batch: int) -> torch.Tensor:
+        """A verify step's logits over the whole vocabulary (its first ``batch`` rows)."""
+        return self._gather([o[:batch] for o in outs])
 
     # ------------------------------------------------------------ graphs
 

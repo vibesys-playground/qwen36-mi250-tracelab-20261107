@@ -504,7 +504,13 @@ def passes(args) -> int:
     result("load", seconds=round(time.perf_counter() - t0, 1), graphs=fast.use_graphs,
            mtp=fast.mtp is not None, switch_interval_s=float(os.environ.get("ENGINE_TP_SWITCH_S", "0.0002")))
     group = fast.group
-    r0, r1 = fast.ranks
+    proc = len(fast.ranks) == 1  # ENGINE_TP_PROC=1: rank 1 is a process of its own
+    r0 = fast.ranks[0]
+    r1 = None if proc else fast.ranks[1]
+    modes = [m for m in args.modes.split(",") if m]
+    if proc and modes != ["both"]:
+        raise ValueError("ENGINE_TP_PROC=1 times the 'both' mode only")
+    result("passes_setting", tp_proc=os.environ.get("ENGINE_TP_PROC", "0"), modes=modes)
     slot = gen._free_slots[-1]
     pool = token_pool(CHECKPOINT["model"], CHECKPOINT["revision"], 40_000, "synthetic")
     devices = list(range(torch.cuda.device_count()))
@@ -554,7 +560,7 @@ def passes(args) -> int:
 
     for _ in range(2):  # warm every shape and mode
         for new in NEW:
-            for mode in MODES:
+            for mode in modes:
                 timed(mode, new)
     # The number of all-reduces in one pass (per rank).
     calls = Counter()
@@ -572,21 +578,21 @@ def passes(args) -> int:
             group.allreduce = orig
 
     timed("both", 561, counted)
-    result("allreduce_calls_per_pass", per_rank=dict(calls))
+    result("allreduce_calls_per_pass", per_rank={str(k): v for k, v in calls.items()})
     walls: dict[tuple[str, int], list[float]] = defaultdict(list)
     for _ in range(args.reps):
         for new in NEW:
-            for mode in MODES:
+            for mode in modes:
                 walls[(mode, new)].append(timed(mode, new))
     table = {}
     for (mode, new), v in sorted(walls.items(), key=lambda kv: (kv[0][1], MODES.index(kv[0][0]))):
         med = statistics.median(v)
         table[(mode, new)] = med
-        result("pass", mode=mode, new_tokens=new, context=CONTEXT, reps=len(v), wall_ms_median=round(med, 2),
+        result("pass", tp_proc=os.environ.get("ENGINE_TP_PROC", "0"), mode=mode, new_tokens=new, context=CONTEXT, reps=len(v), wall_ms_median=round(med, 2),
                wall_ms_min=round(min(v), 2), wall_ms_max=round(max(v), 2), wall_ms_all=[round(x, 1) for x in v])
     # One profiled pass per mode at 561 tokens: per-GCD kernel time and launches.
     tmp = tempfile.mkdtemp(prefix="gil-trace-")
-    for mode in MODES:
+    for mode in modes:
         path = os.path.join(tmp, f"{mode}.json")
 
         def profiled(fn):
@@ -597,10 +603,15 @@ def passes(args) -> int:
 
         try:
             ms = timed(mode, 561, profiled)
-            result("profiled_pass", mode=mode, new_tokens=561, profiled_wall_ms=round(ms, 1), **_kernel_stats(path))
+            result("profiled_pass", tp_proc=os.environ.get("ENGINE_TP_PROC", "0"), mode=mode, new_tokens=561, profiled_wall_ms=round(ms, 1), **_kernel_stats(path))
         except Exception as exc:  # noqa: BLE001
             result("profiled_pass", mode=mode, error=f"{type(exc).__name__}: {exc}")
     fast.reset(slot)
+    if args.parity:
+        _parity(gen, fast, pool, args.parity)
+    if proc:
+        result("proc_end", timeouts=fast.timeouts(), rank1_timeouts=fast.sync())
+        return 0
     # Today's eager all-reduce (two threads, host mailbox) at 8 KB and at one prefill's size.
     for rows, iters in ((2, 1000), (PREFILL_ROWS, 50)):
         xs = [torch.randn((rows, HIDDEN), device=m.embed.device).to(torch.bfloat16) for m in fast.ranks]
@@ -645,6 +656,59 @@ def passes(args) -> int:
     return 0
 
 
+def _parity(gen, fast, pool: list[int], n: int) -> None:
+    """Greedy tokens of 4 prompts: plain captured decode (``fast.prefill``/``fast.decode``)
+    and the speculative ``Generator`` path (prefix cache, snapshots, verify, flips)."""
+    import hashlib
+
+    import torch
+
+    from engine.protocol import Sampling
+
+    prompts = [pool[9973 * k : 9973 * k + length] for k, length in enumerate((1800, 610, 2500, 133))]
+    plain: list[list[int]] = []
+    lasts = []
+    for s, p in enumerate(prompts):
+        fast.reset(s)
+        logits = None
+        for begin, end, _ in gen._chunks(tuple(p), 0):
+            follow = p[end] if end < len(p) else None
+            logits = fast.prefill(s, p[begin:end], begin, follow)
+        lasts.append(int(torch.argmax(logits)))
+        plain.append([lasts[-1]])
+    for step in range(n - 1):
+        out = fast.decode(lasts, list(range(len(prompts))), [len(p) + step for p in prompts]).float()
+        lasts = out.argmax(-1).tolist()
+        for r in range(len(prompts)):
+            plain[r].append(lasts[r])
+    for s in range(len(prompts)):
+        fast.reset(s)
+    gens = [gen.start(tuple(p), Sampling(max_tokens=n, temperature=0.0, ignore_eos=True)) for p in prompts]
+    spec: list[list[int]] = [[] for _ in prompts]
+    live = list(range(len(prompts)))
+    while live:
+        waiting = []
+        for i in live:
+            while True:
+                step = gens[i].next_step()
+                spec[i].append(step.token_id)
+                if step.finish is not None:
+                    gens[i].retire()
+                    break
+                if not gens[i].has_queued():
+                    waiting.append(i)
+                    break
+        live = waiting
+        if live:
+            gen.decode([gens[i] for i in live])
+    gen._reclaim()
+    for r in range(len(prompts)):
+        result("parity_tokens", tp_proc=os.environ.get("ENGINE_TP_PROC", "0"), prompt=r, n=n,
+               spec_equals_plain=spec[r] == plain[r],
+               plain_sha=hashlib.sha1(str(plain[r]).encode()).hexdigest()[:12],
+               spec_sha=hashlib.sha1(str(spec[r]).encode()).hexdigest()[:12], plain=plain[r], spec=spec[r])
+
+
 # =============================================================================== all
 
 
@@ -681,12 +745,18 @@ def run_all(args) -> int:
     if "ipc" in args.parts:
         rows += _child([sys.executable, me, "ipc", "--timeout", "900"], env, 1000)
     if "passes" in args.parts:
-        rows += _child([sys.executable, me, "passes", "--reps", str(args.reps)], env, 5400)
+        for value in args.procs.split(","):
+            penv = dict(env)
+            if value:
+                penv["ENGINE_TP_PROC"] = value
+            rows += _child([sys.executable, me, "passes", "--reps", str(args.reps), "--modes", args.modes,
+                            "--parity", str(args.parity)], penv, 5400)
     by = defaultdict(list)
     for r in rows:
         by[r["kind"]].append(r)
     print("\n=== prefill pass wall (ms, median), 3,600-token context ===", flush=True)
-    walls = {(r["mode"], r["new_tokens"]): r["wall_ms_median"] for r in by["pass"]}
+    walls = {(r["mode"], r["new_tokens"]): r["wall_ms_median"] for r in by["pass"]
+             if r.get("tp_proc", "0") == "0"}
     print(f"{'new':>5} " + " ".join(f"{m:>13}" for m in MODES) + f" {'solo0/both':>10}")
     for new in NEW:
         both = walls.get(("both", new))
@@ -717,6 +787,24 @@ def run_all(args) -> int:
            threshold_ms=KILL_VERIFY_MS,
            verdict=("PASS (IPC works)" if ipc_ok else
                     "KILL" if added is None or added > KILL_VERIFY_MS else "PASS (RCCL fallback)"))
+    if any(r.get("tp_proc") == "1" for r in by["pass"]):
+        print("\n=== prefill pass wall (ms, median), 'both' mode: ENGINE_TP_PROC=0 vs 1 ===", flush=True)
+        procw = {(r["tp_proc"], r["new_tokens"]): r["wall_ms_median"] for r in by["pass"] if r["mode"] == "both"}
+        for new in NEW:
+            a, b = procw.get(("0", new)), procw.get(("1", new))
+            print(f"{new:>5} threads {a!s:>8} proc {b!s:>8} proc/threads "
+                  f"{(round(b / a, 3) if a and b else None)!s:>6}", flush=True)
+            result("proc_vs_threads", new_tokens=new, threads_ms=a, proc_ms=b,
+                   ratio=round(b / a, 3) if a and b else None)
+    if by["parity_tokens"]:
+        tok = {(r["tp_proc"], r["prompt"]): r for r in by["parity_tokens"]}
+        prompts = sorted({r["prompt"] for r in by["parity_tokens"]})
+        for p in prompts:
+            a, b = tok.get(("0", p)), tok.get(("1", p))
+            result("parity_vs_threads", prompt=p,
+                   proc_spec_equals_plain=b["spec_equals_plain"] if b else None,
+                   plain_same=(a["plain"] == b["plain"]) if a and b else None,
+                   spec_same=(a["spec"] == b["spec"]) if a and b else None)
     print(f"all: done in {time.time() - started:.0f} s", flush=True)
     return 0
 
@@ -728,10 +816,15 @@ def main() -> int:
     p_all.add_argument("--devices", default="0,1")
     p_all.add_argument("--reps", type=int, default=12)
     p_all.add_argument("--parts", default="ipc,passes")
+    p_all.add_argument("--procs", default="", help="ENGINE_TP_PROC values, one passes child each")
+    p_all.add_argument("--modes", default=",".join(MODES))
+    p_all.add_argument("--parity", type=int, default=0, help="greedy tokens per prompt (0: none)")
     p_ipc = sub.add_parser("ipc")
     p_ipc.add_argument("--timeout", type=int, default=900)
     p_pass = sub.add_parser("passes")
     p_pass.add_argument("--reps", type=int, default=12)
+    p_pass.add_argument("--modes", default=",".join(MODES))
+    p_pass.add_argument("--parity", type=int, default=0)
     args = parser.parse_args()
     if args.cmd == "all":
         return run_all(args)

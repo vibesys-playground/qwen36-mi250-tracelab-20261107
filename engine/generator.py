@@ -577,8 +577,10 @@ class Generator:
             try:
                 if use_tensor_parallel():
                     # ENGINE_TP=2: every layer split over the replica's two GPUs (plan 13).
-                    from engine.fast.tp import TPModel
+                    from engine.fast.tp import TPModel, proc_enabled
 
+                    if proc_enabled():  # ENGINE_TP_PROC=1: rank 1 in its own process (plan 30)
+                        from engine.fast.tp_proc import ProcTPModel as TPModel
                     fast = TPModel(lm, **fast_options)
                 else:
                     fast = FastModel(lm, **fast_options)

@@ -145,7 +145,7 @@ class _Device:
     """Per-device inputs of a decode step and the page table, kept at fixed addresses."""
 
     device: torch.device
-    packed: torch.Tensor  # [3, longest bucket]: tokens, slots, positions, filled by one copy
+    packed: torch.Tensor  # [4, longest bucket]: tokens, slots, positions, GDN rows; one copy
     page_table: torch.Tensor
 
     @property
@@ -159,6 +159,11 @@ class _Device:
     @property
     def positions(self) -> torch.Tensor:
         return self.packed[2]
+
+    @property
+    def gdn(self) -> torch.Tensor:
+        """Each row's Gated DeltaNet state row (its slot's current bank, see ``FastModel.bank``)."""
+        return self.packed[3]
 
 
 @dataclass
@@ -188,10 +193,10 @@ class _PackOnDevice:
     tables: list[torch.Tensor]  # per segment: its used pages, for attention
     spans: list[tuple[int, int, int]]  # per segment: first row, rows, keys after it
     single_rows: torch.Tensor | None  # rows of one-token segments
-    single_slots: torch.Tensor | None
+    single_slots: torch.Tensor | None  # (their Gated DeltaNet state rows, ``FastModel._g``)
     multi_rows: torch.Tensor | None  # rows of longer segments, in packed order
     multi_slots: torch.Tensor | None
-    multi_spans: list[tuple[int, int, int]]  # per longer segment: slot, first row in multi_rows, rows
+    multi_spans: list[tuple[int, int, int]]  # per longer segment: state row, first row in multi_rows, rows
     pad_index: torch.Tensor | None  # multi row j -> its index in [segments x longest]
     cu_seqlens: torch.Tensor | None  # [longer segments + 1] row offsets in the multi rows
     longest: int
@@ -219,15 +224,16 @@ class _PackPlan:
                 offsets.append(pos % PAGE)
             self.spans.append((row, count, total))
             self.used.append(table[: math.ceil(total / PAGE)])
+            state = model._g(slot)  # the slot's Gated DeltaNet state row
             if count == 1:
                 single_rows.append(row)
-                single_slots.append(slot)
+                single_slots.append(state)
             else:
                 index = len(multi_spans)
-                multi_spans.append((slot, len(multi_rows), count))
+                multi_spans.append((state, len(multi_rows), count))
                 pad_index.extend(range(index * longest, index * longest + count))
                 multi_rows.extend(range(row, row + count))
-                multi_slots.append(slot)
+                multi_slots.append(state)
             row += count
             last.append(row - 1)
         self.tokens = torch.tensor(tokens, dtype=torch.long)
@@ -278,6 +284,7 @@ class FastModel:
         use_triton: bool | None = None,
         use_graphs: bool | None = None,
         buckets: Sequence[int] = (1, 2, 4, 8, 16, 32),
+        mtp: torch.nn.Module | None = None,
     ) -> None:
         text = lm.model.language_model if hasattr(lm.model, "language_model") else lm.model
         cfg = text.config
@@ -314,11 +321,30 @@ class FastModel:
             "fused": self.use_triton and os.environ.get("ENGINE_FUSED", "1") == "1",
         }
         self.buckets = sorted(buckets)
-        self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
+        # The checkpoint's MTP head (``engine.mtp.MTPHead``) for self-speculative decoding
+        # (``verify``): an extra full-attention layer, index ``mtp_index``, on the lm_head's
+        # device, whose KV lives in the same pages as the model's (one more pool).
+        self.mtp = mtp
+        self.mtp_index = len(self.layers)
+        if mtp is not None:
+            mdev = mtp.fc.weight.device
+            if mdev != self.lm_head.device:
+                raise ValueError(f"the MTP head must sit on the lm_head's device {self.lm_head.device}")
+            # The head embeds its input token on its own device (a copy of the same table).
+            self.mtp_embed = self.embed if self.embed.device == mdev else self.embed.to(mdev)
+        # A verify step runs two rows per slot; any batch has at most one (two) rows per slot.
+        self._rows = max(max(self.buckets) * (2 if mtp is not None else 1), slots)
         inv_freq = text.rotary_emb.inv_freq.detach().float().cpu()
 
         # Per-layer state, allocated once on the layer's device.
         rows = slots + 1
+        # With the MTP head every slot has two banks of Gated DeltaNet state, rows ``slot`` and
+        # ``slot + rows``: a verify step runs its first token on the current bank and its draft
+        # on the other (a copy taken after the first token), so a rejected draft leaves the
+        # current bank exactly one token on and an accepted one flips ``bank[slot]``.
+        self.gdn_rows = rows
+        self.bank = [0] * rows
+        banks = 2 if mtp is not None else 1
         self.devices: dict[torch.device, _Device] = {}
         self.inv_freq: dict[torch.device, torch.Tensor] = {}
         self.gdn_state: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -329,16 +355,18 @@ class FastModel:
             if self.layer_types[i] == "linear_attention":
                 m = layer.linear_attn
                 conv = torch.zeros(
-                    (rows, m.conv_dim, m.conv_kernel_size), dtype=self.embed.dtype, device=dev
+                    (banks * rows, m.conv_dim, m.conv_kernel_size), dtype=self.embed.dtype, device=dev
                 )
                 rec = torch.zeros(
-                    (rows, m.num_v_heads, m.head_k_dim, m.head_v_dim),
+                    (banks * rows, m.num_v_heads, m.head_k_dim, m.head_v_dim),
                     dtype=torch.float32,
                     device=dev,
                 )
                 self.gdn_state[i] = (conv, rec)
             else:
                 attn_layers.append(i)
+        if mtp is not None:
+            attn_layers.append(self.mtp_index)
         for dev in (self.embed.device, self.final_norm.device, self.lm_head.device):
             self._device(dev, inv_freq)
 
@@ -346,7 +374,7 @@ class FastModel:
         self.pool = PagePool(pages)
         self.kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i in attn_layers:
-            m = self.layers[i].self_attn
+            m = self._attn_module(i)
             dev = m.k_proj.weight.device
             shape = (pages, cfg.num_key_value_heads, PAGE, m.head_dim)
             self.kv[i] = (
@@ -358,6 +386,8 @@ class FastModel:
         self.slot_pages[self.dummy].append(self.pool.alloc())
         self._push_table(self.dummy)
         self.segments = self._segments()
+        self.vsegments = self._segments(verify=True) if mtp is not None else []
+        self.last_drafts: torch.Tensor | None = None  # per prefill segment: the MTP head's draft
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
 
@@ -366,8 +396,9 @@ class FastModel:
     def _device(self, dev: torch.device, inv_freq: torch.Tensor) -> _Device:
         if dev not in self.devices:
             longest = self._rows
-            packed = torch.zeros((3, longest), dtype=torch.long, device=dev)
+            packed = torch.zeros((4, longest), dtype=torch.long, device=dev)
             packed[1].fill_(self.slots)
+            packed[3].fill_(self.slots)
             self.devices[dev] = _Device(
                 device=dev,
                 packed=packed,
@@ -384,13 +415,13 @@ class FastModel:
         need = self.max_pages + 1  # one full-length sequence plus the dummy page
         if kv_tokens is not None:
             return max(need, math.ceil(kv_tokens / PAGE) + 1)
-        head_dim = self.layers[attn_layers[0]].self_attn.head_dim if attn_layers else 1
+        head_dim = self._attn_module(attn_layers[0]).head_dim if attn_layers else 1
         page_bytes = 2 * cfg.num_key_value_heads * PAGE * head_dim * self.embed.element_size()
         if self.embed.device.type != "cuda":
             return need + 2 * self.slots
         per_device: dict[torch.device, int] = {}
         for i in attn_layers:
-            dev = self.layers[i].self_attn.k_proj.weight.device
+            dev = self._attn_module(i).k_proj.weight.device
             per_device[dev] = per_device.get(dev, 0) + 1
         fraction = float(os.environ.get("ENGINE_KV_FRACTION", "0.6"))
         reserve = int(float(os.environ.get("ENGINE_RESERVE_GB", "6")) * (1 << 30))
@@ -409,12 +440,18 @@ class FastModel:
             )
         return pages
 
-    def _segments(self) -> list[_Segment]:
+    def _attn_module(self, i: int) -> torch.nn.Module:
+        """Layer ``i``'s attention module; ``mtp_index`` is the MTP head's."""
+        if i == self.mtp_index:
+            return self.mtp.layers[0].self_attn
+        return self.layers[i].self_attn
+
+    def _segments(self, verify: bool = False) -> list[_Segment]:
         ops: list[tuple[torch.device, Callable]] = [(self.embed.device, self._embed_op)]
         for i in range(len(self.layers)):
-            ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i)))
+            ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i, verify)))
         ops.append((self.final_norm.device, self._norm_op))
-        ops.append((self.lm_head.device, self._head_op))
+        ops.append((self.lm_head.device, self._verify_head_op if verify else self._head_op))
         segments: list[_Segment] = []
         for dev, op in ops:
             if not segments or segments[-1].device != dev:
@@ -444,11 +481,23 @@ class FastModel:
         if grew:
             self._push_table(slot)
 
+    def _g(self, slot: int) -> int:
+        """The Gated DeltaNet state row that holds ``slot``'s current state."""
+        return slot + self.bank[slot] * self.gdn_rows
+
+    def flip(self, slot: int) -> None:
+        """Make ``slot``'s other bank current: after ``verify`` accepted its draft, or to undo
+        that (the bank left behind still holds the state one token earlier)."""
+        if self.mtp is None:
+            raise RuntimeError("only a model with the MTP head has two state banks")
+        self.bank[slot] ^= 1
+
     def reset(self, slot: int) -> None:
         """Release ``slot``'s pages and zero its recurrent and convolution state."""
         for page in self.slot_pages[slot]:
             self.pool.unref(page)
         self.slot_pages[slot] = []
+        self.bank[slot] = 0
         for conv, rec in self.gdn_state.values():
             conv[slot].zero_()
             rec[slot].zero_()
@@ -462,7 +511,8 @@ class FastModel:
 
     def snapshot(self, slot: int, length: int) -> Snapshot:
         """A copy of ``slot``'s state, which must cover exactly ``length`` tokens."""
-        gdn = [(conv[slot].clone(), rec[slot].clone()) for conv, rec in self.gdn_state.values()]
+        row = self._g(slot)
+        gdn = [(conv[row].clone(), rec[row].clone()) for conv, rec in self.gdn_state.values()]
         used = math.ceil(length / PAGE)
         own = self.slot_pages[slot][:used]
         full = length // PAGE
@@ -477,9 +527,10 @@ class FastModel:
 
     def restore(self, snap: Snapshot, slot: int) -> None:
         """Make ``slot`` (reset) hold ``snap``'s state."""
+        row = self._g(slot)
         for (conv, rec), (c, r) in zip(self.gdn_state.values(), snap.gdn, strict=True):
-            conv[slot].copy_(c)
-            rec[slot].copy_(r)
+            conv[row].copy_(c)
+            rec[row].copy_(r)
         full = snap.length // PAGE
         held = list(snap.pages)
         for page in held:  # held first: allocating below may evict ``snap`` itself
@@ -501,7 +552,8 @@ class FastModel:
         included (nothing writes the slot again before its reset), and clones
         the Gated DeltaNet states. The slot is left without pages.
         """
-        gdn = [(conv[slot].clone(), rec[slot].clone()) for conv, rec in self.gdn_state.values()]
+        row = self._g(slot)
+        gdn = [(conv[row].clone(), rec[row].clone()) for conv, rec in self.gdn_state.values()]
         used = math.ceil(length / PAGE)
         pages = self.slot_pages[slot]
         for page in pages[used:]:
@@ -518,9 +570,10 @@ class FastModel:
         """
         if snap.released:
             raise RuntimeError("adopting a released snapshot")
+        row = self._g(slot)
         for (conv, rec), (c, r) in zip(self.gdn_state.values(), snap.gdn, strict=True):
-            conv[slot].copy_(c)
-            rec[slot].copy_(r)
+            conv[row].copy_(c)
+            rec[row].copy_(r)
         for page in self.slot_pages[slot]:
             self.pool.unref(page)
         self.slot_pages[slot] = list(snap.pages)
@@ -603,24 +656,37 @@ class FastModel:
     def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         return F.linear(x, self.lm_head).float()
 
-    def _layer_op(self, i: int) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
+    def _layer_op(self, i: int, verify: bool = False) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
         def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
             batch = x.shape[0]
-            return self.layer_decode(i, x, meta.slots[:batch], meta.positions[:batch], meta)
+            return self.layer_decode(
+                i, x, meta.slots[:batch], meta.positions[:batch], meta, meta.gdn[:batch], verify
+            )
 
         return op
 
     def layer_decode(
-        self, i: int, x: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor, meta: _Device
+        self,
+        i: int,
+        x: torch.Tensor,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+        meta: _Device,
+        states: torch.Tensor | None = None,
+        verify: bool = False,
     ) -> torch.Tensor:
+        """One layer for one token per row; ``states`` are the rows' Gated DeltaNet state rows
+        (default ``slots``). With ``verify`` the rows are two halves, each slot's first token
+        then its draft (see ``verify``)."""
         layer = self.layers[i]
+        states = slots if states is None else states
         fused = self.triton_kernels["fused"]
         if fused:
             _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
         else:
             h = _rms(x, layer.input_layernorm.weight, self.eps)
         if self.layer_types[i] == "linear_attention":
-            h = self._gdn_decode(i, h, slots)
+            h = self._gdn_verify(i, h, states) if verify else self._gdn_decode(i, h, states)
         else:
             h = self._attn_decode(i, h, slots, positions, meta)
         if fused:
@@ -653,7 +719,7 @@ class FastModel:
             k = k.repeat_interleave(ratio, dim=1)
         return q, k, v, g, beta
 
-    def _gdn_out(self, m: torch.nn.Module, core: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def _gdn_gate(self, m: torch.nn.Module, core: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         tokens = core.shape[0]
         out = _gated_rms(
             core.reshape(-1, m.head_v_dim),
@@ -661,15 +727,43 @@ class FastModel:
             m.norm.weight,
             m.norm.variance_epsilon,
         )
-        return F.linear(out.reshape(tokens, -1), m.out_proj.weight)
+        return out.reshape(tokens, -1)
+
+    def _gdn_out(self, m: torch.nn.Module, core: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        return F.linear(self._gdn_gate(m, core, z), m.out_proj.weight)
 
     def _gdn_decode(self, i: int, x: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
         m = self.layers[i].linear_attn
-        conv_state, rec_state = self.gdn_state[i]
         qkv, z, b, a = self._gdn_project(m, x)
+        return F.linear(self._gdn_step(i, qkv, z, b, a, slots), m.out_proj.weight)
+
+    def _gdn_verify(self, i: int, x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        """A verify step's Gated DeltaNet layer: rows ``[:n]`` are each slot's first token on
+        its current state row, rows ``[n:]`` its draft on the other bank's row. The projections
+        run over all rows at once; the recurrence runs the first half in place, copies those
+        states to the second half's rows, then runs the second half there."""
+        m = self.layers[i].linear_attn
+        conv_state, rec_state = self.gdn_state[i]
+        n = x.shape[0] // 2
+        first, second = rows[:n], rows[n:]
+        qkv, z, b, a = self._gdn_project(m, x)
+        out_a = self._gdn_step(i, qkv[:n], z[:n], b[:n], a[:n], first)
+        conv_state.index_copy_(0, second, conv_state.index_select(0, first))
+        rec_state.index_copy_(0, second, rec_state.index_select(0, first))
+        out_b = self._gdn_step(i, qkv[n:], z[n:], b[n:], a[n:], second)
+        return F.linear(torch.cat((out_a, out_b)), m.out_proj.weight)
+
+    def _gdn_step(
+        self, i: int, qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """The recurrent step of projected inputs on state rows ``slots`` (in place), before
+        ``out_proj``."""
+        m = self.layers[i].linear_attn
+        conv_state, rec_state = self.gdn_state[i]
         if self.triton_kernels["fused"] and self.triton_kernels["gdn"]:
             mixed = kernels.gdn_conv_(conv_state, slots, qkv, m.conv1d.weight)
-            return F.linear(kernels.gdn_fused_(rec_state, slots, mixed, a, b, z, m), m.out_proj.weight)
+            return kernels.gdn_fused_(rec_state, slots, mixed, a, b, z, m)
         # Short causal convolution over the last ``kernel`` inputs (the slot's state holds them).
         window = torch.cat((conv_state.index_select(0, slots)[:, :, 1:], qkv.unsqueeze(-1)), dim=-1)
         conv_state.index_copy_(0, slots, window)
@@ -681,11 +775,11 @@ class FastModel:
         kf = hf.l2norm(k.float(), dim=-1, eps=1e-6)
         core = kernels.gdn_recurrent_(
             rec_state, slots, qf, kf, v.float(), g, beta.float(), use_triton=self.triton_kernels["gdn"]
-        ).to(x.dtype)
-        return self._gdn_out(m, core, z)
+        ).to(qkv.dtype)
+        return self._gdn_gate(m, core, z)
 
     def _qkv(self, i: int, x: torch.Tensor, positions: torch.Tensor):
-        m = self.layers[i].self_attn
+        m = self._attn_module(i)
         tokens = x.shape[0]
         qg = F.linear(x, m.q_proj.weight).view(tokens, -1, m.head_dim * 2)
         q, gate = torch.chunk(qg, 2, dim=-1)
@@ -751,8 +845,14 @@ class FastModel:
     # ---------------------------------------------------------------- prefill
 
     @torch.inference_mode()
-    def prefill(self, slot: int, ids: Sequence[int], start: int) -> torch.Tensor:
-        """Run ``ids`` at positions ``start``... into ``slot``; fp32 logits after the last one."""
+    def prefill(
+        self, slot: int, ids: Sequence[int], start: int, follow: int | None = None
+    ) -> torch.Tensor:
+        """Run ``ids`` at positions ``start``... into ``slot``; fp32 logits after the last one.
+
+        With the MTP head, the head also runs over the chunk (``_mtp_prefill``): ``follow``
+        is the token after the chunk, None for the greedy pick from the returned logits.
+        """
         count = len(ids)
         self._ensure_pages(slot, start + count)
         dev = self.embed.device
@@ -769,6 +869,13 @@ class FastModel:
             x = x + h
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
             x = x + self._moe(layer.mlp, h)
+        if self.mtp is not None:
+            hidden = _rms(x.to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
+            logits = F.linear(hidden[-1:], self.lm_head).float()
+            self._mtp_prefill(
+                hidden, [(slot, ids, start)], [follow], logits, _PackPlan(self, [(slot, ids, start)])
+            )
+            return logits[0]
         x = x[-1:].to(self.final_norm.device)
         x = _rms(x, self.final_norm, self.eps).to(self.lm_head.device)
         return F.linear(x, self.lm_head).float()[0]
@@ -776,6 +883,7 @@ class FastModel:
     def _gdn_prefill(self, i: int, x: torch.Tensor, slot: int) -> torch.Tensor:
         m = self.layers[i].linear_attn
         count = x.shape[0]
+        slot = self._g(slot)  # the state row
         if count == 1:  # Transformers' single-token path: the recurrent rule
             slots = torch.tensor([slot], device=x.device)
             return self._gdn_decode(i, x, slots)
@@ -841,8 +949,14 @@ class FastModel:
     # ---------------------------------------------------------------- packed prefill
 
     @torch.inference_mode()
-    def prefill_packed(self, segments: Sequence[tuple[int, Sequence[int], int]]) -> torch.Tensor:
+    def prefill_packed(
+        self,
+        segments: Sequence[tuple[int, Sequence[int], int]],
+        follows: Sequence[int | None] | None = None,
+    ) -> torch.Tensor:
         """Run several sequences' prefill chunks in one pass; fp32 logits [segments, vocab].
+
+        ``follows`` gives, per segment, ``prefill``'s ``follow`` (default: all None).
 
         Each segment ``(slot, ids, start)`` is what ``prefill(slot, ids, start)``
         would run, and leaves its slot in the same state. The segments' tokens
@@ -861,9 +975,10 @@ class FastModel:
             raise ValueError("a packed prefill holds at most one segment per slot")
         if any(len(ids) == 0 for _, ids, _ in segments):
             raise ValueError("an empty prefill segment")
+        follows = list(follows) if follows is not None else [None] * len(segments)
         if len(segments) == 1:
             slot, ids, start = segments[0]
-            return self.prefill(slot, ids, start)[None]
+            return self.prefill(slot, ids, start, follows[0])[None]
         for slot, ids, start in segments:
             self._ensure_pages(slot, start + len(ids))
         plan = _PackPlan(self, segments)
@@ -879,6 +994,11 @@ class FastModel:
             x = x + h
             h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
             x = x + self._moe(layer.mlp, h)
+        if self.mtp is not None:
+            hidden = _rms(x.to(self.final_norm.device), self.final_norm, self.eps).to(self.lm_head.device)
+            logits = F.linear(hidden.index_select(0, plan.on(hidden.device).last), self.lm_head).float()
+            self._mtp_prefill(hidden, segments, follows, logits, plan)
+            return logits
         x = x.index_select(0, plan.on(x.device).last).to(self.final_norm.device)
         x = _rms(x, self.final_norm, self.eps).to(self.lm_head.device)
         return F.linear(x, self.lm_head).float()
@@ -977,6 +1097,155 @@ class FastModel:
         out = out * torch.sigmoid(gate)
         return F.linear(out, m.o_proj.weight)
 
+    # ---------------------------------------------------------------- MTP head
+
+    def _mtp_layer(self, z: torch.Tensor, attend: Callable[[torch.Tensor], torch.Tensor], decode: bool):
+        """The head's decoder layer (gated full attention by ``attend``, then the MoE)."""
+        layer = self.mtp.layers[0]
+        h = _rms(z, layer.input_layernorm.weight, self.eps)
+        z = z + attend(h)
+        h = _rms(z, layer.post_attention_layernorm.weight, self.eps)
+        return z + self._moe(layer.mlp, h, decode=decode)
+
+    def _mtp_in(self, hidden: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """``fc(cat(norm(embed(x[t+1])), norm(H[t])))``: embedding first (``engine.mtp``)."""
+        m = self.mtp
+        e = _rms(F.embedding(tokens, self.mtp_embed), m.pre_fc_norm_embedding.weight, self.eps)
+        h = _rms(hidden, m.pre_fc_norm_hidden.weight, self.eps)
+        return F.linear(torch.cat((e, h), dim=-1), m.fc.weight)
+
+    def _mtp_logits(self, z: torch.Tensor) -> torch.Tensor:
+        return F.linear(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
+
+    def _mtp_prefill(
+        self,
+        hidden: torch.Tensor,
+        segments: Sequence[tuple[int, Sequence[int], int]],
+        follows: Sequence[int | None],
+        logits: torch.Tensor,
+        plan: _PackPlan,
+    ) -> None:
+        """Run the MTP head over a prefill pass: at each position ``i`` the pair ``(H[i],
+        x[i+1])``, writing the head's KV into the slot's pages, so later drafts attend to the
+        whole context. A segment's last pair takes its ``follow`` token, or (None) the greedy
+        pick from its ``logits`` row. Sets ``last_drafts``: per segment, the head's guess of
+        the token after that one."""
+        dev = hidden.device
+        nxt: list[int] = []
+        picked: list[tuple[int, int]] = []  # (row, segment) whose next token is the greedy pick
+        for k, ((_, ids, _), follow) in enumerate(zip(segments, follows, strict=True)):
+            nxt.extend(ids[1:])
+            if follow is None:
+                picked.append((len(nxt), k))
+            nxt.append(0 if follow is None else follow)
+        tokens = torch.tensor(nxt, dtype=torch.long, device=dev)
+        if picked:
+            rows = torch.tensor([r for r, _ in picked], dtype=torch.long, device=dev)
+            segs = torch.tensor([k for _, k in picked], dtype=torch.long, device=dev)
+            tokens.index_copy_(0, rows, logits.index_select(0, segs).argmax(-1))
+        on = plan.on(dev)
+        z = self._mtp_layer(
+            self._mtp_in(hidden, tokens),
+            lambda h: self._attn_prefill_packed(self.mtp_index, h, on),
+            decode=False,
+        )
+        self.last_drafts = self._mtp_logits(z.index_select(0, on.last)).argmax(-1)
+
+    def _mtp_decode(self, hidden: torch.Tensor, tokens: torch.Tensor, meta: _Device) -> torch.Tensor:
+        """The head on one pair per row at the rows' positions; its greedy guess per row."""
+        n = hidden.shape[0]
+        slots, positions = meta.slots[:n], meta.positions[:n]
+        z = self._mtp_layer(
+            self._mtp_in(hidden, tokens),
+            lambda h: self._attn_decode(self.mtp_index, h, slots, positions, meta),
+            decode=True,
+        )
+        return self._mtp_logits(z).argmax(-1)
+
+    def _verify_head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
+        """The verify step's last op: logits from the normed hidden ``x``, each row's greedy
+        pick, and the MTP head on (hidden, pick) per row. Leaves ``[2, rows]`` (picks, drafts)
+        in ``_verify_out``; returns the logits."""
+        logits = F.linear(x, self.lm_head).float()
+        picks = logits.argmax(-1)
+        self._verify_out = torch.stack((picks, self._mtp_decode(x, picks, meta)))
+        return logits
+
+    @torch.inference_mode()
+    def verify(
+        self,
+        tokens: Sequence[int],
+        drafts: Sequence[int],
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> tuple[torch.Tensor, list[int], list[int], list[int], list[int]]:
+        """One self-speculative step: each slot's last token at its position and its draft
+        after it, in one forward (two rows per slot), then the MTP head on both.
+
+        Returns (fp32 logits after each first token ``[batch, vocab]``, the greedy pick after
+        each first token ``g1``, after each draft ``g2``, the head's next draft if the draft
+        is rejected ``d1`` and if accepted ``d2``). The slot's current Gated DeltaNet bank is
+        left one token on; the other bank two tokens on: ``flip`` it when ``g1`` equals the
+        draft. Attention KV is written at both positions; a rejected draft's entry lies past
+        the slot's length and is overwritten by the next step. The logits may be a graph's
+        static output: read them before the next call.
+        """
+        if self.mtp is None:
+            raise RuntimeError("verify needs the MTP head")
+        batch = len(tokens)
+        for slot, position in zip(slots, positions, strict=True):
+            self._ensure_pages(slot, position + 2)
+        size = self.bucket(batch) if self.use_graphs else batch
+        rows = 2 * size
+        host = torch.zeros((4, self._rows), dtype=torch.long)
+        host[1].fill_(self.dummy)
+        host[3].fill_(self.dummy)
+        host[3, size:rows] = self.dummy + self.gdn_rows
+        cur = [self._g(s) for s in slots]
+        other = [s + (1 - self.bank[s]) * self.gdn_rows for s in slots]
+        for half, toks, pos, states in (
+            (0, tokens, positions, cur),
+            (size, drafts, [p + 1 for p in positions], other),
+        ):
+            host[0, half : half + batch] = torch.tensor(list(toks), dtype=torch.long)
+            host[1, half : half + batch] = torch.tensor(list(slots), dtype=torch.long)
+            host[2, half : half + batch] = torch.tensor(list(pos), dtype=torch.long)
+            host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
+        for meta in self.devices.values():
+            meta.packed.copy_(host)
+        logits, out = self._run(self.vsegments, size, rows, verify=True)
+        picks = out.cpu().tolist()
+        g, d = picks[0], picks[1]
+        return (
+            logits[:batch],
+            g[:batch],
+            g[size : size + batch],
+            d[:batch],
+            d[size : size + batch],
+        )
+
+    def _run(
+        self, segments: list[_Segment], size: int, rows: int, verify: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Replay ``segments``' graphs for bucket ``size`` (capturing them first), or run them
+        eagerly over ``rows`` rows; the last segment's output (and a verify's picks)."""
+        if self.use_graphs and self.graph_error is None:
+            if size not in segments[0].graphs:
+                self.capture(size, verify)
+            if self.graph_error is None:
+                x = None
+                for seg in segments:
+                    with torch.cuda.device(seg.device):
+                        if x is not None:
+                            seg.inputs[size].copy_(x)
+                        seg.graphs[size].replay()
+                        x = seg.outputs[size]
+                return x, (self._verify_static[size] if verify else None)
+        x = self.devices[self.embed.device].tokens[:rows]
+        for seg in segments:
+            x = seg.run(x.to(seg.device), self.devices[seg.device])
+        return x, (self._verify_out if verify else None)
+
     # ---------------------------------------------------------------- decode
 
     def bucket(self, batch: int) -> int:
@@ -997,33 +1266,19 @@ class FastModel:
         for slot, position in zip(slots, positions, strict=True):
             self._ensure_pages(slot, position + 1)
         size = self.bucket(batch) if self.use_graphs else batch
-        pad = size - batch
-        longest = self._rows
-        host = torch.zeros((3, longest), dtype=torch.long)
+        host = torch.zeros((4, self._rows), dtype=torch.long)
         host[1].fill_(self.dummy)
+        host[3].fill_(self.dummy)
         host[0, :batch] = torch.tensor(list(tokens), dtype=torch.long)
         host[1, :batch] = torch.tensor(list(slots), dtype=torch.long)
         host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
+        host[3, :batch] = torch.tensor([self._g(s) for s in slots], dtype=torch.long)
         for meta in self.devices.values():
             meta.packed.copy_(host)
-        if self.use_graphs and self.graph_error is None:
-            if size not in self.segments[0].graphs:
-                self.capture(size)
-            if self.graph_error is None:
-                x = None
-                for seg in self.segments:
-                    with torch.cuda.device(seg.device):
-                        if x is not None:
-                            seg.inputs[size].copy_(x)
-                        seg.graphs[size].replay()
-                        x = seg.outputs[size]
-                return x[:batch]
-        x = self.devices[self.embed.device].tokens[:size]
-        for seg in self.segments:
-            x = seg.run(x.to(seg.device), self.devices[seg.device])
+        x, _ = self._run(self.segments, size, size)
         return x[:batch]
 
-    def capture(self, size: int) -> None:
+    def capture(self, size: int, verify: bool = False) -> None:
         """Capture every segment's graph for batch ``size``; on failure record why and run eagerly.
 
         Capture modes are tried in turn (``ENGINE_CAPTURE_MODES``): "global"
@@ -1036,7 +1291,7 @@ class FastModel:
             modes = os.environ.get("ENGINE_CAPTURE_MODES", "global,thread_local,relaxed").split(",")
         errors = []
         for mode in modes:
-            error = self._capture(size, mode)
+            error = self._capture(size, mode, verify)
             if error is None:
                 self._capture_modes = [mode]
                 self.capture_mode = mode
@@ -1045,17 +1300,22 @@ class FastModel:
             errors.append(f"{mode}: {error}")
         self.graph_error = " | ".join(errors)
 
-    def _capture(self, size: int, mode: str) -> str | None:
+    def _capture(self, size: int, mode: str, verify: bool = False) -> str | None:
+        segments = self.vsegments if verify else self.segments
+        rows = 2 * size if verify else size
         try:
             meta0 = self.devices[self.embed.device]
             for meta in self.devices.values():
-                meta.slots[:size].fill_(self.dummy)
-                meta.positions[:size].zero_()
-            x = meta0.tokens[:size]
-            for seg in self.segments:
+                meta.slots[:rows].fill_(self.dummy)
+                meta.positions[:rows].zero_()
+                meta.gdn[:rows].fill_(self.dummy)
+                if verify:
+                    meta.gdn[size:rows].fill_(self.dummy + self.gdn_rows)
+            x = meta0.tokens[:rows]
+            for seg in segments:
                 with torch.cuda.device(seg.device):
                     meta = self.devices[seg.device]
-                    static_in = x if seg is self.segments[0] else x.to(seg.device).clone()
+                    static_in = x if seg is segments[0] else x.to(seg.device).clone()
                     # One side stream per device, also passed to torch.cuda.graph: its default
                     # capture stream is a process-wide singleton made on the first device, so
                     # a segment on another GPU would be captured on a foreign stream.
@@ -1079,10 +1339,12 @@ class FastModel:
                         out = seg.run(static_in, meta)
                     seg.inputs[size], seg.outputs[size], seg.graphs[size] = static_in, out, graph
                     x = out
+            if verify:
+                self.__dict__.setdefault("_verify_static", {})[size] = self._verify_out
             for dev in self.devices:
                 torch.cuda.synchronize(dev)
         except Exception as exc:  # noqa: BLE001 - any capture failure falls back to eager
-            for seg in self.segments:
+            for seg in self.segments + self.vsegments:
                 seg.graphs.clear()
                 seg.inputs.clear()
                 seg.outputs.clear()
@@ -1107,10 +1369,14 @@ class FastModel:
             pools[dev] = torch.cuda.graph_pool_handle()
         return pools[dev]
 
-    def capture_all(self) -> None:
-        """Capture every bucket, largest first so the graphs share one memory pool per device."""
+    def capture_all(self, decode: bool = True, verify: bool = True) -> None:
+        """Capture every bucket, largest first so the graphs share one memory pool per device:
+        the decode steps' and (with the MTP head) the verify steps'."""
         if not self.use_graphs:
             return
-        for size in sorted(self.buckets, reverse=True):
-            if self.graph_error is None and size not in self.segments[0].graphs:
-                self.capture(size)
+        kinds = [k for k, on in ((True, verify and self.mtp is not None), (False, decode)) if on]
+        for is_verify in kinds:
+            segments = self.vsegments if is_verify else self.segments
+            for size in sorted(self.buckets, reverse=True):
+                if self.graph_error is None and size not in segments[0].graphs:
+                    self.capture(size, is_verify)

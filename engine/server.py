@@ -124,6 +124,17 @@ class Worker:
         job.events.put(_DONE)
         return None
 
+    @classmethod
+    def _advance_all(
+        cls, job: Job, events: Iterator[Any], send: Generation | None = None
+    ) -> AwaitDecode | Prefill | None:
+        """``_advance``, repeated while the request's next token is already picked (a verify
+        step of ``engine.speculative`` emits two), so it waits only for a real decode step."""
+        want = cls._advance(job, events, send)
+        while isinstance(want, AwaitDecode) and want.generation.has_queued():
+            want = cls._advance(job, events)
+        return want
+
     @staticmethod
     def _fail(job: Job, events: Iterator[Any], exc: Exception) -> None:
         job.events.put(exc if isinstance(exc, RequestError) else _internal(exc))
@@ -167,11 +178,11 @@ class Worker:
                             ready.append((job, events, result))
             waiting = []
             for job, events in running:
-                want = self._advance(job, events)
+                want = self._advance_all(job, events)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
             for job, events, generation in ready:
-                want = self._advance(job, events, generation)
+                want = self._advance_all(job, events, generation)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
             # Unpacked: each new job is prefilled and emits its first token before the next
@@ -182,7 +193,7 @@ class Worker:
                 except Exception as exc:  # noqa: BLE001 - this request only
                     self._fail(job, events, exc)
                     continue
-                want = self._advance(job, events, generation)
+                want = self._advance_all(job, events, generation)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
             running = [(job, events) for job, events, _ in waiting]

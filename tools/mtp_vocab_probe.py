@@ -118,9 +118,13 @@ def main() -> None:
                 seg.inputs.clear()
                 seg.outputs.clear()
             m.__dict__.pop("_verify_static", None)
+            # Dropping a pool's last graphs frees the pool: capturing into its handle again
+            # trips the HIP caching allocator's assert, so the next capture takes a new pool.
+            m.__dict__.pop("_pools", None)
         fast.set_draft_vocab(subsets[n])
         sync()
-        torch.cuda.empty_cache()
+        if fast.graph_error is not None:
+            raise SystemExit(f"graphs are off ({fast.graph_error}): eager step times mean nothing")
 
     def prefill(slot: int, prompt: list[int]) -> torch.Tensor:
         fast.reset(slot)
@@ -144,13 +148,14 @@ def main() -> None:
     # ---------------------------------------------------------------- 1. step time
     slots = [0, 1, 2, 3]
     prompts = [corpus[9973 * k : 9973 * k + args.prompt_len] for k in range(4)]
-    use(sizes[0])
     lasts = [int(torch.argmax(prefill(s, p))) for s, p in zip(slots, prompts, strict=True)]
     length = args.prompt_len
     drafts = [0, 0, 0, 0]
     for batch in (1, 2, 4):
         dec = median_ms(lambda: fast.decode(lasts[:batch], slots[:batch], [length] * batch).argmax(-1).cpu(), args.iters)
         print(f"RESULT decode B={batch} decode_ms={dec:.3f}", flush=True)
+    if fast.graph_error is not None:
+        raise SystemExit(f"graphs are off ({fast.graph_error}): eager step times mean nothing")
     times: dict[tuple[int, int], list[float]] = {}
     for rnd in range(args.rounds):
         order = sizes if rnd % 2 == 0 else list(reversed(sizes))

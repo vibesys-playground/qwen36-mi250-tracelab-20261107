@@ -312,6 +312,8 @@ class FastModel:
             "attn": self.use_triton,
             # Fused launches: residual add + RMSNorm, and the whole DeltaNet step.
             "fused": self.use_triton and os.environ.get("ENGINE_FUSED", "1") == "1",
+            # Whole decode layers in a few launches (``engine.fast.fused``, ENGINE_FUSED_DECODE).
+            "fused_decode": False,
         }
         self.buckets = sorted(buckets)
         self._rows = max(max(self.buckets), slots)  # a batch has at most one row per slot
@@ -358,6 +360,17 @@ class FastModel:
         self.slot_pages[self.dummy].append(self.pool.alloc())
         self._push_table(self.dummy)
         self.segments = self._segments()
+        self.fused = None
+        self.fused_error: str | None = None
+        if self.use_triton and (on_gpu or kernels.INTERPRET):
+            from engine.fast import fused
+
+            if fused.enabled():
+                try:
+                    self.fused = fused.FusedDecode(self)
+                    self.triton_kernels["fused_decode"] = True
+                except Exception as exc:  # noqa: BLE001 - the per-op decode path still serves
+                    self.fused_error = f"{type(exc).__name__}: {exc}"
         self.graph_error: str | None = None
         self.capture_mode: str | None = None
 
@@ -613,6 +626,12 @@ class FastModel:
     def layer_decode(
         self, i: int, x: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor, meta: _Device
     ) -> torch.Tensor:
+        if (
+            self.fused is not None
+            and self.triton_kernels["fused_decode"]
+            and x.shape[0] <= self.fused.max_rows
+        ):
+            return self.fused.layer(i, x, slots, positions, meta)
         layer = self.layers[i]
         fused = self.triton_kernels["fused"]
         if fused:

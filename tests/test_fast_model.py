@@ -78,6 +78,18 @@ def _close(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).abs().max() / b.float().abs().max())
 
 
+def _assert_top1(logits: torch.Tensor, ref: torch.Tensor) -> None:
+    """The same top-1 token, unless the reference's top two are within two BF16 ulps (a tie
+    that a one-ulp difference in a BF16 projection may break either way)."""
+    got = int(torch.argmax(logits))
+    want = int(torch.argmax(ref))
+    if got == want:
+        return
+    top = float(ref[want])
+    ulp = 2.0 ** (torch.floor(torch.log2(torch.tensor(abs(top)))).item() - 7)
+    assert float(ref[got]) >= top - 2 * ulp, (got, want, float(ref[got]), top)
+
+
 @pytest.mark.parametrize("length", [1, 5, 13, 70])
 def test_fast_prefill_and_decode_match_transformers(generator: Generator, length: int) -> None:
     prompt = [(7 * i + 3) % 300 + 5 for i in range(length)]
@@ -89,7 +101,7 @@ def test_fast_prefill_and_decode_match_transformers(generator: Generator, length
     for step, token in enumerate(tokens):
         logits = fast.decode([token], [0], [length + step])[0]
         assert _close(logits, hf_logits[step + 1]) < 0.03, step
-        assert int(torch.argmax(logits)) == int(torch.argmax(hf_logits[step + 1]))
+        _assert_top1(logits, hf_logits[step + 1])
 
 
 def test_batched_decode_matches_each_sequence_alone(generator: Generator) -> None:

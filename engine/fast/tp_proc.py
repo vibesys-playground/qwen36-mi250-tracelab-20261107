@@ -759,8 +759,15 @@ class ProcTPModel(tpm.TPModel):
         def put_pooled(t: torch.Tensor, dev: torch.device) -> torch.Tensor:
             if dev != dev1:
                 return put(t, dev)
-            with torch.cuda.use_mem_pool(pool, device=dev):
-                out = torch.empty(tuple(t.shape), dtype=t.dtype, device=dev)
+            # The pool cannot reuse blocks the default pool caches (the checkpoint's own copies
+            # on ``dev``, freed as the shard is made: 26 GiB in j162); on a miss, hand those back.
+            try:
+                with torch.cuda.use_mem_pool(pool, device=dev):
+                    out = torch.empty(tuple(t.shape), dtype=t.dtype, device=dev)
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                with torch.cuda.use_mem_pool(pool, device=dev):
+                    out = torch.empty(tuple(t.shape), dtype=t.dtype, device=dev)
             out.copy_(t.detach())
             return out
 

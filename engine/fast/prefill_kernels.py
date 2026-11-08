@@ -45,57 +45,91 @@ if triton is not None:
 
     # ------------------------------------------------------------------------------ attention
 
-    @triton.jit(do_not_specialize=["T", "start"])
+    @triton.jit(do_not_specialize=["T", "start", "PER", "SPLITS"])
     def _prefill_attn_kernel(
-        q_ptr, k_ptr, v_ptr, table_ptr, gate_ptr, out_ptr, T, start, scale,
+        q_ptr, k_pool_ptr, v_ptr, table_ptr, acc_ptr, ml_ptr, T, start, scale, PER, SPLITS,
         stride_page, stride_head, stride_tok,
         QH: tl.constexpr, GROUP: tl.constexpr, BLOCK_R: tl.constexpr, D: tl.constexpr,
         PAGE: tl.constexpr, WIDEN: tl.constexpr,
     ):
-        """Rows ``[tile * BLOCK_R, +BLOCK_R)`` x the GROUP query heads of one KV head."""
+        """Rows [tile * BLOCK_R, +BLOCK_R) x the GROUP query heads of one KV head, over the
+        tile's causal keys in pages [split * PER, +PER): unnormalized fp32 partial output
+        with its running max and sum (flash-decoding's split, combined by
+        ``_prefill_attn_combine_kernel``)."""
         tile = tl.program_id(0)
-        kvh = tl.program_id(1)
+        split = tl.program_id(1)
+        kvh = tl.program_id(2)
         M: tl.constexpr = BLOCK_R * GROUP
         mi = tl.arange(0, M)
         r = tile * BLOCK_R + mi // GROUP
         head = kvh * GROUP + mi % GROUP
         r_ok = r < T
         d = tl.arange(0, D)
-        qo = (r.to(tl.int64) * QH + head)[:, None] * D + d[None, :]
-        q = tl.load(q_ptr + qo, mask=r_ok[:, None], other=0.0)
+        q = tl.load(q_ptr + (r.to(tl.int64) * QH + head)[:, None] * D + d[None, :], mask=r_ok[:, None], other=0.0)
         if WIDEN:
             q = q.to(tl.float32)
         q_pos = start + r
         end = start + tl.minimum(tile * BLOCK_R + BLOCK_R, T)  # keys [0, end) for this tile
+        first = split * PER
+        last = tl.minimum(first + PER, tl.cdiv(end, PAGE))
         m = tl.full([M], float("-inf"), dtype=tl.float32)
         l = tl.zeros([M], dtype=tl.float32)
         acc = tl.zeros([M, D], dtype=tl.float32)
         t = tl.arange(0, PAGE)
-        pages = tl.cdiv(end, PAGE)
-        for p in range(0, pages):
+        for p in range(first, last):
             page = tl.load(table_ptr + p).to(tl.int64)
             k_pos = p * PAGE + t
             k_ok = k_pos < end
             offs = page * stride_page + kvh * stride_head + t[:, None] * stride_tok + d[None, :]
-            keys = tl.load(k_ptr + offs, mask=k_ok[:, None], other=0.0)
+            keys = tl.load(k_pool_ptr + offs, mask=k_ok[:, None], other=0.0)
+            values = tl.load(v_ptr + offs, mask=k_ok[:, None], other=0.0)
             if WIDEN:
                 keys = keys.to(tl.float32)
             s = tl.dot(q, tl.trans(keys)) * scale
             s = tl.where(k_pos[None, :] <= q_pos[:, None], s, float("-inf"))
             m_new = tl.maximum(m, tl.max(s, axis=1))
-            alpha = tl.exp(m - m_new)
-            prob = tl.exp(s - m_new[:, None])
+            # A row with no key in this page so far keeps m = -inf: guard the exponents.
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tl.exp(m - m_safe)
+            prob = tl.exp(s - m_safe[:, None])
             l = l * alpha + tl.sum(prob, axis=1)
-            values = tl.load(v_ptr + offs, mask=k_ok[:, None], other=0.0)
             if WIDEN:
                 acc = acc * alpha[:, None] + tl.dot(_bf16(prob, WIDEN), values.to(tl.float32))
             else:
                 acc = acc * alpha[:, None] + tl.dot(prob.to(values.dtype), values)
             m = m_new
-        o = _bf16(acc / l[:, None], WIDEN)  # SDPA's BF16 output
-        g = tl.load(gate_ptr + qo, mask=r_ok[:, None], other=0.0).to(tl.float32)
-        sig = _bf16(tl.sigmoid(g), WIDEN)  # torch.sigmoid on BF16
-        tl.store(out_ptr + qo, _bf16(o * sig, WIDEN).to(tl.bfloat16), mask=r_ok[:, None])
+        rows = (r.to(tl.int64) * QH + head) * SPLITS + split
+        tl.store(acc_ptr + rows[:, None] * D + d[None, :], acc, mask=r_ok[:, None])
+        tl.store(ml_ptr + rows * 2, m, mask=r_ok)
+        tl.store(ml_ptr + rows * 2 + 1, l, mask=r_ok)
+
+    @triton.jit(do_not_specialize=["ROWS", "SPLITS"])
+    def _prefill_attn_combine_kernel(
+        acc_ptr, ml_ptr, gate_ptr, out_ptr, ROWS, SPLITS, D: tl.constexpr,
+        BLOCK: tl.constexpr, WIDEN: tl.constexpr,
+    ):
+        """Per (row, head): merge the splits' partials, round to BF16 (SDPA's output), times
+        sigmoid(gate) rounded to BF16, rounded again (the eager ``out * sigmoid(gate)``)."""
+        rh = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        ok = rh < ROWS
+        d = tl.arange(0, D)
+        top = tl.full([BLOCK], float("-inf"), dtype=tl.float32)
+        for sp in range(0, SPLITS):
+            top = tl.maximum(top, tl.load(ml_ptr + (rh * SPLITS + sp) * 2, mask=ok, other=0.0))
+        num = tl.zeros([BLOCK, D], dtype=tl.float32)
+        den = tl.zeros([BLOCK], dtype=tl.float32)
+        for sp in range(0, SPLITS):
+            m = tl.load(ml_ptr + (rh * SPLITS + sp) * 2, mask=ok, other=0.0)
+            w = tl.where(m == float("-inf"), 0.0, tl.exp(m - top))
+            den += w * tl.load(ml_ptr + (rh * SPLITS + sp) * 2 + 1, mask=ok, other=0.0)
+            part = tl.load(acc_ptr + (rh * SPLITS + sp).to(tl.int64)[:, None] * D + d[None, :], mask=ok[:, None], other=0.0)
+            num += w[:, None] * part
+        den = tl.where(ok, den, 1.0)
+        o = _bf16(num / den[:, None], WIDEN)
+        offs = rh.to(tl.int64)[:, None] * D + d[None, :]
+        g = tl.load(gate_ptr + offs, mask=ok[:, None], other=0.0).to(tl.float32)
+        sig = _bf16(tl.sigmoid(g), WIDEN)
+        tl.store(out_ptr + offs, _bf16(o * sig, WIDEN).to(tl.bfloat16), mask=ok[:, None])
 
     # ------------------------------------------------------------------------ residual + norm
 
@@ -312,6 +346,10 @@ def attention_supported(q: torch.Tensor, k_pool: torch.Tensor) -> bool:
     )
 
 
+ATTN_PROGRAMS = int(os.environ.get("ENGINE_PREFILL_ATTN_PROGRAMS", "1024"))
+MAX_SPLITS = 32
+
+
 def prefill_attention(
     q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
     start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None,
@@ -322,19 +360,31 @@ def prefill_attention(
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads
-    # Rows per program: enough programs for the GPU at a few rows, M = rows x group >= 16.
-    rows = 2 if count < 256 else 4
-    rows = max(rows, 16 // group)
+    # Rows per program (M = rows x group >= 16 for the dot), then the context split into
+    # SPLITS page ranges so that ~ATTN_PROGRAMS programs run: several per compute unit, which
+    # hides the latency of each page's dependent loads. Both depend on the shape alone (the
+    # split count is a runtime argument: no compile per count).
+    rows = max(2 if count < 256 else 4, 16 // group)
+    tiles = triton.cdiv(count, rows)
+    pages = triton.cdiv(start + count, page)
+    splits = max(1, min(MAX_SPLITS, pages, triton.cdiv(ATTN_PROGRAMS, tiles * heads)))
+    per = triton.cdiv(pages, splits)
     if out is None:
         out = torch.empty((count, q_heads * dim), dtype=q.dtype, device=q.device)
     assert k_pool.stride() == v_pool.stride()
     q = q.contiguous()
     gate = gate.contiguous()
+    acc = torch.empty((count * q_heads * splits, dim), dtype=torch.float32, device=q.device)
+    ml = torch.empty((count * q_heads * splits, 2), dtype=torch.float32, device=q.device)
     with on_device(q):
-        _prefill_attn_kernel[(triton.cdiv(count, rows), heads)](
-            q, k_pool, v_pool, table, gate, out, count, start, scale,
+        _prefill_attn_kernel[(tiles, splits, heads)](
+            q, k_pool, v_pool, table, acc, ml, count, start, scale, per, splits,
             k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
-            QH=q_heads, GROUP=group, BLOCK_R=rows, D=dim, PAGE=page, WIDEN=_WIDEN,
+            QH=q_heads, GROUP=group, BLOCK_R=rows, D=dim, PAGE=page, WIDEN=_WIDEN, num_warps=4,
+        )
+        block = 16
+        _prefill_attn_combine_kernel[(triton.cdiv(count * q_heads, block),)](
+            acc, ml, gate, out, count * q_heads, splits, D=dim, BLOCK=block, WIDEN=_WIDEN,
             num_warps=4,
         )
     return out

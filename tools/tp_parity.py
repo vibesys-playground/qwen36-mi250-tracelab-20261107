@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("ref", "check"), required=True)
+    parser.add_argument("--mode", choices=("ref", "check", "repeat"), required=True)
     parser.add_argument("--out", default="/tmp/tp_ref.pt")
     parser.add_argument("--ref", default="/tmp/tp_ref.pt")
     parser.add_argument("--steps", type=int, default=96)
@@ -56,7 +56,7 @@ def main() -> None:
             position = end
         return fast.prefill(slot, prompt[body:], body)
 
-    if args.mode == "ref":
+    if args.mode in ("ref", "repeat"):
         ids: list[int] = []
         i = 0
         while len(ids) < 9973 * 4 + 20000:
@@ -81,64 +81,71 @@ def main() -> None:
     else:
         saved = torch.load(args.ref)
         prompts = saved["prompts"]
-    groups = [list(range(0, 4)), list(range(4, 8))]
-    record = {"prompts": prompts, "inputs": {}, "picks": {}, "margins": {}}
-    agree = total = 0
-    close_misses = []
-    free_identical = []
-    for group in groups:
-        first = []
-        for slot, k in enumerate(group):
-            logits = prefill(slot, prompts[k]).float()
-            first.append(logits)
-        lasts = [int(x.argmax()) for x in first]
-        inputs = {k: [] for k in group}
-        picks = {k: [lasts[j]] for j, k in enumerate(group)}
-        margins = {k: [float(torch.topk(first[j], 2).values.diff().abs())] for j, k in enumerate(group)}
-        if args.mode == "check":
-            ref_picks = saved["picks"]
-            for j, k in enumerate(group):
-                total += 1
-                agree += int(lasts[j] == ref_picks[k][0])
-            feed = [saved["inputs"][k] for k in group]
-        for step in range(args.steps):
-            tokens = lasts if args.mode == "ref" else [feed[j][step] for j in range(len(group))]
-            out = fast.decode(tokens, list(range(len(group))), [len(prompts[k]) + step for k in group]).float()
-            top = torch.topk(out, 2, dim=-1).values
-            lasts = out.argmax(-1).tolist()
-            for j, k in enumerate(group):
-                inputs[k].append(tokens[j])
-                picks[k].append(lasts[j])
-                margins[k].append(float(top[j, 0] - top[j, 1]))
-                if args.mode == "check":
-                    want = saved["picks"][k][step + 1]
+    if args.mode != "check":
+        saved = None
+    # ``repeat``: the reference and the check in this one process (greedy repeatability).
+    for mode in (["ref", "check"] if args.mode == "repeat" else [args.mode]):
+        groups = [list(range(0, 4)), list(range(4, 8))]
+        record = {"prompts": prompts, "inputs": {}, "picks": {}, "margins": {}}
+        agree = total = 0
+        close_misses = []
+        free_identical = []
+        for group in groups:
+            first = []
+            for slot, k in enumerate(group):
+                logits = prefill(slot, prompts[k]).float()
+                first.append(logits)
+            lasts = [int(x.argmax()) for x in first]
+            inputs = {k: [] for k in group}
+            picks = {k: [lasts[j]] for j, k in enumerate(group)}
+            margins = {k: [float(torch.topk(first[j], 2).values.diff().abs())] for j, k in enumerate(group)}
+            if mode == "check":
+                ref_picks = saved["picks"]
+                for j, k in enumerate(group):
                     total += 1
-                    if lasts[j] == want:
-                        agree += 1
-                    else:
-                        close_misses.append(round(saved["margins"][k][step + 1], 4))
-        for k in group:
-            record["inputs"][k] = inputs[k]
-            record["picks"][k] = picks[k]
-            record["margins"][k] = margins[k]
-            if args.mode == "check":
-                ref = saved["picks"][k]
-                n = 0  # free-running: the pick equals the reference and every earlier one did
-                while n < len(ref) and picks[k][n] == ref[n] and (n == 0 or inputs[k][n - 1] == ref[n - 1]):
-                    n += 1
-                free_identical.append(n)
-        for slot in range(len(group)):
-            fast.reset(slot)
-    if args.mode == "ref":
-        torch.save(record, args.out)
-        print(f"RESULT ref saved prompts={len(prompts)} steps={args.steps} "
-              f"lengths={[len(p) for p in prompts]}", flush=True)
-    else:
-        print(f"RESULT teacher_forced top1_pct={100.0 * agree / total:.2f} ({agree}/{total}) "
-              f"ref_margin_at_misses={sorted(close_misses)[:20]}", flush=True)
-        print(f"RESULT identical_greedy_prefix={free_identical} of {args.steps + 1}", flush=True)
-        if hasattr(fast, "timeouts"):
-            print(f"RESULT tp_allreduce_timeouts={fast.timeouts()}", flush=True)
+                    agree += int(lasts[j] == ref_picks[k][0])
+                feed = [saved["inputs"][k] for k in group]
+            for step in range(args.steps):
+                tokens = lasts if mode == "ref" else [feed[j][step] for j in range(len(group))]
+                out = fast.decode(tokens, list(range(len(group))), [len(prompts[k]) + step for k in group]).float()
+                top = torch.topk(out, 2, dim=-1).values
+                lasts = out.argmax(-1).tolist()
+                for j, k in enumerate(group):
+                    inputs[k].append(tokens[j])
+                    picks[k].append(lasts[j])
+                    margins[k].append(float(top[j, 0] - top[j, 1]))
+                    if mode == "check":
+                        want = saved["picks"][k][step + 1]
+                        total += 1
+                        if lasts[j] == want:
+                            agree += 1
+                        else:
+                            close_misses.append(round(saved["margins"][k][step + 1], 4))
+            for k in group:
+                record["inputs"][k] = inputs[k]
+                record["picks"][k] = picks[k]
+                record["margins"][k] = margins[k]
+                if mode == "check":
+                    ref = saved["picks"][k]
+                    n = 0  # free-running: the pick equals the reference and every earlier one did
+                    while n < len(ref) and picks[k][n] == ref[n] and (n == 0 or inputs[k][n - 1] == ref[n - 1]):
+                        n += 1
+                    free_identical.append(n)
+            for slot in range(len(group)):
+                fast.reset(slot)
+        if mode == "ref":
+            torch.save(record, args.out)
+            print(f"RESULT ref saved prompts={len(prompts)} steps={args.steps} "
+                  f"lengths={[len(p) for p in prompts]}", flush=True)
+        else:
+            print(f"RESULT teacher_forced top1_pct={100.0 * agree / total:.2f} ({agree}/{total}) "
+                  f"ref_margin_at_misses={sorted(close_misses)[:20]}", flush=True)
+            print(f"RESULT identical_greedy_prefix={free_identical} of {args.steps + 1}", flush=True)
+            if hasattr(fast, "timeouts"):
+                print(f"RESULT tp_allreduce_timeouts={fast.timeouts()}", flush=True)
+
+        if mode == "ref" and args.mode == "repeat":
+            saved = record
 
 
 if __name__ == "__main__":

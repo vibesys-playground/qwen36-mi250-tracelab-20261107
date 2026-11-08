@@ -707,7 +707,7 @@ class FastModel:
         Triton RMSNorm, whose result for a row does not depend on how many rows run."""
 
         def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
-            if self._fused_rows(x.shape[0], verify):
+            if self._fused_head(x.shape[0], verify):
                 with kernels.on_device(x):
                     return kernels.add_rms(x, None, self.final_norm, self.eps)[1]
             return self._norm_op(x, meta)
@@ -719,10 +719,17 @@ class FastModel:
         lm_head runs through the fused GEMV, whose sum order is the same for every row count
         (``engine.fast.fused``), so a slot's logits are the same in a decode step and in a
         verify step; else ``F.linear`` (BF16 out, as the GEMV)."""
-        if self._fused_rows(x.shape[0], verify):
+        if self._fused_head(x.shape[0], verify):
             with kernels.on_device(x):
-                return self.fused.gemv(x, self.lm_head).float()
+                return self.fused.head(x, self.lm_head).float()
         return F.linear(x, self.lm_head).float()
+
+    def _fused_head(self, rows: int, verify: bool) -> bool:
+        """Whether a step's final norm and lm_head run through the fused kernels
+        (``ENGINE_FUSED_HEAD``, default on, for steps the fused layers serve)."""
+        from engine.fast import fused
+
+        return fused.HEAD and self._fused_rows(rows, verify)
 
     def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         return self._logits(x)

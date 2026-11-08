@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from engine import looptimers
 from engine.protocol import Sampling
 
 if TYPE_CHECKING:
@@ -85,6 +86,9 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
         [g.length for g in generations],
     )
     generator.verify_steps += 1
+    timed = looptimers.ENABLED
+    if timed:
+        t0 = looptimers.now()
     for i, g in enumerate(generations):
         g.flipped = False
         if not g.speculates:
@@ -106,6 +110,8 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
                 continue
         g.length += 1
         g.draft = d1[i]
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
 
 
 def settle(generator: Generator, g: Generation, slot: int | None) -> None:

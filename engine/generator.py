@@ -481,6 +481,10 @@ class Generator:
         self.eos_ids = eos_ids
         self.max_model_len = max_model_len
         self._chunk = chunk_tokens
+        # Fast path: a prompt whose uncached part is at most this many tokens runs as ONE
+        # prefill pass (last token included); 0 restores chunk-aligned passes plus a separate
+        # last-token pass (``_chunks``).
+        self._one_pass_max = int(os.environ.get("ENGINE_PREFILL_ONE_PASS_MAX", "4096"))
         self.fast = fast
         self._prefix_cache: PrefixCache | FastPrefixCache
         if fast is None:
@@ -653,8 +657,30 @@ class Generator:
         return self.fast is not None and os.environ.get("ENGINE_PREFILL_PACK", "1") != "0"
 
     def _chunks(self, prompt: tuple[int, ...], start: int) -> list[tuple[int, int, bool]]:
-        """``_prefill_fast``'s passes as (begin, end, snapshot after) spans."""
-        body = len(prompt) - 1
+        """``_prefill_fast``'s passes as (begin, end, snapshot after) spans.
+
+        With ``ENGINE_PREFILL_ONE_PASS_MAX`` (default 4096) above 0, an uncached part of at
+        most that many tokens is one span, the last token included: one pass and no
+        snapshot (a multi-round session resumes from its session tail). A longer one runs
+        in spans ending at multiples of the chunk size, the last running to the end of the
+        prompt, with a snapshot after the last chunk boundary before the end (reused by a
+        repeat of the prompt, at a length independent of where a reuse began). With 0:
+        spans end at multiples of the chunk size, then the last token runs alone, with
+        snapshots after the last boundary and after all but the last token.
+        """
+        n = len(prompt)
+        if self._one_pass_max > 0:
+            if n - start <= self._one_pass_max:
+                return [(start, n, False)]
+            last_boundary = ((n - 1) // self._chunk) * self._chunk
+            spans = []
+            position = start
+            while position < n:
+                end = min((position // self._chunk + 1) * self._chunk, n)
+                spans.append((position, end, end == last_boundary))
+                position = end
+            return spans
+        body = n - 1
         last_boundary = (body // self._chunk) * self._chunk
         spans = []
         position = start
@@ -663,7 +689,7 @@ class Generator:
             store = (end == last_boundary and end != body) or end == body
             spans.append((position, end, store))
             position = end
-        spans.append((body, len(prompt), False))
+        spans.append((body, n, False))
         return spans
 
     def _validate(self, prompt: tuple[int, ...], sampling: Sampling) -> int:
@@ -712,7 +738,10 @@ class Generator:
         self._reclaim()
         if self._free_slots:
             other = self._free_slots[-2] if self.packing and len(self._free_slots) > 1 else None
-            self.fast.warmup(self._free_slots[-1], self._chunk, token_ids, other)
+            # One-pass prefill runs spans up to ``_one_pass_max`` tokens: warm the bucketed
+            # conv and prefill-expert shapes up to that length too.
+            longest = max(self._chunk, self._one_pass_max)
+            self.fast.warmup(self._free_slots[-1], longest, token_ids, other)
 
     def _reclaim(self) -> None:
         while self._released:
@@ -778,20 +807,17 @@ class Generator:
         return generation
 
     def _prefill_fast(self, prompt: tuple[int, ...], start: int, slot: int) -> torch.Tensor:
-        """``prefill``'s chunks and snapshots, into ``slot``."""
-        body = len(prompt) - 1
-        last_boundary = (body // self._chunk) * self._chunk
-        position = start
-        while position < body:
-            end = min((position // self._chunk + 1) * self._chunk, body)
-            # ``prompt[end]`` follows the chunk (for the MTP head's last pair; ``end < body``).
-            self.fast.prefill(slot, prompt[position:end], position, prompt[end])
-            position = end
-            if position == last_boundary and position != body:
-                self._prefix_cache.store(prompt[:position], slot)
-        if body > start:
-            self._prefix_cache.store(prompt[:body], slot)
-        return self.fast.prefill(slot, prompt[body:], body)
+        """``prefill``'s passes (``_chunks``) and snapshots, into ``slot``; the last logits."""
+        logits = None
+        for begin, end, store in self._chunks(prompt, start):
+            # ``prompt[end]`` follows the span (for the MTP head's last pair), None at the end.
+            follow = prompt[end] if end < len(prompt) else None
+            logits = self.fast.prefill(slot, prompt[begin:end], begin, follow)
+            self.prefill_passes += 1
+            self.prefill_segments += 1
+            if store:
+                self._prefix_cache.store(prompt[:end], slot)
+        return logits
 
     def _decode_fast(self, generations: list[Generation]) -> None:
         if self.fast.mtp is not None:

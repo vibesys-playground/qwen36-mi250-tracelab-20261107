@@ -12,7 +12,9 @@ new tokens, so the prefix cache is exercised. Prompt text is the source of the
 installed Transformers package (nothing from the benchmark). It prints, per
 setting, output tokens/s over the wall time, TPOT and TTFT percentiles, cached
 prompt tokens and /health, then (for two settings) how many requests produced
-identical tokens in both. A hint for the lead, not the task's metric.
+identical tokens in both. ``--corpus synthetic`` uses the replay's own synthetic
+code lines instead of the Transformers source. A hint for the lead, not the
+task's metric.
 """
 
 from __future__ import annotations
@@ -33,11 +35,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def token_pool(model: str, revision: str | None, need: int) -> list[int]:
+def token_pool(model: str, revision: str | None, need: int, corpus: str = "source") -> list[int]:
     import transformers
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model, revision=revision)
+    if corpus == "synthetic":
+        # The TraceLab replay's token pool: Request Factory's synthetic coding lines (two per
+        # index, a fixed nonce here), each tokenized without special tokens, concatenated.
+        ids = []
+        index = 0
+        while len(ids) < need:
+            for line in (f"def case_{index}(items):", f"    return sorted(set(items))  # {index} 0f3a9c"):
+                ids.extend(tok.encode(line, add_special_tokens=False))
+            index += 1
+        return ids
     files = sorted(Path(transformers.__file__).parent.glob("models/*/modeling_*.py"))
     ids: list[int] = []
     for f in files:
@@ -178,6 +190,12 @@ def main() -> None:
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
     parser.add_argument(
+        "--corpus",
+        choices=("source", "synthetic"),
+        default="source",
+        help="prompt text: the installed Transformers source, or the replay's synthetic code lines",
+    )
+    parser.add_argument(
         "--settings",
         default="ENGINE_REPLICAS=4,ENGINE_REPLICAS=2,ENGINE_REPLICAS=1",
         help="comma-separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
@@ -188,7 +206,7 @@ def main() -> None:
     model = args.model or CHECKPOINT["model"]
     revision = None if args.model else CHECKPOINT["revision"]
     need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
-    pool = token_pool(model, revision, need)
+    pool = token_pool(model, revision, need, args.corpus)
     print(json.dumps({"event": "shape", **vars(args)}), flush=True)
     outputs = {}
     for setting in args.settings.split(","):

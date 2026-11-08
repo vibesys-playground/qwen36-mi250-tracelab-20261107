@@ -559,7 +559,8 @@ class Generator:
                 fast = FastModel(
                     lm,
                     slots=int(os.environ.get("ENGINE_SLOTS", "32")),
-                    max_len=options["max_model_len"],
+                    # A verify step writes its draft one position past the last token.
+                    max_len=options["max_model_len"] + (1 if head is not None else 0),
                     mtp=head,
                 )
             except FastPathUnavailable as exc:

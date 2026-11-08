@@ -9,21 +9,24 @@ copies per layer). This module computes only the real rows and never reads
 expert ids or counts on the host:
 
 1. Bookkeeping on the device: ``argsort`` of the pairs' expert ids, per-expert
-   counts by ``scatter_add_`` into a fixed ``[experts]`` buffer, their
-   exclusive cumulative sum (each expert's first sorted row) and the cumulative
-   number of ``BLOCK_M``-row tiles per expert.
+   counts by ``scatter_add_`` into a fixed ``[experts]`` buffer, then
+   ``_tiles_kernel``: each expert's first sorted row and a table
+   of the ``BLOCK_M``-row tiles (expert, first row, row end) and their number.
 2. ``_gate_up_kernel``: one program per (tile, block of ``moe_intermediate``
    columns). The grid holds the most tiles any routing can need
    (``ceil(pairs / BLOCK_M) + experts``, known from the token count alone); a
-   program finds its expert by a binary search over the cumulative tile counts
-   and returns at once when its tile is past the last one. It gathers its rows
-   of ``x`` by token, multiplies them by the expert's gate and up rows in place
-   and writes ``silu(gate) * up`` in sorted order.
+   program reads its tile from the table and returns at once when its tile is
+   past the last one. It gathers its rows of ``x`` by token, multiplies them by
+   the expert's gate and up rows in place and writes ``silu(gate) * up`` in
+   sorted order.
 3. ``_down_kernel``: the same tiling over ``hidden`` columns; it multiplies by
-   the expert's ``down_proj`` and writes each row, times its routing weight in
-   fp32, at the pair's own (unsorted) index, so a token's ``top_k`` rows are
-   adjacent and one ``sum`` combines them. No atomics: the result does not
-   depend on scheduling, so greedy decoding stays repeatable.
+   the expert's ``down_proj`` and writes each row (BF16) at the pair's own
+   (unsorted) index, so a token's ``top_k`` rows are adjacent; the combine
+   applies the routing weights in fp32 and sums them. No atomics: the result
+   does not depend on scheduling, so greedy decoding stays repeatable.
+
+The tile shapes come from ``config``: a few buckets of the mean rows per
+expert, i.e. of the token count alone (graph-capturable per bucket).
 
 Rounding follows the padded batched matmul it replaces: projections, the SiLU
 and its product with ``up`` and the down projection are rounded to BF16, the
@@ -39,6 +42,7 @@ powers of two or multiples of 128); ``supported`` says when it applies.
 from __future__ import annotations
 
 import os
+from typing import NamedTuple
 
 import torch
 from torch.nn import functional as F
@@ -85,39 +89,54 @@ if triton is not None:
         else:
             return x.to(tl.bfloat16).to(tl.float32)
 
-    @triton.jit
-    def _find_tile(t, tile_ends_ptr, counts_ptr, starts_ptr, E: tl.constexpr, LOG_E: tl.constexpr, BLOCK_M: tl.constexpr):
-        """Expert of tile ``t`` (smallest e with tile_ends[e] > t), its first row and row end."""
-        lo = t * 0
-        hi = lo + E
-        for _ in tl.static_range(LOG_E + 1):
-            mid = (lo + hi) // 2
-            v = tl.load(tile_ends_ptr + tl.minimum(mid, E - 1))
-            go_left = v > t
-            hi = tl.where(go_left, mid, hi)
-            lo = tl.where(go_left, lo, mid + 1)
-        e = tl.minimum(lo, E - 1)
-        count = tl.load(counts_ptr + e)
-        start = tl.load(starts_ptr + e)
-        first_tile = tl.load(tile_ends_ptr + e) - (count + BLOCK_M - 1) // BLOCK_M
-        row0 = start + (t - first_tile) * BLOCK_M
-        return e, row0, start + count
+    @triton.jit(do_not_specialize=["MAX_TILES"])
+    def _tiles_kernel(
+        counts_ptr, starts_ptr, cursor_ptr, table_ptr, MAX_TILES, E: tl.constexpr, BLOCK_M: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Grid ``cdiv(MAX_TILES, BLOCK_T)``; each program recomputes the per-expert prefix sums
+        (E values) and fills BLOCK_T entries of the tile table the GEMM kernels read: for tile
+        t, table[t] = expert, table[MAX_TILES + t] = first row, table[2 * MAX_TILES + t] = row
+        end; table[3 * MAX_TILES] = the number of tiles. Program 0 also writes each expert's
+        first sorted row (``starts``, and a copy in ``cursor`` for ``_expert_order_kernel``).
+        A GEMM program finds its tile with three independent loads instead of a binary search;
+        the tiles are the same."""
+        pid = tl.program_id(0)
+        e = tl.arange(0, E)
+        c = tl.load(counts_ptr + e)
+        st = tl.cumsum(c, axis=0) - c
+        n = (c + BLOCK_M - 1) // BLOCK_M
+        tend = tl.cumsum(n, axis=0)
+        tstart = tend - n
+        total = tl.sum(n, axis=0)
+        if pid == 0:
+            tl.store(starts_ptr + e, st)
+            tl.store(cursor_ptr + e, st)
+            tl.store(table_ptr + 3 * MAX_TILES, total)
+        t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+        # The tile's expert: the first e with tend[e] > t (tend is non-decreasing).
+        ex = tl.sum((tend[None, :] <= t[:, None]).to(tl.int32), axis=1)
+        sel = e[None, :] == ex[:, None]
+        row_start = tl.sum(tl.where(sel, st[None, :], 0), axis=1)
+        first = tl.sum(tl.where(sel, tstart[None, :], 0), axis=1)
+        count = tl.sum(tl.where(sel, c[None, :], 0), axis=1)
+        ok = t < total
+        tl.store(table_ptr + t, ex, mask=ok)
+        tl.store(table_ptr + MAX_TILES + t, row_start + (t - first) * BLOCK_M, mask=ok)
+        tl.store(table_ptr + 2 * MAX_TILES + t, row_start + count, mask=ok)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["MAX_TILES"])
     def _gate_up_kernel(
         x_ptr,
         w_ptr,
         order_ptr,
-        tile_ends_ptr,
-        counts_ptr,
-        starts_ptr,
+        table_ptr,
         act_ptr,
         stride_we,
         stride_wn,
+        MAX_TILES,
         H: tl.constexpr,
         I: tl.constexpr,
-        E: tl.constexpr,
-        LOG_E: tl.constexpr,
         TOP_K: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -127,9 +146,11 @@ if triton is not None:
         """act[r, n] = silu(x_t . Wg[e, n]) * (x_t . Wu[e, n]) for sorted row r = pair of token t."""
         t = tl.program_id(0)
         nb = tl.program_id(1)
-        if t >= tl.load(tile_ends_ptr + E - 1):
+        if t >= tl.load(table_ptr + 3 * MAX_TILES):
             return
-        e, row0, row_end = _find_tile(t, tile_ends_ptr, counts_ptr, starts_ptr, E, LOG_E, BLOCK_M)
+        e = tl.load(table_ptr + t)
+        row0 = tl.load(table_ptr + MAX_TILES + t)
+        row_end = tl.load(table_ptr + 2 * MAX_TILES + t)
         rows = row0 + tl.arange(0, BLOCK_M)
         row_ok = rows < row_end
         pairs = tl.load(order_ptr + rows, mask=row_ok, other=0)
@@ -160,33 +181,33 @@ if triton is not None:
         out = act_ptr + rows.to(tl.int64)[:, None] * I + cols[None, :]
         tl.store(out, _bf16(act * up, WIDEN).to(tl.bfloat16), mask=row_ok[:, None])
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["MAX_TILES"])
     def _down_kernel(
         act_ptr,
         w_ptr,
-        wt_ptr,
         order_ptr,
-        tile_ends_ptr,
-        counts_ptr,
-        starts_ptr,
+        table_ptr,
         out_ptr,
         stride_we,
         stride_wn,
+        MAX_TILES,
         H: tl.constexpr,
         I: tl.constexpr,
-        E: tl.constexpr,
-        LOG_E: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         WIDEN: tl.constexpr,
     ):
-        """out[p, n] = w_p * bf16(act[r] . Wd[e, n]) in fp32, at pair p = order[r]."""
+        """out[p, n] = bf16(act[r] . Wd[e, n]) (BF16) at pair p = order[r]. The routing weight is
+        applied by the combine, in fp32: w * bf16 is exact in fp32, so the summands are the
+        ones ``bf16(acc) * w`` stored in fp32 would give, with half the bytes."""
         t = tl.program_id(0)
         nb = tl.program_id(1)
-        if t >= tl.load(tile_ends_ptr + E - 1):
+        if t >= tl.load(table_ptr + 3 * MAX_TILES):
             return
-        e, row0, row_end = _find_tile(t, tile_ends_ptr, counts_ptr, starts_ptr, E, LOG_E, BLOCK_M)
+        e = tl.load(table_ptr + t)
+        row0 = tl.load(table_ptr + MAX_TILES + t)
+        row_end = tl.load(table_ptr + 2 * MAX_TILES + t)
         rows = row0 + tl.arange(0, BLOCK_M)
         row_ok = rows < row_end
         cols = nb * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -203,31 +224,86 @@ if triton is not None:
             a_ptrs += BLOCK_K
             w_ptrs += BLOCK_K
         pairs = tl.load(order_ptr + rows, mask=row_ok, other=0)
-        weight = tl.load(wt_ptr + pairs, mask=row_ok, other=0.0).to(tl.float32)
-        val = _bf16(acc, WIDEN) * weight[:, None]
         out = out_ptr + pairs.to(tl.int64)[:, None] * H + cols[None, :]
-        tl.store(out, val, mask=row_ok[:, None])
+        tl.store(out, _bf16(acc, WIDEN).to(tl.bfloat16), mask=row_ok[:, None])
 
 
-# Tile shape: BLOCK_M rows, gate_up BLOCK_N/BLOCK_K, down BLOCK_N/BLOCK_K, warps, stages.
-# Measured on an MI210 (gfx90a, job j76) over the real routing of four Qwen3.6 layers and a
-# skewed one, 64 to 4096 tokens, against eight other shapes (BLOCK_M 16-128, BLOCK_N 64/128,
-# BLOCK_K 64/128, 4/8 warps): fastest summed over the layers with real routing at every size,
-# within 6% of the fastest with skewed routing from 700 tokens up (0.29 ms behind over four
-# layers at 64 skewed tokens). ``ENGINE_MOE_GROUPED_CFG``
-# overrides it: "BM,BN1,BK1,BN2,BK2,warps,stages".
-DEFAULT_CONFIG = (64, 64, 128, 64, 128, 4, 2)
+class KernelConfig(NamedTuple):
+    """One GEMM kernel's launch: BLOCK_N, BLOCK_K, warps, stages, and the AMD knobs
+    ``matrix_instr_nonkdim`` and ``waves_per_eu`` (0: the compiler's choice)."""
+
+    bn: int
+    bk: int
+    warps: int
+    stages: int
+    nonkdim: int = 0
+    waves: int = 0
 
 
-def config(pairs: int, experts: int) -> tuple[int, int, int, int, int, int, int]:
-    """Tile shape for ``pairs`` (token, expert) rows over ``experts``; from the shape alone."""
+class Config(NamedTuple):
+    """BLOCK_M (shared: one tile table) and the two GEMM kernels' launches."""
+
+    bm: int
+    gate_up: KernelConfig
+    down: KernelConfig
+
+
+# Tile shapes by mean routed rows per expert (pairs / experts), from the token count alone so a
+# captured graph per token bucket replays the same launches. Tuned in plan 38 (job j180) on one
+# MI250 GCD with the TP2 shard (gate_up [256, 512, 2048], down [256, 2048, 256]) and the real
+# routing of all 40 layers (replay-like and natural text, 61/561/1,650/2,300 new tokens): the
+# fastest per bucket, every output bitwise equal to the earlier DEFAULT_CONFIG
+# (64, 64,128, 64,128, 4 warps, 2 stages) since BLOCK_K stays 128. Upper bound (rows per
+# expert, inclusive) -> config; the last bucket has no bound.
+BUCKETS: tuple[tuple[float, Config], ...] = (
+    (4.0, Config(16, KernelConfig(64, 128, 4, 2), KernelConfig(256, 128, 4, 1, 16, 2))),  # <= 128 tokens at 8 of 256
+    (32.0, Config(64, KernelConfig(64, 128, 4, 1), KernelConfig(256, 128, 8, 1))),  # <= 1,024 tokens
+    (float("inf"), Config(64, KernelConfig(128, 128, 4, 1, 16, 2), KernelConfig(128, 128, 4, 1, 16, 0))),
+)
+
+
+def config(pairs: int, experts: int) -> Config:
+    """Tile shapes for ``pairs`` (token, expert) rows over ``experts``; from the shape alone.
+    ``ENGINE_MOE_GROUPED_CFG`` = "BM,BN1,BK1,BN2,BK2,warps,stages" overrides it (both kernels,
+    no AMD knobs)."""
     override = os.environ.get("ENGINE_MOE_GROUPED_CFG")
     if override:
         values = tuple(int(v) for v in override.split(","))
         if len(values) != 7:
             raise ValueError("ENGINE_MOE_GROUPED_CFG needs BM,BN1,BK1,BN2,BK2,warps,stages")
-        return values  # type: ignore[return-value]
-    return DEFAULT_CONFIG
+        bm, bn1, bk1, bn2, bk2, warps, stages = values
+        return Config(bm, KernelConfig(bn1, bk1, warps, stages), KernelConfig(bn2, bk2, warps, stages))
+    rows = pairs / max(1, experts)
+    for bound, cfg in BUCKETS:
+        if rows <= bound:
+            return cfg
+    return BUCKETS[-1][1]
+
+
+def bucket_tokens(top_k: int, experts: int, limit: int) -> list[int]:
+    """One token count (at most ``limit``) in each bucket that ``config`` can pick: what to warm."""
+    out = []
+    lo = 0.0
+    for bound, _ in BUCKETS:
+        tokens = int(lo * experts) // top_k + 1
+        if tokens <= limit:
+            out.append(tokens)
+        lo = bound
+    return out
+
+
+def launch_options(k: KernelConfig) -> dict:
+    """``num_warps`` / ``num_stages`` and, on ROCm only, the AMD backend's knobs."""
+    opts = {"num_warps": k.warps, "num_stages": k.stages}
+    if torch.version.hip and not INTERPRET:
+        if k.nonkdim:
+            opts["matrix_instr_nonkdim"] = k.nonkdim
+        if k.waves:
+            opts["waves_per_eu"] = k.waves
+    return opts
+
+
+TILE_BLOCK = 32  # tiles per step of ``_tiles_kernel``
 
 
 def _aligned(dim: int) -> bool:
@@ -264,37 +340,36 @@ def moe_prefill(
     experts, two_i, hidden = gate_up.shape
     inter = two_i // 2
     pairs = tokens * top_k
-    bm, bn1, bk1, bn2, bk2, warps, stages = config(pairs, experts)
-    bn1, bk2 = min(bn1, inter), min(bk2, inter)
-    bk1, bn2 = min(bk1, hidden), min(bn2, hidden)
+    cfg = config(pairs, experts)
+    bm = cfg.bm
+    bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
+    bn2, bk2 = min(cfg.down.bn, hidden), min(cfg.down.bk, inter)
     dev = x.device
     x = x.contiguous()
     ids = top_k_index.reshape(-1)
     order = torch.argsort(ids, stable=True).to(torch.int32)
     counts = torch.zeros(experts, dtype=torch.int32, device=dev)
     counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
-    ends = torch.cumsum(counts, 0, dtype=torch.int32)
-    starts = ends - counts
-    tile_ends = torch.cumsum((counts + (bm - 1)) // bm, 0, dtype=torch.int32)
-    weights = top_k_weights.reshape(-1).contiguous()
+    meta = torch.empty((2, experts), dtype=torch.int32, device=dev)
     max_tiles = triton.cdiv(pairs, bm) + experts
-    log_e = max(1, (experts - 1).bit_length())
+    table = torch.empty(3 * max_tiles + 1, dtype=torch.int32, device=dev)
     act = torch.empty((pairs, inter), dtype=torch.bfloat16, device=dev)
-    out = torch.empty((pairs, hidden), dtype=torch.float32, device=dev)
+    out = torch.empty((pairs, hidden), dtype=torch.bfloat16, device=dev)
     with on_device(x):
+        _tiles_kernel[(triton.cdiv(max_tiles, TILE_BLOCK),)](counts, meta[0], meta[1], table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=TILE_BLOCK)
         _gate_up_kernel[(max_tiles, triton.cdiv(inter, bn1))](
-            x, gate_up, order, tile_ends, counts, starts, act,
-            gate_up.stride(0), gate_up.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e, TOP_K=top_k,
-            BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            x, gate_up, order, table, act, gate_up.stride(0), gate_up.stride(1), max_tiles,
+            H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
+            **launch_options(cfg.gate_up),
         )
         _down_kernel[(max_tiles, triton.cdiv(hidden, bn2))](
-            act, down, weights, order, tile_ends, counts, starts, out,
-            down.stride(0), down.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e,
-            BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            act, down, order, table, out, down.stride(0), down.stride(1), max_tiles,
+            H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN,
+            **launch_options(cfg.down),
         )
-    return out.view(tokens, top_k, hidden).sum(dim=1).to(x.dtype)
+    # The routing weight in fp32 (exact on two BF16 values), the top_k rows summed in fp32.
+    weighted = out.float() * top_k_weights.reshape(-1, 1).float()
+    return weighted.view(tokens, top_k, hidden).sum(dim=1).to(x.dtype)
 
 
 def enabled() -> bool:

@@ -734,10 +734,14 @@ class FastModel:
             seen.add(key)
             num, _, hidden = gate_up.shape
             shapes = {}
-            tokens = DECODE_EXPERT_TOKENS + 1
-            while tokens <= 2 * max(chunk, DECODE_EXPERT_TOKENS + 1):
+            limit = 2 * max(chunk, DECODE_EXPERT_TOKENS + 1)
+            counts = [DECODE_EXPERT_TOKENS + 1]
+            while counts[-1] * 2 <= limit:
+                counts.append(counts[-1] * 2)
+            # Every bucket ``config`` can pick, even one narrower than a doubling.
+            counts += [t for t in moe_prefill.bucket_tokens(self.top_k, num, limit) if t > DECODE_EXPERT_TOKENS]
+            for tokens in counts:
                 shapes.setdefault(moe_prefill.config(tokens * self.top_k, num), tokens)
-                tokens *= 2
             for tokens in shapes.values():
                 x = torch.zeros((tokens, hidden), dtype=gate_up.dtype, device=gate_up.device)
                 ids = torch.arange(tokens * self.top_k, device=gate_up.device) % num

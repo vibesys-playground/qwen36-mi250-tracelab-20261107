@@ -49,6 +49,9 @@ BM = 16  # the fixed row tile
 # Step 0 (j183, TP2 GCD 2,3, served verify_chain B=2): bitwise over 1000 graph replays x 3
 # layers x R 1-32; 9.155 -> 8.809 ms (k=1), 13.648 -> 13.311 ms (k=3). A last-program variant
 # (atomic tile counter, one wave doing every row's top-k) was slower (9.594, 14.385): dropped.
+# Step 1 (j192, on f4b2962): bitwise again (1000 replays x 3 layers x R 1-32); chain_gate
+# 9.285 -> 9.002 ms (k=1), 13.75 -> 13.427 ms (k=3); served A/B 0/1/0/1 302/302 requests
+# identical across all four processes; 0 Triton compiles after /health.
 TOPK_EPI = os.environ.get("ENGINE_TOPK_EPI", "1") == "1"
 
 # Tiles per weight shape (N, K): outputs per tile, K chunk, warps, K split. Never by row count.

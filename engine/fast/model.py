@@ -40,7 +40,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import fla_pin, kernels, mfma, moe_prefill, prefill_kernels
+from engine.fast import fla_pin, flash_prefill, kernels, mfma, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -706,6 +706,15 @@ class FastModel:
         bucketed convolutions up to ``chunk`` tokens."""
         if self.triton_kernels["moe_prefill"]:
             self._warm_moe_prefill(chunk)
+        if self.triton_kernels["prefill_fused"] and prefill_kernels._FLASH:
+            # Plan 35: the flash attention tiles compile per (tile, split or not), not per
+            # shape; compile them all here rather than on a request's first use of each.
+            group = self.config.num_attention_heads // self.config.num_key_value_heads
+            warmed = set()
+            for k_pool, v_pool in self.kv.values():
+                if k_pool.device not in warmed:
+                    warmed.add(k_pool.device)
+                    flash_prefill.warm(k_pool, v_pool, k_pool.shape[1] * group)
         seen = set()
         for i, (conv, _) in self.gdn_state.items():
             weight = self.layers[i].linear_attn.conv1d.weight

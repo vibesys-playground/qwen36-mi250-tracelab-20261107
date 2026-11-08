@@ -31,6 +31,23 @@ CHUNK = 8  # small prefill chunks, so short prompts cross chunk boundaries
 _STARTUP_GUARD_SECONDS = 180
 
 
+def repeat_reuse(n: int, chunk: int = CHUNK) -> int:
+    """Tokens a repeat of an ``n``-token prompt reuses from its first run's snapshots.
+
+    The Transformers path (and the fast path with ``ENGINE_PREFILL_ONE_PASS_MAX=0``)
+    snapshots all but the last token. The fast path's one-pass prefill stores no
+    snapshot for an uncached part within the limit, and the last chunk boundary
+    before the end for a longer one. Exact for prompts within the default limit,
+    or for a prompt whose first run started cold.
+    """
+    one_pass_max = int(os.environ.get("ENGINE_PREFILL_ONE_PASS_MAX", "4096"))
+    if os.environ.get("ENGINE_FAST") != "1" or one_pass_max == 0:
+        return max(n - 1, 0)
+    if n <= one_pass_max:
+        return 0
+    return ((n - 1) // chunk) * chunk
+
+
 @dataclass(frozen=True)
 class Server:
     url: str

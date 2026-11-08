@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 import torch
-from conftest import CHUNK, Server
+from conftest import CHUNK, Server, repeat_reuse
 from engine.generator import Generation, Generator
 from engine.protocol import Sampling
 
@@ -102,7 +102,7 @@ def test_repeating_a_resumed_round_repeats_its_tokens(server: Server) -> None:
     prompt, ids, _ = rounds[-1]
     again, usage = _completion(server, prompt, len(ids))
     assert again == ids
-    assert usage["prompt_tokens_details"]["cached_tokens"] == len(prompt) - 1
+    assert usage["prompt_tokens_details"]["cached_tokens"] == repeat_reuse(len(prompt))
 
 
 def test_a_diverging_prompt_does_not_reuse_a_tail(server: Server, cold_server: Server) -> None:

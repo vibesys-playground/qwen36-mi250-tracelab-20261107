@@ -118,6 +118,12 @@ def pct(values: list[float], q: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, int(q * len(ordered)))], 2)
 
 
+def per_request(health: dict, key: str, requests: int) -> float | None:
+    """A /health counter (the router's total over replicas) per request."""
+    value = health.get(key)
+    return round(value / requests, 3) if isinstance(value, int) and requests else None
+
+
 def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[int]]:
     env = dict(os.environ)
     env.pop("ENGINE_FAST", None)
@@ -162,6 +168,12 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
     tpot = [(r["times"][-1] - r["times"][0]) * 1e3 / (len(r["times"]) - 1)
             for r in results if len(r["times"]) > 1]
     ttft = [(r["times"][0] - r["start"]) * 1e3 for r in results if r["times"]]
+    # TTFT by round: a session's first round (cold, the longest prefill) vs its later rounds
+    # (resumed from the session tail).
+    ttft_first = [(r["times"][0] - r["start"]) * 1e3 for r in results
+                  if r["times"] and r["key"].endswith("r0")]
+    ttft_later = [(r["times"][0] - r["start"]) * 1e3 for r in results
+                  if r["times"] and not r["key"].endswith("r0")]
     tokens = sum(len(r["ids"]) for r in results)
     cached = sum(int((r["usage"].get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
                  for r in results)
@@ -172,6 +184,13 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
         "output_tok_per_s": round(tokens / wall, 2),
         "tpot_ms_p50": pct(tpot, 0.5), "tpot_ms_p90": pct(tpot, 0.9),
         "ttft_ms_p50": pct(ttft, 0.5), "ttft_ms_p90": pct(ttft, 0.9),
+        "ttft_first_round_ms_p50": pct(ttft_first, 0.5),
+        "ttft_first_round_ms_p90": pct(ttft_first, 0.9),
+        "ttft_later_rounds_ms_p50": pct(ttft_later, 0.5),
+        "ttft_later_rounds_ms_p90": pct(ttft_later, 0.9),
+        # Segments: a request's prefill spans (passes it takes part in); passes: shared passes.
+        "prefill_segments_per_request": per_request(health, "prefill_segments", len(results)),
+        "prefill_passes_per_request": per_request(health, "prefill_passes", len(results)),
         "cached_prompt_tokens": cached, "health": health, "engine": engine_lines[:4],
     }), flush=True)
     return {r["key"]: r["ids"] for r in results}

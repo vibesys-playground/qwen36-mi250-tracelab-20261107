@@ -324,6 +324,11 @@ class FastModel:
             "fused_verify": False,
         }
         self.buckets = sorted(buckets)
+        # Rows per slot of a verify step (``_gdn_verify``): 2 for plan 5's one draft. Deeper
+        # drafts (tools/deep_mtp_probe.py) set more; ``gdn_chain`` runs a fused verify's
+        # recurrence over them in one launch (``engine.fast.fused``).
+        self.verify_groups = 2
+        self.gdn_chain = False
         # The checkpoint's MTP head (``engine.mtp.MTPHead``) for self-speculative decoding
         # (``verify``): an extra full-attention layer, index ``mtp_index``, on the lm_head's
         # device, whose KV lives in the same pages as the model's (one more pool).
@@ -767,20 +772,27 @@ class FastModel:
         return F.linear(self._gdn_step(i, qkv, z, b, a, slots), m.out_proj.weight)
 
     def _gdn_verify(self, i: int, x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-        """A verify step's Gated DeltaNet layer: rows ``[:n]`` are each slot's first token on
-        its current state row, rows ``[n:]`` its draft on the other bank's row. The projections
-        run over all rows at once; the recurrence runs the first half in place, copies those
-        states to the second half's rows, then runs the second half there."""
+        """A verify step's Gated DeltaNet layer: rows are ``verify_groups`` groups of ``n``
+        (group-major, one row per slot each). Group 0 is each slot's first token on its current
+        state row, group ``j`` its ``j``-th draft on another state row (for plan 5's two groups,
+        the other bank's). The projections run over all rows at once; the recurrence runs group
+        0 in place, then for each later group copies the previous group's states to its rows
+        and runs it there."""
         m = self.layers[i].linear_attn
         conv_state, rec_state = self.gdn_state[i]
-        n = x.shape[0] // 2
-        first, second = rows[:n], rows[n:]
+        groups = self.verify_groups
+        n = x.shape[0] // groups
         qkv, z, b, a = self._gdn_project(m, x)
-        out_a = self._gdn_step(i, qkv[:n], z[:n], b[:n], a[:n], first)
-        conv_state.index_copy_(0, second, conv_state.index_select(0, first))
-        rec_state.index_copy_(0, second, rec_state.index_select(0, first))
-        out_b = self._gdn_step(i, qkv[n:], z[n:], b[n:], a[n:], second)
-        return F.linear(torch.cat((out_a, out_b)), m.out_proj.weight)
+        outs = []
+        for index in range(groups):
+            part = slice(index * n, (index + 1) * n)
+            states = rows[part]
+            if index:
+                prev = rows[(index - 1) * n : index * n]
+                conv_state.index_copy_(0, states, conv_state.index_select(0, prev))
+                rec_state.index_copy_(0, states, rec_state.index_select(0, prev))
+            outs.append(self._gdn_step(i, qkv[part], z[part], b[part], a[part], states))
+        return F.linear(torch.cat(outs), m.out_proj.weight)
 
     def _gdn_step(
         self, i: int, qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor,

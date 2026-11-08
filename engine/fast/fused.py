@@ -143,6 +143,83 @@ if triton is not None:
         tl.store(out_ptr + (row * V_HEADS + head) * DV + vv, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16))
 
     @triton.jit
+    def _gdn_chain_conv_kernel(
+        state_ptr, rows_ptr, proj_ptr, w_ptr, C, N, G, stride_slot, stride_proj,
+        K: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """The short convolution of a verify chain: rows are group-major (row ``j * N + c`` is
+        chain ``c``'s ``j``-th token). Token ``j`` shifts the window left by state row
+        ``rows[(j - 1) * N + c]`` (``j = 0``: its own row, in place) into ``rows[j * N + c]``,
+        so each group's row keeps the window after its token; the convolved, silu'd value
+        replaces the raw projection in ``proj`` (``_gdn_conv_kernel``'s math)."""
+        chain = tl.program_id(0)
+        block = tl.program_id(1)
+        cc = block * BLOCK + tl.arange(0, BLOCK)
+        ok = cc < C
+        src = tl.load(rows_ptr + chain).to(tl.int64)
+        for j in range(G):
+            row = j * N + chain
+            dst = tl.load(rows_ptr + row).to(tl.int64)
+            sbase = state_ptr + src * stride_slot + cc * K
+            dbase = state_ptr + dst * stride_slot + cc * K
+            xn = tl.load(proj_ptr + row * stride_proj + cc, mask=ok, other=0.0)
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for i in tl.static_range(K - 1):
+                si = tl.load(sbase + i + 1, mask=ok, other=0.0)
+                acc += si.to(tl.float32) * tl.load(w_ptr + cc * K + i, mask=ok, other=0.0).to(tl.float32)
+                tl.store(dbase + i, si, mask=ok)
+            acc += xn.to(tl.float32) * tl.load(w_ptr + cc * K + K - 1, mask=ok, other=0.0).to(tl.float32)
+            tl.store(dbase + K - 1, xn, mask=ok)
+            y = acc.to(tl.bfloat16).to(tl.float32)
+            tl.store(proj_ptr + row * stride_proj + cc, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
+            tl.debug_barrier()
+            src = dst
+
+    @triton.jit
+    def _gdn_chain_step_kernel(
+        state_ptr, rows_ptr, in_ptr, alog_ptr, dtb_ptr, nw_ptr, out_ptr, N, G,
+        stride_in, V_HEADS, stride_slot, stride_head, eps, scale,
+        Z_OFF, B_OFF, A_OFF,
+        RATIO: tl.constexpr, KEY_DIM: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+    ):
+        """``_gdn_step_kernel`` over a verify chain: the state stays in registers across the
+        chain's G tokens and is stored after each token into that group's state row."""
+        chain = tl.program_id(0)
+        head = tl.program_id(1)
+        k_head = head // RATIO
+        kk = tl.arange(0, DK)
+        vv = tl.arange(0, DV)
+        off = head * stride_head + kk[:, None] * DV + vv[None, :]
+        first = tl.load(rows_ptr + chain).to(tl.int64)
+        s = tl.load(state_ptr + first * stride_slot + off)
+        decay = -tl.exp(tl.load(alog_ptr + head).to(tl.float32))
+        dtb = tl.load(dtb_ptr + head).to(tl.float32)
+        nw = tl.load(nw_ptr + vv).to(tl.float32)
+        for j in range(G):
+            row = j * N + chain
+            base_in = in_ptr + row * stride_in
+            q = tl.load(base_in + k_head * DK + kk).to(tl.float32)
+            k = tl.load(base_in + KEY_DIM + k_head * DK + kk).to(tl.float32)
+            v = tl.load(base_in + 2 * KEY_DIM + head * DV + vv).to(tl.float32)
+            q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) * scale
+            k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
+            beta = tl.sigmoid(tl.load(base_in + B_OFF + head).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+            a = tl.load(base_in + A_OFF + head).to(tl.float32) + dtb
+            softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+            s = s * tl.exp(decay * softplus)
+            kv_mem = tl.sum(s * k[:, None], axis=0)
+            delta = (v - kv_mem) * beta
+            s = s + k[:, None] * delta[None, :]
+            o = tl.sum(s * q[:, None], axis=0)
+            dst = tl.load(rows_ptr + row).to(tl.int64)
+            tl.store(state_ptr + dst * stride_slot + off, s)
+            o = o.to(tl.bfloat16).to(tl.float32)
+            n = (o * tl.rsqrt(tl.sum(o * o, axis=0) / DV + eps)).to(tl.bfloat16).to(tl.float32)
+            y = (nw * n).to(tl.bfloat16).to(tl.float32)
+            zz = tl.load(base_in + Z_OFF + head * DV + vv).to(tl.float32)
+            tl.store(out_ptr + (row * V_HEADS + head) * DV + vv, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16))
+
+    @triton.jit
     def _attn_prep_kernel(
         qkv_ptr, q_ptr, k_pool, v_pool, table_ptr, slot_ptr, pos_ptr, len_ptr,
         cos_ptr, sin_ptr, qn_ptr, kn_ptr, q_eps, k_eps,
@@ -408,7 +485,8 @@ class FusedDecode:
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
         bp = max(2, _pow2(rows))
-        bk = min(TILES["bk4"] if bp <= 4 else TILES["bk8"], _pow2(k))
+        tile = TILES["bk4"] if bp <= 4 else TILES["bk8"] if bp <= 8 else max(128, 8192 // bp)
+        bk = min(tile, _pow2(k))
         bn = TILES["bn"]
         grid = min(triton.cdiv(n, bn), 2 * self.cus[x.device])
         if conv is None:
@@ -488,27 +566,49 @@ class FusedDecode:
         )
 
     def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
-        """A verify step's GDN layer: rows ``[:n]`` are each slot's first token on its current
-        state row, rows ``[n:]`` its draft on the other bank's row (``FastModel._gdn_verify``).
+        """A verify step's GDN layer. Rows are ``G = fast.verify_groups`` groups of ``n`` (one
+        row per slot each, group-major): group 0 is each slot's first token on its current
+        state row, group ``j`` the ``j``-th draft on its own state row, which must start from
+        the state after group ``j - 1`` (``FastModel._gdn_verify``). ``G = 2`` is plan 5's
+        verify (two rows per slot, the draft on the other bank).
 
-        The projection GEMV and ``out_proj`` run once over all rows (weights read once); the
-        short convolution (``kernels.gdn_conv_``, the same math as the GEMV's conv epilogue)
-        and the delta-rule step run on the first half, the first half's states are copied to
-        the second half's rows, then the second half runs there, so each draft row starts from
-        the state after its slot's first token."""
+        The projection GEMV and ``out_proj`` run once over all rows (weights read once). The
+        short convolution and delta-rule step run group after group: by default each group's
+        start states are copied from the previous group's rows, then ``kernels.gdn_conv_`` and
+        the step run there; with ``fast.gdn_chain`` one launch each runs the whole chain
+        (``_gdn_chain_conv_kernel``, ``_gdn_chain_step_kernel``), the state kept in registers."""
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
         conv_dim = 2 * m.key_dim + m.value_dim
-        proj = self._gemv(h, self.w_in[i])  # raw projections; the conv runs per half below
+        proj = self._gemv(h, self.w_in[i])  # raw projections; the conv runs per group below
         core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
-        n = h.shape[0] // 2
-        halves = ((slice(0, n), states[:n]), (slice(n, 2 * n), states[n:]))
-        for index, (rows, slots) in enumerate(halves):
+        groups = getattr(fast, "verify_groups", 2)
+        n = h.shape[0] // groups
+        if getattr(fast, "gdn_chain", False):
+            block = 256
+            _gdn_chain_conv_kernel[(n, triton.cdiv(conv_dim, block))](
+                conv_state, states, proj, m.conv1d.weight, conv_dim, n, groups,
+                conv_state.stride(0), proj.stride(0), K=conv_state.shape[-1], BLOCK=block,
+            )
+            heads, dk, dv = m.num_v_heads, m.head_k_dim, m.head_v_dim
+            z_off = 2 * m.key_dim + m.value_dim
+            b_off = z_off + m.in_proj_z.weight.shape[0]
+            a_off = b_off + m.in_proj_b.weight.shape[0]
+            _gdn_chain_step_kernel[(n, heads)](
+                rec_state, states, proj, m.A_log, m.dt_bias, m.norm.weight, core, n, groups,
+                proj.stride(0), heads, rec_state.stride(0), rec_state.stride(1),
+                m.norm.variance_epsilon, dk ** -0.5, z_off, b_off, a_off,
+                RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
+            )
+            return self._gemv(core, m.out_proj.weight)
+        for index in range(groups):
+            rows = slice(index * n, (index + 1) * n)
+            slots = states[rows]
             if index:
-                first = states[:n]
-                conv_state.index_copy_(0, slots, conv_state.index_select(0, first))
-                rec_state.index_copy_(0, slots, rec_state.index_select(0, first))
+                prev = states[(index - 1) * n : index * n]
+                conv_state.index_copy_(0, slots, conv_state.index_select(0, prev))
+                rec_state.index_copy_(0, slots, rec_state.index_select(0, prev))
             part = proj[rows]
             part[:, :conv_dim] = kernels.gdn_conv_(conv_state, slots, part[:, :conv_dim], m.conv1d.weight)
             self._gdn_step(m, rec_state, slots, part, core[rows])

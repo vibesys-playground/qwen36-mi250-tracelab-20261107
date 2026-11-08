@@ -45,8 +45,9 @@ from torch.nn import functional as F
 
 from engine.fast.kernels import INTERPRET, on_device, tl, triton
 
-# The Triton interpreter's ``tl.dot`` mishandles BF16 operands (numpy has no bfloat16); there
-# the tiles are widened to fp32 first, which multiplies the same values exactly.
+# The Triton interpreter's ``tl.dot`` mishandles BF16 operands (numpy has no bfloat16) and it
+# rounds fp32 to BF16 by truncation; there the tiles are widened to fp32 first, which multiplies
+# the same values exactly, and rounding to nearest even is done on the bits (``_bf16``).
 _WIDEN = INTERPRET
 
 
@@ -73,6 +74,16 @@ def moe_prefill_reference(
 
 
 if triton is not None:
+
+    @triton.jit
+    def _bf16(x, WIDEN: tl.constexpr):
+        """``x`` (fp32) rounded to BF16, to nearest even, as fp32."""
+        if WIDEN:
+            bits = x.to(tl.uint32, bitcast=True)
+            bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+            return bits.to(tl.float32, bitcast=True)
+        else:
+            return x.to(tl.bfloat16).to(tl.float32)
 
     @triton.jit
     def _find_tile(t, tile_ends_ptr, counts_ptr, starts_ptr, E: tl.constexpr, LOG_E: tl.constexpr, BLOCK_M: tl.constexpr):
@@ -143,11 +154,11 @@ if triton is not None:
             g_ptrs += BLOCK_K
             u_ptrs += BLOCK_K
         # Round where the BF16 matmuls of the padded path round: projections, SiLU, product.
-        gate = acc_g.to(tl.bfloat16).to(tl.float32)
-        up = acc_u.to(tl.bfloat16).to(tl.float32)
-        act = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+        gate = _bf16(acc_g, WIDEN)
+        up = _bf16(acc_u, WIDEN)
+        act = _bf16(gate * tl.sigmoid(gate), WIDEN)
         out = act_ptr + rows.to(tl.int64)[:, None] * I + cols[None, :]
-        tl.store(out, (act * up).to(tl.bfloat16), mask=row_ok[:, None])
+        tl.store(out, _bf16(act * up, WIDEN).to(tl.bfloat16), mask=row_ok[:, None])
 
     @triton.jit
     def _down_kernel(
@@ -193,19 +204,19 @@ if triton is not None:
             w_ptrs += BLOCK_K
         pairs = tl.load(order_ptr + rows, mask=row_ok, other=0)
         weight = tl.load(wt_ptr + pairs, mask=row_ok, other=0.0).to(tl.float32)
-        val = acc.to(tl.bfloat16).to(tl.float32) * weight[:, None]
+        val = _bf16(acc, WIDEN) * weight[:, None]
         out = out_ptr + pairs.to(tl.int64)[:, None] * H + cols[None, :]
         tl.store(out, val, mask=row_ok[:, None])
 
 
-# Tile shapes per routing density (pairs per expert on average). ``ENGINE_MOE_GROUPED_CFG``
-# overrides all of them: "BM,BN1,BK1,BN2,BK2,warps,stages".
-_CONFIGS = (  # (max average rows per expert, BLOCK_M, gate_up BN, BK, down BN, BK, warps, stages)
-    (8, 16, 64, 64, 64, 64, 4, 2),
-    (24, 32, 64, 64, 64, 64, 4, 2),
-    (64, 64, 64, 64, 64, 64, 4, 2),
-    (None, 128, 64, 64, 64, 64, 8, 2),
-)
+# Tile shape: BLOCK_M rows, gate_up BLOCK_N/BLOCK_K, down BLOCK_N/BLOCK_K, warps, stages.
+# Measured on an MI210 (gfx90a, job j76) over the real routing of four Qwen3.6 layers and a
+# skewed one, 64 to 4096 tokens, against eight other shapes (BLOCK_M 16-128, BLOCK_N 64/128,
+# BLOCK_K 64/128, 4/8 warps): fastest summed over the layers with real routing at every size,
+# within 6% of the fastest with skewed routing from 700 tokens up (0.29 ms behind over four
+# layers at 64 skewed tokens). ``ENGINE_MOE_GROUPED_CFG``
+# overrides it: "BM,BN1,BK1,BN2,BK2,warps,stages".
+DEFAULT_CONFIG = (64, 64, 128, 64, 128, 4, 2)
 
 
 def config(pairs: int, experts: int) -> tuple[int, int, int, int, int, int, int]:
@@ -216,11 +227,7 @@ def config(pairs: int, experts: int) -> tuple[int, int, int, int, int, int, int]
         if len(values) != 7:
             raise ValueError("ENGINE_MOE_GROUPED_CFG needs BM,BN1,BK1,BN2,BK2,warps,stages")
         return values  # type: ignore[return-value]
-    avg = pairs / experts
-    for limit, *cfg in _CONFIGS:
-        if limit is None or avg <= limit:
-            return tuple(cfg)  # type: ignore[return-value]
-    raise AssertionError
+    return DEFAULT_CONFIG
 
 
 def _aligned(dim: int) -> bool:

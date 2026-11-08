@@ -754,7 +754,9 @@ class FastModel:
     def _moe(self, mlp: torch.nn.Module, x: torch.Tensor, decode: bool = False) -> torch.Tensor:
         """Shared plus routed experts. Decode steps always use the in-place expert kernel,
         which never synchronizes with the host, so every batch bucket can be captured;
-        prefill chunks above ``DECODE_EXPERT_TOKENS`` use the registered experts module."""
+        prefill chunks above ``DECODE_EXPERT_TOKENS`` use the grouped GEMM of
+        ``moe_prefill`` (no host synchronization either), or, under
+        ``ENGINE_MOE_GROUPED=0`` or without Triton, the registered experts module."""
         tokens = x.shape[0]
         shared = mlp.shared_expert
         shared_out = F.linear(

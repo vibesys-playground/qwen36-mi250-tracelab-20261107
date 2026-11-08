@@ -32,9 +32,7 @@ def _routing(n, e, k, mode, g):
     return idx, (w / w.sum(-1, keepdim=True)).bfloat16()
 
 
-# The Triton interpreter rounds fp32 to BF16 by truncation (GPUs round to nearest even), so
-# its error against the PyTorch paths is a few BF16 ulps larger.
-TOL = 5e-2 if kernels.INTERPRET else 2e-2
+TOL = 2e-2
 
 
 def _device():

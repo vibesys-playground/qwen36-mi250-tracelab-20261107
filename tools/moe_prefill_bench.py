@@ -24,7 +24,8 @@ a few real layers fit one small GPU), then:
               last-token logits after prefills of --parity-prompts prefixes of
               random length, and teacher-forced greedy decode steps after
               eight of them (decode itself is unchanged; its state comes from
-              the prefill).
+              the prefill); the per-expert loop against the current path is the
+              noise floor (same math, another reduction order).
 
 Every number is a hint for the lead, not the task's metric.
 """
@@ -267,54 +268,65 @@ def passes(generator, fast, args) -> None:
 
 
 def parity(generator, fast, args) -> None:
+    """Top-1 agreement with the current path ("current": padded bmm, its loop under skew) of
+    the grouped path and, as the noise floor of a mere change of reduction order, of the
+    per-expert loop alone (PADDED_MAX_ROWS=0)."""
+    from engine import experts as ex
+
     rng = random.Random(0)
     texts = [sample_ids(generator.tokenizer, 4097, skip=40 + 5 * j) for j in range(8)]
-    agree = total = 0
-    max_diff = 0.0
-    with torch.inference_mode():
-        for n in range(args.parity_prompts):
-            ids = texts[n % 8][: rng.randint(17, 4096)]
-            res = []
-            for flag in (False, True):
-                fast.triton_kernels["moe_prefill"] = flag
+    padded_max = ex.PADDED_MAX_ROWS
+
+    def use(variant: str) -> None:
+        fast.triton_kernels["moe_prefill"] = variant == "grouped"
+        ex.PADDED_MAX_ROWS = 0 if variant == "loop" else padded_max
+
+    variants = ("current", "grouped", "loop")
+    agree = {v: 0 for v in variants[1:]}
+    d_agree = {v: 0 for v in variants[1:]}
+    max_diff = {v: 0.0 for v in variants[1:]}
+    total = d_total = 0
+    steps = args.decode_steps
+    try:
+        with torch.inference_mode():
+            for n in range(args.parity_prompts):
+                ids = texts[n % 8][: rng.randint(17, 4096)]
+                res = {}
+                for v in variants:
+                    use(v)
+                    fast.reset(0)
+                    res[v] = fast.prefill(0, ids, 0).float().cpu()
                 fast.reset(0)
-                res.append(fast.prefill(0, ids, 0).float().cpu())
-            fast.reset(0)
-            total += 1
-            agree += int(res[0].argmax() == res[1].argmax())
-            max_diff = max(max_diff, float((res[0] - res[1]).abs().max()))
-        print(
-            f"RESULT parity prefill_last_token top1={100 * agree / total:.2f}% ({agree}/{total}) "
-            f"max_logit_diff={max_diff:.3f}",
-            flush=True,
-        )
-        # Teacher-forced greedy decode after prefills with each path (reference: current path).
-        d_agree = d_total = 0
-        steps = args.decode_steps
-        for j in range(8):
-            ids = texts[j][: 300 + 450 * j]
-            tokens = {}
-            for flag in (False, True):
-                fast.triton_kernels["moe_prefill"] = flag
+                total += 1
+                for v in variants[1:]:
+                    agree[v] += int(res[v].argmax() == res["current"].argmax())
+                    max_diff[v] = max(max_diff[v], float((res[v] - res["current"]).abs().max()))
+            # Teacher-forced greedy decode after prefills with each path, fed the current
+            # path's tokens (decode itself is unchanged; its state comes from the prefill).
+            for j in range(8):
+                ids = texts[j][: 300 + 450 * j]
+                tokens = {}
+                for v in variants:
+                    use(v)
+                    fast.reset(0)
+                    seq = [int(fast.prefill(0, ids, 0).float().argmax())]
+                    for s in range(steps):
+                        feed = seq[s] if v == "current" else tokens["current"][s]
+                        out = fast.decode([feed], [0], [len(ids) + s]).float()
+                        seq.append(int(out[0].argmax()))
+                    tokens[v] = seq
                 fast.reset(0)
-                logits = fast.prefill(0, ids, 0).float()
-                seq = [int(logits.argmax())]
-                for s in range(steps):
-                    feed = seq[s] if not flag else tokens[False][s]
-                    out = fast.decode([feed], [0], [len(ids) + s]).float()
-                    seq.append(int(out[0].argmax()))
-                tokens[flag] = seq
-            fast.reset(0)
-            d_total += len(tokens[False])
-            d_agree += sum(a == b for a, b in zip(tokens[False], tokens[True]))
-        fast.triton_kernels["moe_prefill"] = True
+                d_total += len(tokens["current"])
+                for v in variants[1:]:
+                    d_agree[v] += sum(a == b for a, b in zip(tokens["current"], tokens[v]))
+    finally:
+        use("grouped")
+    for v in variants[1:]:
         print(
-            f"RESULT parity teacher_forced_decode top1={100 * d_agree / d_total:.2f}% ({d_agree}/{d_total})",
-            flush=True,
-        )
-        print(
-            f"RESULT parity combined top1={100 * (agree + d_agree) / (total + d_total):.2f}% "
-            f"({agree + d_agree}/{total + d_total})",
+            f"RESULT parity[{v} vs current] prefill_last_token top1={100 * agree[v] / total:.2f}% "
+            f"({agree[v]}/{total}) max_logit_diff={max_diff[v]:.3f} "
+            f"teacher_forced_decode top1={100 * d_agree[v] / d_total:.2f}% ({d_agree[v]}/{d_total}) "
+            f"combined top1={100 * (agree[v] + d_agree[v]) / (total + d_total):.2f}%",
             flush=True,
         )
 

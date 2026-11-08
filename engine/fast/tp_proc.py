@@ -133,6 +133,10 @@ class _LLProc(tpm._LL):
             raise RuntimeError(f"hipDeviceEnablePeerAccess({me.index}->{peer.index}) failed: {rc}")
         hip.hipGetLastError()
         self.cap_eager = EAGER_CAPACITY - EAGER_CAPACITY % tpm.CHUNK
+        # Plan 29's fused all-reduce + RMSNorm (ENGINE_GLUE_ARRMS, off by default) has no
+        # cross-process buffers: ``Group.allreduce_rms`` falls back to all-reduce + add_rms.
+        self.rms_cap = tpm.RMS_ROWS * tpm.RMS_WIDTH
+        self.rms_ready = False
         own = _alloc_fine(hip, me, 2 * tpm.CAPACITY * 8)
         own_eager = _alloc_fine(hip, me, 2 * self.cap_eager * 8)
         loop = _alloc_fine(hip, me, 2 * tpm.CAPACITY * 8)

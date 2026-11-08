@@ -61,10 +61,10 @@ from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _
 triton, tl = kernels.triton, kernels.tl
 
 CHUNK = 64  # 32-bit words per CTA of the in-graph all-reduce
-# Plan 33 (ENGINE_PREFILL_GRAPH): single-segment prefill passes of up to the
+# Plan 33 (ENGINE_PREFILL_GRAPH, default on; 0 for eager prefill): single-segment passes of up to the
 # largest bucket replay one captured graph per rank and size (``TPModel.capture_prefill``),
 # their all-reduces in the graph too, so the all-reduce buffer must hold a pass's hidden state.
-PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "0") == "1"
+PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "1") == "1"
 # Padded pass sizes (rows); a pass of n tokens (DECODE_EXPERT_TOKENS < n <= the largest, 2,048
 # = the server's prefill chunk) runs the smallest size >= n; longer or packed passes run eagerly.
 PG_BUCKETS = tuple(sorted(int(b) for b in os.environ.get(

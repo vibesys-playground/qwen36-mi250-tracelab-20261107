@@ -144,10 +144,19 @@ def _arg(a) -> ctypes._SimpleCData:
 
 
 class Function:
+    """A kernel of a loaded module. Every query and launch first makes the module's device
+    current: HIP's module calls on a function of another device crash the process (j201:
+    ``hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`` segfaulted with the peer GCD current)."""
+
     def __init__(self, handle: ctypes.c_void_p, name: str, device: torch.device) -> None:
         self.handle, self.name, self.device = handle, name, device
 
+    def _current(self) -> None:
+        torch.cuda.set_device(self.device)
+        check(hip().hipSetDevice(self.device.index), "hipSetDevice")
+
     def attr(self, which: int) -> int:
+        self._current()
         v = ctypes.c_int()
         check(hip().hipFuncGetAttribute(ctypes.byref(v), ctypes.c_int(which), self.handle),
               "hipFuncGetAttribute")
@@ -155,6 +164,7 @@ class Function:
 
     def occupancy(self, block: int, smem: int = 0) -> int:
         """Resident blocks per CU (``hipModuleOccupancyMaxActiveBlocksPerMultiprocessor``)."""
+        self._current()
         v = ctypes.c_int()
         check(hip().hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
             ctypes.byref(v), self.handle, ctypes.c_int(block), ctypes.c_size_t(smem)),
@@ -166,6 +176,7 @@ class Function:
             grid = (grid, 1, 1)
         if isinstance(block, int):
             block = (block, 1, 1)
+        self._current()
         if stream is None:
             stream = torch.cuda.current_stream(self.device)
         vals = [_arg(a) for a in args]

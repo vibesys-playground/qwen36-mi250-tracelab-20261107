@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     fast.capture_all()
     _sync()
-    print(f"RESULT capture_s={time.perf_counter() - t0:.1f} graph_error={fast.graph_error}")
+    print(f"RESULT capture_s={time.perf_counter() - t0:.1f} capture_mode={fast.capture_mode} graph_error={fast.graph_error}")
     if torch.cuda.is_available():
         for d in range(torch.cuda.device_count()):
             free, total = torch.cuda.mem_get_info(d)

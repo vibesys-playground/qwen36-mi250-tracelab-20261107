@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import math
 import os
+import traceback
+from pathlib import Path
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -241,6 +243,7 @@ class FastModel:
         self._push_table(self.dummy)
         self.segments = self._segments()
         self.graph_error: str | None = None
+        self.capture_mode: str | None = None
 
     # ---------------------------------------------------------------- setup
 
@@ -656,7 +659,28 @@ class FastModel:
         return x[:batch]
 
     def capture(self, size: int) -> None:
-        """Capture every segment's graph for batch ``size``; on failure record why and run eagerly."""
+        """Capture every segment's graph for batch ``size``; on failure record why and run eagerly.
+
+        Capture modes are tried in turn (``ENGINE_CAPTURE_MODES``): "global"
+        refuses any unsafe HIP call from any thread during capture, while
+        "thread_local" and "relaxed" allow the runtime queries some launchers
+        make. The first that captures is kept for later buckets.
+        """
+        modes = getattr(self, "_capture_modes", None)
+        if modes is None:
+            modes = os.environ.get("ENGINE_CAPTURE_MODES", "global,thread_local,relaxed").split(",")
+        errors = []
+        for mode in modes:
+            error = self._capture(size, mode)
+            if error is None:
+                self._capture_modes = [mode]
+                self.capture_mode = mode
+                self.graph_error = None
+                return
+            errors.append(f"{mode}: {error}")
+        self.graph_error = " | ".join(errors)
+
+    def _capture(self, size: int, mode: str) -> str | None:
         try:
             meta0 = self.devices[self.embed.device]
             for meta in self.devices.values():
@@ -675,18 +699,33 @@ class FastModel:
                     torch.cuda.current_stream(seg.device).wait_stream(stream)
                     torch.cuda.synchronize(seg.device)
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, pool=self._pool(seg.device)):
+                    with torch.cuda.graph(
+                        graph, pool=self._pool(seg.device), capture_error_mode=mode
+                    ):
                         out = seg.run(static_in, meta)
                     seg.inputs[size], seg.outputs[size], seg.graphs[size] = static_in, out, graph
                     x = out
             for dev in self.devices:
                 torch.cuda.synchronize(dev)
         except Exception as exc:  # noqa: BLE001 - any capture failure falls back to eager
-            self.graph_error = f"{type(exc).__name__}: {exc}"
             for seg in self.segments:
                 seg.graphs.clear()
                 seg.inputs.clear()
                 seg.outputs.clear()
+            # Where in the forward the capture broke: the innermost frame of this package.
+            where = [
+                f"{Path(f.filename).name}:{f.lineno} {f.name}"
+                for f in traceback.extract_tb(exc.__traceback__)
+                if "engine" in f.filename
+            ]
+            first = str(exc).splitlines()[0] if str(exc) else ""
+            try:  # clear a sticky error before the next attempt
+                for dev in self.devices:
+                    torch.cuda.synchronize(dev)
+            except Exception:  # noqa: BLE001
+                pass
+            return f"{type(exc).__name__}: {first} at {where[-1] if where else '?'}"
+        return None
 
     def _pool(self, dev: torch.device):
         pools = self.__dict__.setdefault("_pools", {})

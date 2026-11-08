@@ -666,9 +666,7 @@ def _parity(gen, fast, pool: list[int], n: int) -> None:
     from engine.protocol import Sampling
 
     prompts = [pool[9973 * k : 9973 * k + length] for k, length in enumerate((1800, 610, 2500, 133))]
-    # Plain decode graphs before the first step: a bucket captured inside a step warms on dummy
-    # inputs after the step's were loaded (j153: every plain run diverged at its second token).
-    fast.capture_all(decode=True, verify=False)
+    # The plain decode bucket is captured inside the first step (the path j153 found broken).
     plain: list[list[int]] = []
     lasts = []
     for s, p in enumerate(prompts):

@@ -56,7 +56,7 @@ import torch
 from torch.nn import functional as F
 
 from engine.fast import kernels
-from engine.fast.model import PAGE, FastModel, Snapshot
+from engine.fast.model import PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
 
@@ -66,6 +66,9 @@ MAXIT = 4_000_000  # spin iterations before a call gives up (counted in ``timeou
 # Python's thread switch interval while both ranks run eagerly (prefill): the threads hand the
 # GIL to each other at every all-reduce, so a short interval only bounds the odd stall.
 SWITCH_S = float(os.environ.get("ENGINE_TP_SWITCH_S", "0.0002"))
+# ENGINE_TP_PREFILL: "lockstep" runs prefill passes from one host thread, both ranks stage by
+# stage; "threads" runs each rank's own pass on its own thread, meeting at every all-reduce.
+LOCKSTEP = os.environ.get("ENGINE_TP_PREFILL", "threads") == "lockstep"
 # Seconds an eager all-reduce waits for the peer thread before failing the pass.
 WAIT_S = float(os.environ.get("ENGINE_TP_WAIT_S", "300"))
 
@@ -711,6 +714,8 @@ class TPModel:
     @torch.inference_mode()
     def prefill(self, slot: int, ids: Sequence[int], start: int, follow: int | None = None) -> torch.Tensor:
         self.ranks[0]._ensure_pages(slot, start + len(ids))
+        if LOCKSTEP:
+            return self._lockstep([(slot, ids, start)], [follow])[0]
         parts = self._both(lambda m: m.prefill(slot, ids, start, follow))
         self.last_drafts = self.ranks[0].last_drafts
         return self._gather(parts)
@@ -723,9 +728,107 @@ class TPModel:
     ) -> torch.Tensor:
         for slot, ids, start in segments:
             self.ranks[0]._ensure_pages(slot, start + len(ids))
+        if LOCKSTEP:
+            if len({slot for slot, _, _ in segments}) != len(segments):
+                raise ValueError("a packed prefill holds at most one segment per slot")
+            if any(len(ids) == 0 for _, ids, _ in segments):
+                raise ValueError("an empty prefill segment")
+            return self._lockstep(segments, list(follows) if follows is not None else [None] * len(segments))
         parts = self._both(lambda m: m.prefill_packed(segments, follows))
         self.last_drafts = self.ranks[0].last_drafts
         return self._gather(parts)
+
+    # ------------------------------------------------------------ lock-step prefill
+
+    def _pair(self, parts: list[torch.Tensor], residuals: list[torch.Tensor] | None = None) -> list[torch.Tensor]:
+        """The all-reduce from one thread: per rank ``[residual +] (own + peer)``, the sum in
+        fp32 in the same order as ``Group.allreduce`` (so the same bits on both ranks)."""
+        out = []
+        for r, part in enumerate(parts):
+            theirs = parts[1 - r].to(part.device)
+            total = (part.float() + theirs.float()).to(part.dtype)
+            out.append(total if residuals is None else residuals[r] + total)
+        return out
+
+    def _argmax_all(self, logits: list[torch.Tensor]) -> torch.Tensor:
+        """Greedy picks over both ranks' vocabulary shards (ties to the lowest index), on rank
+        0's device."""
+        return self._gather([lg.float() for lg in logits]).argmax(-1)
+
+    def _lockstep(self, segments: Sequence[tuple[int, Sequence[int], int]],
+                  follows: Sequence[int | None]) -> torch.Tensor:
+        """``FastModel.prefill_packed``'s pass over both ranks from this one thread, stage by
+        stage (every launch is asynchronous, so the two GPUs still run side by side): no host
+        threads to hand over, the cross-rank sums as stream-ordered peer copies."""
+        ranks = self.ranks
+        plans = [_PackPlan(m, segments) for m in ranks]
+        ons = [plan.on(m.embed.device) for plan, m in zip(plans, ranks, strict=True)]
+        xs = []
+        for m, plan in zip(ranks, plans, strict=True):
+            with _on(m):
+                xs.append(F.embedding(plan.tokens.to(m.embed.device), m.embed))
+        for i in range(len(ranks[0].layers)):
+            gdn = ranks[0].layer_types[i] == "linear_attention"
+            hs = []
+            for m, x, on in zip(ranks, xs, ons, strict=True):
+                with _on(m):
+                    h = _rms(x, m.layers[i].input_layernorm.weight, m.eps)
+                    hs.append(m._gdn_prefill_packed(i, h, on) if gdn else m._attn_prefill_packed(i, h, on))
+            xs = self._pair(hs, xs)
+            hs = []
+            for m, x in zip(ranks, xs, strict=True):
+                with _on(m):
+                    h = _rms(x, m.layers[i].post_attention_layernorm.weight, m.eps)
+                    hs.append(m._moe(m.layers[i].mlp, h))
+            xs = self._pair(hs, xs)
+        logits = []
+        hidden = []
+        for m, x, on in zip(ranks, xs, ons, strict=True):
+            with _on(m):
+                last = _rms(x.index_select(0, on.last), m.final_norm, m.eps)
+                logits.append(F.linear(last, m.lm_head).float())
+                if m.mtp is not None:
+                    hidden.append(_rms(x, m.final_norm, m.eps))
+        out = self._gather(logits)
+        if ranks[0].mtp is not None:
+            self.last_drafts = self._mtp_lockstep(hidden, segments, follows, out, ons)
+        return out
+
+    def _mtp_lockstep(self, hidden: list[torch.Tensor], segments, follows, logits: torch.Tensor,
+                      ons: list) -> torch.Tensor:
+        """``FastModel._mtp_prefill`` over both ranks, stage by stage; the drafts (rank 0)."""
+        ranks = self.ranks
+        nxt: list[int] = []
+        picked: list[tuple[int, int]] = []
+        for k, ((_, ids, _), follow) in enumerate(zip(segments, follows, strict=True)):
+            nxt.extend(ids[1:])
+            if follow is None:
+                picked.append((len(nxt), k))
+            nxt.append(0 if follow is None else follow)
+        tokens = torch.tensor(nxt, dtype=torch.long, device=logits.device)
+        if picked:
+            rows = torch.tensor([r for r, _ in picked], dtype=torch.long, device=logits.device)
+            segs = torch.tensor([k for _, k in picked], dtype=torch.long, device=logits.device)
+            tokens.index_copy_(0, rows, logits.index_select(0, segs).argmax(-1))
+        zs, hs = [], []
+        for m, h, on in zip(ranks, hidden, ons, strict=True):
+            with _on(m):
+                z = m._mtp_in(h, tokens.to(h.device))
+                layer = m.mtp.layers[0]
+                zs.append(z)
+                hs.append(m._attn_prefill_packed(m.mtp_index, _rms(z, layer.input_layernorm.weight, m.eps), on))
+        zs = self._pair(hs, zs)
+        hs = []
+        for m, z in zip(ranks, zs, strict=True):
+            with _on(m):
+                layer = m.mtp.layers[0]
+                hs.append(m._moe(layer.mlp, _rms(z, layer.post_attention_layernorm.weight, m.eps)))
+        zs = self._pair(hs, zs)
+        parts = []
+        for m, z, on in zip(ranks, zs, ons, strict=True):
+            with _on(m):
+                parts.append(m._mtp_logits(z.index_select(0, on.last)))
+        return self._argmax_all(parts)
 
     @torch.inference_mode()
     def warmup(self, slot: int, chunk: int, token_ids: Sequence[int], other: int | None = None) -> None:

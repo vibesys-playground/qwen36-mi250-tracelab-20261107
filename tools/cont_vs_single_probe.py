@@ -224,6 +224,9 @@ def main():
 
     def route_cmp(tag, ra, rb, xa, xb, n1):
         """routing flips per MoE layer on rows >= n1 and error of ever-flipped vs never-flipped rows."""
+        if len(ra) < L or len(rb) < L:
+            result("route", pair=tag, n1=n1, error=f"routes recorded {len(ra)},{len(rb)} of {L}")
+            return
         ever = torch.zeros(N - n1, dtype=torch.bool)
         out = []
         for l in range(L):

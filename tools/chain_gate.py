@@ -147,8 +147,9 @@ def main() -> None:
     prompts = [corpus[9973 * k : 9973 * k + args.prompt_len] for k in range(2)]
     lasts = [int(torch.argmax(prefill(s, p))) for s, p in zip(slots, prompts, strict=True)]
     length = args.prompt_len
+    KS = [k for k in (1, 3, 7) if k <= mfma.KMAX]  # k up to the ring (ENGINE_SPEC_KMAX)
     step_ms = {}
-    for k in (1, 3, 7):
+    for k in KS:
         drafts = [[lasts[b]] * k for b in range(2)]
         try:
             fn = lambda: fast.verify_chain(lasts, drafts, slots, [length] * 2)  # noqa: E731
@@ -211,7 +212,7 @@ def main() -> None:
         return res
 
     fast.verify_chain = logged
-    for kname in ("1", "3", "7", ""):
+    for kname in [str(k) for k in KS] + [""]:
         os.environ["ENGINE_SPEC_K"] = kname
         for name in groups:
             tot_tokens = tot_steps = 0
@@ -289,7 +290,7 @@ def main() -> None:
     out("today", verify_B2_ms=today_ms, replay_tokens_per_slot_step=today_e, source=args.today)
     for name in groups:
         rows = {}
-        for k in (1, 3, 7):
+        for k in KS:
             if k in step_ms and (str(k), name) in accept:
                 e = accept[(str(k), name)]["E"]
                 rows[k] = {"step_ms": round(step_ms[k], 3), "E_k": round(e, 3),

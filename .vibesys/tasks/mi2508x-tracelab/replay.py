@@ -25,6 +25,14 @@ MODEL = "Qwen/Qwen3.6-35B-A3B"
 REVISION = "995ad96eacd98c81ed38be0c5b274b04031597b0"
 TRACE = Path(__file__).with_name("recorded_sessions.csv")
 TRACE_SHA256 = "b49b5e63e53e946e54b068654cfa07795a76e1a2d90abe35c7ebc6ecb15a707b"
+# The protocol-2 declaration: exactly the task's objectives, each with its unit.
+HELLO_METRICS = {
+    "output_tokens_per_s": {"unit": "tok/s", "direction": "max"},
+    "ttft_p50_ms": {"unit": "ms", "direction": "min"},
+    "ttft_p90_ms": {"unit": "ms", "direction": "min"},
+    "tpot_p50_ms": {"unit": "ms", "direction": "min"},
+    "tpot_p90_ms": {"unit": "ms", "direction": "min"},
+}
 METRICS = {
     "output_tokens_per_s": "output_token_throughput_per_s",
     "ttft_p50_ms": "ttft_ms_p50",
@@ -156,13 +164,22 @@ def _run(args: argparse.Namespace, temporary: Path) -> dict[str, float]:
     )
 
 
+def _write_record(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, allow_nan=False) + "\n")
+        output.flush()
+
+
 def main() -> int:
-    """Run one recorded replay; emit a protocol error on any boundary failure."""
+    """Run one recorded replay as a protocol-2 stream: hello first, then result or error."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request-factory-engine", required=True)
     parser.add_argument("--url", default="http://localhost:8000")
     parser.add_argument("--vs-output", type=Path, required=True)
     args = parser.parse_args()
+    # Declare the schema before measuring, so a replay killed mid-run reads as NO_OUTCOME.
+    args.vs_output.write_text("", encoding="utf-8")
+    _write_record(args.vs_output, {"kind": "hello", "protocol": 2, "metrics": HELLO_METRICS})
     record: dict[str, Any]
     try:
         with tempfile.TemporaryDirectory(prefix="qwen36-tracelab-") as directory:
@@ -170,10 +187,10 @@ def main() -> int:
         record = {"kind": "result", "label": "", "values": values}
         status = 0
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-        record = {"kind": "error", "message": str(exc)}
+        record = {"kind": "error", "message": str(exc) or type(exc).__name__}
         sys.stderr.write(f"TraceLab replay failed: {exc}\n")
         status = 1
-    args.vs_output.write_text(json.dumps(record, allow_nan=False) + "\n")
+    _write_record(args.vs_output, record)
     return status
 
 

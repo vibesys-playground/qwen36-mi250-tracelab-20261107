@@ -73,10 +73,9 @@ def _session(seed: int, length: int) -> tuple[int, ...]:
 def test_a_growing_session_stays_on_its_replica_and_new_sessions_spread() -> None:
     affinity = Affinity(4, min_tokens=16)
     sessions = [_session(s, 100) for s in range(4)]
-    placed = []
-    for prompt in sessions:
-        replica, ticket = affinity.route(prompt)
-        placed.append(replica)
+    routed = [affinity.route(prompt) for prompt in sessions]  # all start together
+    placed = [replica for replica, _ in routed]
+    for replica, ticket in routed:
         affinity.finish(ticket, replica)
     assert sorted(placed) == [0, 1, 2, 3]
     for _ in range(3):  # every later round extends the previous prompt
@@ -102,7 +101,7 @@ def test_a_session_extending_another_does_not_steal_it() -> None:
 
 
 def test_short_prompts_attract_only_identical_ones() -> None:
-    affinity = Affinity(2, min_tokens=64, idle_seconds=0)
+    affinity = Affinity(2, min_tokens=64, idle_seconds=0, successor_seconds=0)
     probe = _session(1, 5)
     r0, t = affinity.route(probe)
     affinity.finish(t, r0)
@@ -119,6 +118,99 @@ def test_in_flight_requests_count_as_load() -> None:
     r1, _ = affinity.route(_session(2, 100))
     assert {r0, r1} == {0, 1}
     assert affinity.load() == [1, 1]
+
+
+def _closed_loop(affinity: Affinity, slots: int, sessions: int, rounds: int, wait: float):
+    """Drive ``affinity`` like the saturated replay with a fake clock: ``slots`` sessions in
+    flight, each ``rounds`` rounds of uneven length with ``wait`` s between rounds and none
+    after the last, a new session starting the moment one ends. Returns the largest number
+    of requests in flight on one replica seen at any route."""
+    import heapq
+
+    now = 0.0
+    events: list[tuple[float, int, str]] = []  # (time, session, what)
+    prompts: dict[int, tuple[int, ...]] = {}
+    done_rounds: dict[int, int] = {}
+    running: dict[int, tuple[int, int]] = {}
+    started = 0
+    worst = 0
+
+    def start_round(s: int) -> None:
+        nonlocal worst
+        replica, ticket = affinity.route(prompts[s], now=now)
+        running[s] = (replica, ticket)
+        worst = max(worst, max(affinity._inflight))
+        length = 1.0 + ((s * 7 + done_rounds[s] * 3) % 5)  # 1-5 s, varied
+        heapq.heappush(events, (now + length, s, "end"))
+
+    def new_session() -> None:
+        nonlocal started
+        s = started
+        started += 1
+        prompts[s] = _session(s + 1, 100)
+        done_rounds[s] = 0
+        start_round(s)
+
+    for _ in range(slots):
+        new_session()
+    while events:
+        now, s, what = heapq.heappop(events)
+        if what == "end":
+            replica, ticket = running.pop(s)
+            affinity.finish(ticket, replica, now=now)
+            done_rounds[s] += 1
+            if done_rounds[s] < rounds:
+                heapq.heappush(events, (now + wait, s, "next"))
+            elif started < sessions:
+                now += 0.002  # the successor arrives milliseconds later
+                new_session()
+        else:
+            prompts[s] = prompts[s] + tuple(range(-50 * done_rounds[s], -50 * done_rounds[s] + 50))
+            start_round(s)
+    return worst
+
+
+def test_successor_retirement_keeps_replicas_balanced() -> None:
+    balanced = Affinity(4, min_tokens=16)
+    assert _closed_loop(balanced, slots=8, sessions=48, rounds=6, wait=0.3) <= 2
+    assert balanced.stats(now=balanced._clock)["retired_successors"] == 40
+    old = Affinity(4, min_tokens=16, idle_seconds=10.0, successor_seconds=0)
+    assert _closed_loop(old, slots=8, sessions=48, rounds=6, wait=0.3) >= 3
+    assert old.stats(now=old._clock)["share_over_2"] > 0
+    assert balanced.stats(now=balanced._clock)["share_over_2"] == 0
+
+
+def test_a_session_in_a_tool_wait_still_counts() -> None:
+    affinity = Affinity(2, min_tokens=16)
+    a, b = _session(1, 100), _session(2, 100)
+    ra, ta = affinity.route(a, now=0.0)
+    rb, tb = affinity.route(b, now=0.0)
+    affinity.finish(ta, ra, now=1.0)  # a rests for 0.6 s before its next round
+    assert affinity.load(now=1.6) == [1, 1]
+    affinity.finish(tb, rb, now=1.7)  # b ended for good; its successor comes at once
+    c, tc = affinity.route(_session(3, 100), now=1.702)
+    assert c == rb  # b retired, its replica preferred; a still counts on its own
+    assert affinity.load(now=1.702) == [1, 1]
+    # a's next round keeps its replica
+    assert affinity.route(a + _session(4, 20), now=1.75)[0] == ra
+
+
+def test_a_new_session_with_no_recent_end_retires_nothing() -> None:
+    affinity = Affinity(2, min_tokens=16)
+    r, t = affinity.route(_session(1, 100), now=0.0)
+    affinity.finish(t, r, now=1.0)
+    other, _ = affinity.route(_session(2, 100), now=1.5)  # 0.5 s later: not a successor
+    assert other != r
+    assert affinity.stats(now=1.5)["retired_successors"] == 0
+
+
+def test_balance_flag_selects_the_placement() -> None:
+    new = router.make_affinity(4, {})
+    assert (new.idle_seconds, new.successor_seconds) == (1.5, 0.25)
+    old = router.make_affinity(4, {"ENGINE_ROUTER_BALANCE": "0"})
+    assert (old.idle_seconds, old.successor_seconds) == (10.0, 0.0)
+    tuned = router.make_affinity(4, {"ENGINE_SESSION_IDLE_SECONDS": "3"})
+    assert tuned.idle_seconds == 3.0
 
 
 def test_chat_history_matches_message_by_message() -> None:

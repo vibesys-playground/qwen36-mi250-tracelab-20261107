@@ -333,6 +333,61 @@ class Generator:
 
     def start(self, prompt: tuple[int, ...], sampling: Sampling) -> Generation:
         """Validate lengths, reuse the longest usable snapshot, and prefill the rest of the prompt."""
+        max_tokens = self._validate(prompt, sampling)
+        if self.fast is not None:
+            return self._start_fast(prompt, sampling, max_tokens)
+        with torch.inference_mode():
+            reused, cache = self._prefix_cache.lookup(prompt)
+            if cache is None:
+                cache = DynamicCache(config=self.model.config)
+            logits = self.prefill(prompt, reused, cache)
+        return Generation(self, sampling, reused, cache, logits, max_tokens)
+
+    def start_many(
+        self, requests: list[tuple[tuple[int, ...], Sampling]]
+    ) -> list[Generation | Exception]:
+        """``start`` for several prompts, with their prefill chunks packed into shared passes.
+
+        Returns, per request, its ``Generation`` or the exception ``start``
+        would have raised. Without packing (``packing`` is False) it calls
+        ``start`` per request.
+        """
+        if not self.packing or len(requests) == 1:
+            results: list[Generation | Exception] = []
+            for prompt, sampling in requests:
+                try:
+                    results.append(self.start(prompt, sampling))
+                except Exception as exc:  # noqa: BLE001 - reported per request
+                    results.append(exc)
+            return results
+        packer = PackedPrefill(self)
+        tickets = [packer.add(prompt, sampling) for prompt, sampling in requests]
+        done: dict[int, Generation | Exception] = dict(packer.failed())
+        while packer.busy:
+            done.update(packer.step())
+        return [done[t] for t in tickets]
+
+    @property
+    def packing(self) -> bool:
+        """Whether prefill chunks of several requests share passes (fast path, ENGINE_PREFILL_PACK)."""
+        return self.fast is not None and os.environ.get("ENGINE_PREFILL_PACK", "1") != "0"
+
+    def _chunks(self, prompt: tuple[int, ...], start: int) -> list[tuple[int, int, bool]]:
+        """``_prefill_fast``'s passes as (begin, end, snapshot after) spans."""
+        body = len(prompt) - 1
+        last_boundary = (body // self._chunk) * self._chunk
+        spans = []
+        position = start
+        while position < body:
+            end = min((position // self._chunk + 1) * self._chunk, body)
+            store = (end == last_boundary and end != body) or end == body
+            spans.append((position, end, store))
+            position = end
+        spans.append((body, len(prompt), False))
+        return spans
+
+    def _validate(self, prompt: tuple[int, ...], sampling: Sampling) -> int:
+        """``start``'s checks; the request's max_tokens."""
         if not prompt:
             raise RequestError("prompt must contain at least one token")
         if any(t >= self.model.config.vocab_size for t in prompt):
@@ -343,15 +398,7 @@ class Generator:
                 f"prompt ({len(prompt)} tokens) plus max_tokens ({sampling.max_tokens}) "
                 f"exceeds the context length {self.max_model_len}"
             )
-        max_tokens = sampling.max_tokens if sampling.max_tokens is not None else budget
-        if self.fast is not None:
-            return self._start_fast(prompt, sampling, max_tokens)
-        with torch.inference_mode():
-            reused, cache = self._prefix_cache.lookup(prompt)
-            if cache is None:
-                cache = DynamicCache(config=self.model.config)
-            logits = self.prefill(prompt, reused, cache)
-        return Generation(self, sampling, reused, cache, logits, max_tokens)
+        return sampling.max_tokens if sampling.max_tokens is not None else budget
 
     # ---------------------------------------------------------------- fast path
 
@@ -494,3 +541,123 @@ class Generator:
             sorted_probs[outside] = 0.0
             probs = torch.zeros_like(probs).scatter_(0, order, sorted_probs)
         return int(torch.multinomial(probs, 1, generator=rng))
+
+
+@dataclass
+class _Pending:
+    """One request inside a ``PackedPrefill``: its slot and the chunks still to run."""
+
+    ticket: int
+    prompt: tuple[int, ...]
+    sampling: Sampling
+    max_tokens: int
+    slot: int
+    reused: int
+    spans: list[tuple[int, int, bool]]
+    at: int = 0
+
+
+class PackedPrefill:
+    """Prefill of several requests on the fast path, one shared pass per ``step``.
+
+    ``add`` validates a request, takes a slot and restores its longest usable
+    prefix snapshot, exactly as ``Generator.start``; its prompt is split into
+    the chunks ``start`` would run (``Generator._chunks``), with the same
+    snapshots at the same boundaries. Each ``step`` runs the next chunk of every
+    pending request that fits ``ENGINE_PREFILL_PACK_TOKENS`` tokens (default
+    8192; the oldest request always fits) as one ``FastModel.prefill_packed``
+    pass and returns the requests it finished. Requests may be added between
+    steps, so a caller can interleave passes with decode steps and admit new
+    arrivals into the next pass. A failed pass fails only its own requests.
+    """
+
+    def __init__(self, generator: Generator) -> None:
+        self._g = generator
+        self._budget = int(os.environ.get("ENGINE_PREFILL_PACK_TOKENS", "8192"))
+        self._pending: list[_Pending] = []
+        self._failed: list[tuple[int, Exception]] = []
+        self._tickets = 0
+        self.passes = 0
+        self.packed_segments = 0
+
+    @property
+    def busy(self) -> bool:
+        return bool(self._pending)
+
+    def add(self, prompt: tuple[int, ...], sampling: Sampling) -> int:
+        """Queue a request; its ticket, under which ``step`` or ``failed`` reports it."""
+        g = self._g
+        ticket = self._tickets
+        self._tickets += 1
+        try:
+            max_tokens = g._validate(prompt, sampling)
+            g._reclaim()
+            if not g._free_slots:
+                raise RequestError("all sequence slots are busy; retry later", 503)
+            slot = g._free_slots.pop()
+            try:
+                reused, snap = g._prefix_cache.lookup(prompt)
+                if snap is not None:
+                    g.fast.restore(snap, slot)
+            except BaseException:
+                g.fast.reset(slot)
+                g._free_slots.append(slot)
+                raise
+        except Exception as exc:  # noqa: BLE001 - reported per request
+            self._failed.append((ticket, exc))
+            return ticket
+        self._pending.append(
+            _Pending(ticket, prompt, sampling, max_tokens, slot, reused, g._chunks(prompt, reused))
+        )
+        return ticket
+
+    def failed(self) -> list[tuple[int, Exception]]:
+        """Requests ``add`` refused since the last call."""
+        out, self._failed = self._failed, []
+        return out
+
+    def step(self) -> list[tuple[int, Generation | Exception]]:
+        """Run one packed pass; the requests whose prefill it finished (or failed)."""
+        g = self._g
+        batch, used = [], 0
+        for entry in self._pending:
+            begin, end, _ = entry.spans[entry.at]
+            if batch and used + (end - begin) > self._budget:
+                continue
+            batch.append(entry)
+            used += end - begin
+        segments = []
+        for entry in batch:
+            begin, end, _ = entry.spans[entry.at]
+            segments.append((entry.slot, entry.prompt[begin:end], begin))
+        self.passes += 1
+        self.packed_segments += len(segments)
+        done: list[tuple[int, Generation | Exception]] = []
+        try:
+            logits = g.fast.prefill_packed(segments)
+        except Exception as exc:  # noqa: BLE001 - the pass failed for every request in it
+            for entry in batch:
+                g.fast.reset(entry.slot)
+                g._free_slots.append(entry.slot)
+                done.append((entry.ticket, exc))
+            self._pending = [e for e in self._pending if all(e is not b for b in batch)]
+            return done
+        for row, entry in enumerate(batch):
+            _, end, store = entry.spans[entry.at]
+            if store:
+                g._prefix_cache.store(entry.prompt[:end], entry.slot)
+            entry.at += 1
+            if entry.at == len(entry.spans):
+                generation = Generation(
+                    g,
+                    entry.sampling,
+                    entry.reused,
+                    None,
+                    logits[row].clone(),
+                    entry.max_tokens,
+                    slot=entry.slot,
+                    length=len(entry.prompt),
+                )
+                done.append((entry.ticket, generation))
+        self._pending = [e for e in self._pending if e.at < len(e.spans)]
+        return done

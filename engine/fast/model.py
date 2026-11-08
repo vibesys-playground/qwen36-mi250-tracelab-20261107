@@ -157,6 +157,87 @@ class _Segment:
         return x
 
 
+@dataclass
+class _PackOnDevice:
+    """A packed prefill's index tensors on one device (see ``_PackPlan``)."""
+
+    positions: torch.Tensor  # [tokens] absolute position of each packed row
+    pages: torch.Tensor  # [tokens] KV page of each row
+    offsets: torch.Tensor  # [tokens] offset in that page
+    last: torch.Tensor  # [segments] each segment's last row
+    tables: list[torch.Tensor]  # per segment: its used pages, for attention
+    spans: list[tuple[int, int, int]]  # per segment: first row, rows, keys after it
+    single_rows: torch.Tensor | None  # rows of one-token segments
+    single_slots: torch.Tensor | None
+    multi_rows: torch.Tensor | None  # rows of longer segments, in packed order
+    multi_slots: torch.Tensor | None
+    multi_spans: list[tuple[int, int, int]]  # per longer segment: slot, first row in multi_rows, rows
+    pad_index: torch.Tensor | None  # multi row j -> its index in [segments x longest]
+    longest: int
+
+
+class _PackPlan:
+    """Where each packed row comes from, built once on the host, copied to each device once."""
+
+    def __init__(self, model: FastModel, segments: Sequence[tuple[int, Sequence[int], int]]) -> None:
+        tokens, positions, pages, offsets, last = [], [], [], [], []
+        self.spans: list[tuple[int, int, int]] = []
+        self.used: list[list[int]] = []
+        single_rows, single_slots, multi_rows, multi_slots = [], [], [], []
+        multi_spans, pad_index = [], []
+        longest = max((len(ids) for _, ids, _ in segments if len(ids) > 1), default=0)
+        row = 0
+        for slot, ids, start in segments:
+            count = len(ids)
+            total = start + count
+            table = model.slot_pages[slot]
+            tokens.extend(ids)
+            for pos in range(start, total):
+                positions.append(pos)
+                pages.append(table[pos // PAGE])
+                offsets.append(pos % PAGE)
+            self.spans.append((row, count, total))
+            self.used.append(table[: math.ceil(total / PAGE)])
+            if count == 1:
+                single_rows.append(row)
+                single_slots.append(slot)
+            else:
+                index = len(multi_spans)
+                multi_spans.append((slot, len(multi_rows), count))
+                pad_index.extend(range(index * longest, index * longest + count))
+                multi_rows.extend(range(row, row + count))
+                multi_slots.append(slot)
+            row += count
+            last.append(row - 1)
+        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        self._host = {
+            "positions": torch.tensor(positions, dtype=torch.long),
+            "pages": torch.tensor(pages, dtype=torch.long),
+            "offsets": torch.tensor(offsets, dtype=torch.long),
+            "last": torch.tensor(last, dtype=torch.long),
+            "single_rows": torch.tensor(single_rows, dtype=torch.long) if single_rows else None,
+            "single_slots": torch.tensor(single_slots, dtype=torch.long) if single_slots else None,
+            "multi_rows": torch.tensor(multi_rows, dtype=torch.long) if multi_rows else None,
+            "multi_slots": torch.tensor(multi_slots, dtype=torch.long) if multi_slots else None,
+            "pad_index": torch.tensor(pad_index, dtype=torch.long) if pad_index else None,
+        }
+        self.multi_spans = multi_spans
+        self.longest = longest
+        self._on: dict[torch.device, _PackOnDevice] = {}
+
+    def on(self, dev: torch.device) -> _PackOnDevice:
+        if dev not in self._on:
+            moved = {k: (None if v is None else v.to(dev)) for k, v in self._host.items()}
+            self._on[dev] = _PackOnDevice(
+                tables=[torch.tensor(u, dtype=torch.long, device=dev) for u in self.used],
+                spans=self.spans,
+                multi_spans=self.multi_spans,
+                longest=self.longest,
+                **moved,
+            )
+        return self._on[dev]
+
+
 class FastModel:
     """Slot-state Qwen3.6 text forward; one thread owns it."""
 
@@ -637,6 +718,127 @@ class FastModel:
                 )
             )
         out = torch.cat(outs, dim=2)[0].transpose(0, 1).reshape(count, -1)
+        out = out * torch.sigmoid(gate)
+        return F.linear(out, m.o_proj.weight)
+
+    # ---------------------------------------------------------------- packed prefill
+
+    @torch.inference_mode()
+    def prefill_packed(self, segments: Sequence[tuple[int, Sequence[int], int]]) -> torch.Tensor:
+        """Run several sequences' prefill chunks in one pass; fp32 logits [segments, vocab].
+
+        Each segment ``(slot, ids, start)`` is what ``prefill(slot, ids, start)``
+        would run, and leaves its slot in the same state. The segments' tokens
+        are concatenated, so every projection, router, shared expert and routed
+        expert runs once over all of them (weights read once, one launch
+        sequence per pass instead of one per request). What is per sequence
+        stays per sequence: the short convolution and recurrent state of each
+        Gated DeltaNet layer (one chunked delta-rule call over the segments,
+        right-padded to the longest with zero keys, values, decays and betas,
+        which leave a state unchanged), and each segment's paged KV writes and
+        causal attention. One-token segments take the decode recurrence, as
+        ``prefill`` does.
+        """
+        slots = [slot for slot, _, _ in segments]
+        if len(set(slots)) != len(slots):
+            raise ValueError("a packed prefill holds at most one segment per slot")
+        if any(len(ids) == 0 for _, ids, _ in segments):
+            raise ValueError("an empty prefill segment")
+        if len(segments) == 1:
+            slot, ids, start = segments[0]
+            return self.prefill(slot, ids, start)[None]
+        for slot, ids, start in segments:
+            self._ensure_pages(slot, start + len(ids))
+        plan = _PackPlan(self, segments)
+        x = F.embedding(plan.tokens.to(self.embed.device), self.embed)
+        for i, layer in enumerate(self.layers):
+            ldev = layer.input_layernorm.weight.device
+            x = x.to(ldev)
+            h = _rms(x, layer.input_layernorm.weight, self.eps)
+            if self.layer_types[i] == "linear_attention":
+                h = self._gdn_prefill_packed(i, h, plan.on(ldev))
+            else:
+                h = self._attn_prefill_packed(i, h, plan.on(ldev))
+            x = x + h
+            h = _rms(x, layer.post_attention_layernorm.weight, self.eps)
+            x = x + self._moe(layer.mlp, h)
+        x = x.index_select(0, plan.on(x.device).last).to(self.final_norm.device)
+        x = _rms(x, self.final_norm, self.eps).to(self.lm_head.device)
+        return F.linear(x, self.lm_head).float()
+
+    def _gdn_prefill_packed(self, i: int, x: torch.Tensor, p: _PackOnDevice) -> torch.Tensor:
+        m = self.layers[i].linear_attn
+        out = torch.empty_like(x)
+        if p.single_rows is not None:  # one-token segments: the recurrent rule, as ``prefill``
+            out.index_copy_(
+                0, p.single_rows, self._gdn_decode(i, x.index_select(0, p.single_rows), p.single_slots)
+            )
+        if p.multi_rows is None:
+            return out
+        conv_state, rec_state = self.gdn_state[i]
+        xm = x.index_select(0, p.multi_rows)
+        qkv, z, b, a = self._gdn_project(m, xm)
+        kernel = m.conv_kernel_size
+        weight = m.conv1d.weight
+        mixed_parts = []
+        for slot, lo, count in p.multi_spans:  # per-sequence short convolution and its state
+            window = torch.cat((conv_state[slot], qkv[lo : lo + count].transpose(0, 1)), dim=-1)
+            conv_state[slot].copy_(window[:, -kernel:])
+            conv = F.conv1d(window.unsqueeze(0), weight, None, groups=m.conv_dim)[0, :, -count:]
+            mixed_parts.append(conv)
+        mixed = F.silu(torch.cat(mixed_parts, dim=-1).to(qkv.dtype)).transpose(0, 1)
+        q, k, v, g, beta = self._gdn_heads(m, mixed, b, a)
+        batch, longest = len(p.multi_spans), p.longest
+
+        def padded(t: torch.Tensor) -> torch.Tensor:
+            buf = t.new_zeros((batch * longest, *t.shape[1:]))
+            buf.index_copy_(0, p.pad_index, t)
+            return buf.view(batch, longest, *t.shape[1:])
+
+        core, final = hf.torch_chunk_gated_delta_rule(
+            padded(q),
+            padded(k),
+            padded(v),
+            g=padded(g),
+            beta=padded(beta),
+            initial_state=rec_state.index_select(0, p.multi_slots),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        rec_state.index_copy_(0, p.multi_slots, final)
+        core = core.reshape(batch * longest, *core.shape[2:]).index_select(0, p.pad_index)
+        out.index_copy_(0, p.multi_rows, self._gdn_out(m, core, z))
+        return out
+
+    def _attn_prefill_packed(self, i: int, x: torch.Tensor, p: _PackOnDevice) -> torch.Tensor:
+        m, q, k, v, gate = self._qkv(i, x, p.positions)
+        k_pool, v_pool = self.kv[i]
+        k_pool[p.pages, :, p.offsets] = k
+        v_pool[p.pages, :, p.offsets] = v
+        heads = k.shape[1]
+        q_heads = q.shape[1]
+        outs = []
+        for (lo, count, total), table in zip(p.spans, p.tables, strict=True):
+            keys = k_pool[table].permute(1, 0, 2, 3).reshape(heads, -1, m.head_dim)[None, :, :total]
+            values = v_pool[table].permute(1, 0, 2, 3).reshape(heads, -1, m.head_dim)[None, :, :total]
+            query = q[lo : lo + count].transpose(0, 1).unsqueeze(0)
+            positions = p.positions[lo : lo + count]
+            step = max(1, SCORE_BUDGET // (total * q_heads * 4))
+            key_pos = torch.arange(total, device=x.device)
+            for a in range(0, count, step):
+                b = min(count, a + step)
+                mask = key_pos[None, :] <= positions[a:b, None]
+                outs.append(
+                    F.scaled_dot_product_attention(
+                        query[:, :, a:b],
+                        keys,
+                        values,
+                        attn_mask=mask[None, None],
+                        scale=m.scaling,
+                        enable_gqa=q_heads != heads,
+                    )[0].transpose(0, 1)
+                )
+        out = torch.cat(outs, dim=0).reshape(x.shape[0], -1)
         out = out * torch.sigmoid(gate)
         return F.linear(out, m.o_proj.weight)
 

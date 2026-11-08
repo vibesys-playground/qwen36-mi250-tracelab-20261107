@@ -134,7 +134,7 @@ def _to(mlp, dev):
     return mlp
 
 
-@pytest.mark.parametrize("tokens", [17, 90])
+@pytest.mark.parametrize("tokens", [17, 90, 200])
 def test_moe_block_matches_eager(tokens):
     dev = _device()
     experts, hidden, inter, k = 16, 64, 32, 4

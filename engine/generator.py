@@ -42,6 +42,15 @@ memory, instead of one argmax and one blocking ``int()`` per request on a
 cloned logits row. ``torch.argmax`` over the batch returns the same index as
 over each row alone (the first maximum), so greedy outputs do not change.
 Sampled requests keep their cloned row and ``pick``.
+
+Launched steps (``ENGINE_LOOKAHEAD``, on unless "0"): on the fast path, a decode
+step whose requests are all greedy can be queued without waiting (``launch``):
+its inputs are staged in pinned memory and copied without blocking, and only
+its picks (a verify step's two picks and two drafts per request, or a plain
+step's argmax) are copied back, into pinned memory, as it ends. ``collect``
+waits for them and applies them exactly as the synchronous step does
+(``speculative.apply``). A request with a launched step still in flight keeps
+no session tail (the server never lets that happen; see ``engine.server``).
 """
 
 from __future__ import annotations

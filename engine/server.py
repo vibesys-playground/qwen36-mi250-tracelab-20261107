@@ -27,6 +27,17 @@ request's end depends on token ids alone (length, end of sequence), which the
 worker still decides; the text and chunks are the same as when the worker
 renders them. Requests with stop strings, whose end depends on the text, are
 rendered on the worker as before.
+
+With ``ENGINE_LOOKAHEAD`` on (the default; "0" turns it off) a fast-path decode
+step whose requests are all greedy is launched without waiting
+(``Generator.launch``) and collected at the top of the next loop, before new
+jobs are admitted, so a prefill still runs right after the step in flight.
+When the collected step leaves every one of its requests needing another step
+after the tokens it picked (known from the token ids: length, end of sequence;
+never for requests with stop strings) and no request joins, the next step is
+launched from those picks at once, and the jobs take their tokens while it
+runs (one-step lookahead). The batch, the inputs and the order of steps are the
+ones the synchronous loop runs, so outputs and session tails do not change.
 """
 
 from __future__ import annotations
@@ -108,6 +119,8 @@ class Worker:
     chunk of each waiting prompt, hands the prompts that finished to decoding,
     and runs one decode step for every running job. Otherwise each new job is
     prefilled alone (``Generator.start``) before the decode step, as before.
+    With ``ENGINE_LOOKAHEAD`` the decode step may be in flight across loops
+    (see the module doc).
     """
 
     def __init__(self, generator: Generator) -> None:

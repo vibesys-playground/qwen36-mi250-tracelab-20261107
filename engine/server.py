@@ -34,7 +34,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import experts, protocol, router
+from engine import experts, looptimers, protocol, router
 from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
 from engine.protocol import (
     ChatRequest,
@@ -113,7 +113,12 @@ class Worker:
                     break
                 if isinstance(event, (AwaitDecode, Prefill)):
                     return event
-                job.events.put(event)
+                if looptimers.ENABLED:
+                    t = looptimers.now()
+                    job.events.put(event)
+                    looptimers.add("emit", looptimers.now() - t)
+                else:
+                    job.events.put(event)
                 event = next(events)
         except StopIteration:
             pass
@@ -146,7 +151,15 @@ class Worker:
         packer = PackedPrefill(g) if g.packing else None
         prefilling: dict[int, tuple[Job, Iterator[Any]]] = {}
         running: list[tuple[Job, Iterator[Any]]] = []
+        timed = looptimers.ENABLED
+        T = looptimers
+        prev_batch: int | None = None
         while True:
+            if timed:
+                T.begin()
+                t_mark = T.now()
+                arrivals = 0
+                prefilled = False
             block = not running and not prefilling
             ready: list[tuple[Job, Iterator[Any], Generation]] = []
             serial: list[tuple[Job, Iterator[Any], Prefill]] = []
@@ -156,6 +169,8 @@ class Worker:
                 except queue.Empty:
                     break
                 block = False
+                if timed:
+                    arrivals += 1
                 events = job.run()
                 want = self._advance(job, events)
                 if not isinstance(want, Prefill):
@@ -166,6 +181,10 @@ class Worker:
                     serial.append((job, events, want))
                 else:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
+            if timed:
+                t = T.now()
+                T.add("poll", t - t_mark)
+                t_mark = t
             if packer is not None:
                 for ticket, exc in packer.failed():
                     self._fail(*prefilling.pop(ticket), exc)
@@ -176,15 +195,29 @@ class Worker:
                             self._fail(job, events, result)
                         else:
                             ready.append((job, events, result))
+                    if timed:
+                        prefilled = True
+            if timed:
+                t = T.now()
+                T.add("prefill", t - t_mark)
+                t_mark = t
             waiting = []
             for job, events in running:
                 want = self._advance_all(job, events)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
+            if timed:
+                t = T.now()
+                T.add("adv", t - t_mark)
+                t_mark = t
             for job, events, generation in ready:
                 want = self._advance_all(job, events, generation)
                 if isinstance(want, AwaitDecode):
                     waiting.append((job, events, want.generation))
+            if timed:
+                t = T.now()
+                T.add("adv_new", t - t_mark)
+                t_mark = t
             # Unpacked: each new job is prefilled and emits its first token before the next
             # job's prefill, after the running jobs' tokens (the order the base engine used).
             for job, events, prefill in serial:
@@ -200,7 +233,14 @@ class Worker:
             if not waiting:
                 continue
             try:
-                g.decode([generation for _, _, generation in waiting])
+                if timed:
+                    batch = [generation for _, _, generation in waiting]
+                    T.add("pre", T.now() - t_mark)
+                    g.decode(batch)
+                    T.finish(prev_batch, arrivals, prefilled, T.cur.get("_tokens", 0))
+                    prev_batch = len(batch)
+                else:
+                    g.decode([generation for _, _, generation in waiting])
             except Exception as exc:  # the step failed for every request in it
                 for job, _, _ in waiting:
                     job.events.put(_internal(exc))
@@ -234,6 +274,19 @@ class _Output:
             self.in_reasoning = False
             self._detok = Detokenizer(self._generator.tokenizer)
             return tail, ""
+        if looptimers.ENABLED:
+            looptimers.cur["_tokens"] = looptimers.cur.get("_tokens", 0) + 1
+            t = looptimers.now()
+            text = self._detok.push(step.token_id)
+            t1 = looptimers.now()
+            looptimers.add("detok", t1 - t)
+            if self.in_reasoning:
+                self.reasoning.append(text)
+                return text, ""
+            out = self._matcher.push(text)
+            looptimers.add("stop", looptimers.now() - t1)
+            self.content.append(out)
+            return "", out
         text = self._detok.push(step.token_id)
         if self.in_reasoning:
             self.reasoning.append(text)
@@ -290,13 +343,18 @@ def completion_job(
         if step.emit:
             token_ids.append(step.token_id)
         if request.stream:
-            yield protocol.completion_chunk(
+            if looptimers.ENABLED:
+                t = looptimers.now()
+            chunk = protocol.completion_chunk(
                 env,
                 text,
                 step.token_id if step.emit else None,
                 finish_now,
                 request.return_token_ids,
             )
+            if looptimers.ENABLED:
+                looptimers.add("chunk", looptimers.now() - t)
+            yield chunk
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
@@ -334,13 +392,18 @@ def chat_job(
                     "reasoning_content": reasoning,
                     **({"content": content} if content else {}),
                 }
-            yield protocol.chat_chunk(
+            if looptimers.ENABLED:
+                t = looptimers.now()
+            chunk = protocol.chat_chunk(
                 env,
                 delta,
                 step.token_id if step.emit else None,
                 finish_now,
                 request.return_token_ids,
             )
+            if looptimers.ENABLED:
+                looptimers.add("chunk", looptimers.now() - t)
+            yield chunk
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
@@ -377,7 +440,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._send_json(200, {"status": "ok", **self.server.generator.stats()})
+            self._send_json(
+                200, {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
+            )
         elif self.path == "/v1/models":
             card = {
                 "id": self.server.model_name,

@@ -55,6 +55,7 @@ from typing import Any
 import torch
 from torch.nn import functional as F
 
+from engine import looptimers
 from engine.fast import kernels
 from engine.fast.model import PAGE, FastModel, Snapshot, _PackPlan, _rms
 
@@ -945,6 +946,9 @@ class TPModel:
         r0 = self.ranks[0]
         if r0.mtp is None:
             raise RuntimeError("verify needs the MTP head")
+        timed = looptimers.ENABLED
+        if timed:
+            t0 = looptimers.now()
         batch = len(tokens)
         for slot, position in zip(slots, positions, strict=True):
             r0._ensure_pages(slot, position + 2)
@@ -964,10 +968,30 @@ class TPModel:
             host[1, half : half + batch] = torch.tensor(list(slots), dtype=torch.long)
             host[2, half : half + batch] = torch.tensor(list(pos), dtype=torch.long)
             host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
+        if timed:
+            stream0 = torch.cuda.current_stream(r0.vsegments[0].device)
+            ev_start, ev_mid, ev_end = (torch.cuda.Event(enable_timing=True) for _ in range(3))
+            ev_start.record(stream0)
+            looptimers.cur["_build_t"] = looptimers.now()
         self._load_inputs(host)
+        if timed:
+            t1 = looptimers.now()
+            looptimers.add("build", t1 - t0)
+            looptimers.replay_start()
         outs, out = self._run(size, rows, verify=True)
+        if timed:
+            ev_mid.record(stream0)
+            t2 = looptimers.now()
+            looptimers.add("launch", t2 - t1)
         logits = self._gather([o[:batch] for o in outs])
+        if timed:
+            ev_end.record(stream0)
+            t3 = looptimers.now()
+            looptimers.add("gather", t3 - t2)
         picks = out.cpu().tolist()
+        if timed:
+            looptimers.add("wait", looptimers.now() - t3)
+            looptimers.picks_ready(batch, ev_start, ev_mid, ev_end)
         g, d = picks[0], picks[1]
         return logits, g[:batch], g[size : size + batch], d[:batch], d[size : size + batch]
 

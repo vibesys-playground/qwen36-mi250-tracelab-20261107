@@ -39,9 +39,20 @@ from engine.fast import kernels
 triton, tl = kernels.triton, kernels.tl
 
 MAX_ROWS = int(os.environ.get("ENGINE_FUSED_MAX_ROWS", "8"))
-# Every GEMV runs with the same row tile (``_pow2(MAX_ROWS)``) and K chunk whatever its row
-# count, so a row's result never depends on how many rows share the launch: a verify step
-# (two rows per slot) gives a slot's first token exactly the logits a decode step gives it.
+# Row tiling of the fused GEMVs (ENGINE_FUSED_ROW_TILE):
+# - "pairs" (default): rows run in blocks of 2 with the B=1 tiles (4 x 2048), a block per
+#   work item, so a row's sum order never depends on how many rows share the launch;
+# - "fixed": one block of pow2(MAX_ROWS) rows with 4 x 1024 tiles (also row-count invariant);
+# - "rows": the block covers all rows and its tiles follow the row count (plan 11's
+#   original; a verify step then sums a slot's first token differently from a decode step).
+ROW_TILE = os.environ.get("ENGINE_FUSED_ROW_TILE", "pairs")
+# The final norm and lm_head of a fused step through the per-row Triton RMSNorm and the fused
+# GEMV (ENGINE_FUSED_HEAD=1), so a slot's logits are the same in decode and verify steps; its
+# own tiles (ENGINE_FUSED_HEAD_TILE="bn,bk") and grid (programs per CU, ENGINE_FUSED_HEAD_GRID).
+HEAD = os.environ.get("ENGINE_FUSED_HEAD", "1") == "1"
+HEAD_TILE = tuple(int(v) for v in os.environ.get("ENGINE_FUSED_HEAD_TILE", "4,2048").split(","))
+HEAD_GRID = int(os.environ.get("ENGINE_FUSED_HEAD_GRID", "2"))
+GRID = int(os.environ.get("ENGINE_FUSED_GRID", "2"))
 # Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
 # From a sweep on one gfx90a GCD (j71): 4 x 2048 beat 8 x 1024 and 16 x 512 at 4 and 8 rows.
 TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
@@ -72,11 +83,13 @@ if triton is not None:
         """
         pid = tl.program_id(0)
         nprog = tl.num_programs(0)
-        bs = tl.arange(0, BP)
-        bok = bs < R
-        for t in range(pid, tl.cdiv(N, BN), nprog):
-            rows = t * BN + tl.arange(0, BN)
+        for t in range(pid, tl.cdiv(N, BN) * tl.cdiv(R, BP), nprog):
+            # Tile t: BN outputs of one block of BP rows. A row is always summed with the
+            # same [BN, BP, BK] shape and K chunks, whichever block it falls in.
+            rows = (t // tl.cdiv(R, BP)) * BN + tl.arange(0, BN)
             rok = rows < N
+            bs = (t % tl.cdiv(R, BP)) * BP + tl.arange(0, BP)
+            bok = bs < R
             acc = tl.zeros([BN, BP], dtype=tl.float32)
             for k0 in range(0, K, BK):
                 cols = k0 + tl.arange(0, BK)
@@ -404,28 +417,42 @@ class FusedDecode:
                              if dev.type == "cuda" else 4)
         return self.cus[dev]
 
-    def gemv(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """bf16(x @ w.T) for up to ``max_rows`` rows, with the row-count-independent tiles."""
-        return self._gemv(x.contiguous(), w)
+    def head(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """bf16(x @ w.T) for the lm_head: its own tiles and grid (``HEAD_TILE``,
+        ``HEAD_GRID``), rows in blocks of 2 (or as ``ROW_TILE`` says for "fixed"/"rows")."""
+        x = x.contiguous()
+        bp, _, _ = self._tiles(x.shape[0], x.shape[1])
+        bn, bk = HEAD_TILE
+        return self._gemv(x, w, tiles=(bp, bn, min(bk, _pow2(x.shape[1]))), grid_per_cu=HEAD_GRID)
 
     def _is_gdn(self, i: int) -> bool:
         return i < len(self.fast.layers) and self.fast.layer_types[i] == "linear_attention"
 
     # ---------------------------------------------------------------- pieces
 
+    def _tiles(self, rows: int, k: int) -> tuple[int, int, int]:
+        """(row block, outputs per tile, K chunk) of a GEMV (see ``ROW_TILE``)."""
+        if ROW_TILE == "pairs":
+            bp = 2
+        elif ROW_TILE == "fixed":
+            bp = max(2, _pow2(self.max_rows))
+            assert rows <= bp, (rows, bp)
+        else:
+            bp = max(2, _pow2(rows))
+        bk = min(TILES["bk4"] if bp <= 4 else TILES["bk8"], _pow2(k))
+        return bp, TILES["bn"], bk
+
     def _gemv(self, x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None,
-              conv: tuple | None = None) -> torch.Tensor:
+              conv: tuple | None = None, tiles: tuple[int, int, int] | None = None,
+              grid_per_cu: int = GRID) -> torch.Tensor:
         rows, k = x.shape
         n = w.shape[0]
         assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
-        # One row tile and K chunk for every row count (see ``MAX_ROWS``).
-        bp = max(2, _pow2(self.max_rows))
-        assert rows <= bp, (rows, bp)
-        bk = min(TILES["bk4"] if bp <= 4 else TILES["bk8"], _pow2(k))
-        bn = TILES["bn"]
-        grid = min(triton.cdiv(n, bn), 2 * self._cus(x.device))
+        bp, bn, bk = tiles or self._tiles(rows, k)
+        work = triton.cdiv(n, bn) * triton.cdiv(rows, bp)
+        grid = min(work, grid_per_cu * self._cus(x.device))
         if conv is None:
             state, slots, cw, conv_n, kc = out, out, out, 0, 2
             stride_slot = 0

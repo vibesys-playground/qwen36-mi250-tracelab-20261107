@@ -30,7 +30,7 @@ import torch
 from torch.nn import functional as F
 
 from engine.fast.kernels import INTERPRET, on_device, tl, triton
-from engine.fast import moe_prefill
+from engine.fast import flash_prefill, moe_prefill
 
 _WIDEN = INTERPRET  # see ``moe_prefill``: the interpreter's BF16 dot and rounding
 
@@ -38,6 +38,15 @@ _WIDEN = INTERPRET  # see ``moe_prefill``: the interpreter's BF16 dot and roundi
 def enabled() -> bool:
     """``ENGINE_PREFILL_FUSED`` (default on)."""
     return os.environ.get("ENGINE_PREFILL_FUSED", "1") != "0"
+
+
+def flash_enabled() -> bool:
+    """``ENGINE_PREFILL_FLASH`` (default on): ``prefill_attention`` runs the MFMA-tiled flash
+    kernel of ``engine.fast.flash_prefill`` (plan 35); 0 restores ``_prefill_attn_kernel``."""
+    return os.environ.get("ENGINE_PREFILL_FLASH", "1") != "0"
+
+
+_FLASH = flash_enabled()
 
 
 if triton is not None:
@@ -319,6 +328,16 @@ def prefill_attention(
     """Gated causal attention of ``q`` [T, q_heads, dim] at positions ``start``... over the
     first ``start + T`` cached tokens, whose pages are ``table`` (the slot's page list, its
     KV already written): [T, q_heads * dim] BF16, as ``prefill_attention_reference``."""
+    if _FLASH:
+        return flash_prefill.flash_prefill_attention(q, k_pool, v_pool, table, start, gate, scale, out)
+    return prefill_attention_rows(q, k_pool, v_pool, table, start, gate, scale, out)
+
+
+def prefill_attention_rows(
+    q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
+    start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``_prefill_attn_kernel`` (the path before plan 35, ``ENGINE_PREFILL_FLASH=0``)."""
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads

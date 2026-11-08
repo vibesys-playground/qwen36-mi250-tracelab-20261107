@@ -146,6 +146,10 @@ def checks(fn, ref, base=None) -> dict:
 
 
 def cfg_name(c: dict) -> str:
+    if c.get("head"):
+        return "head _prefill_attn_kernel"
+    if not c:
+        return "auto (flash_prefill.choose)"
     parts = [f"R{c['block_r']}xN{c['block_n']}", f"w{c['num_warps']}", f"s{c['num_stages']}"]
     if not c.get("kt", True):
         parts.append("kNxD")
@@ -172,13 +176,16 @@ def child(args) -> None:
             torch.cuda.empty_cache()
             inp = make_inputs(count, start, "cuda")
             ref = reference(*inp[:4], start, inp[4])
-            base = prefill_kernels.prefill_attention(*inp[:4], start, inp[4], SCALE)
+            base = prefill_kernels.prefill_attention_rows(*inp[:4], start, inp[4], SCALE)
             cache[key] = (inp, ref, base)
         (q, k, v, table, gate), ref, base = cache[key]
         kw = dict(cfg)
-        fn = lambda: flash_prefill.flash_prefill_attention(  # noqa: E731
-            q, k, v, table, start, gate, SCALE, **kw
-        )
+        if kw.get("head"):
+            fn = lambda: prefill_kernels.prefill_attention_rows(q, k, v, table, start, gate, SCALE)  # noqa: E731
+        else:
+            fn = lambda: flash_prefill.flash_prefill_attention(  # noqa: E731
+                q, k, v, table, start, gate, SCALE, **kw
+            )
         rec = {"i": i, "count": count, "start": start, "cfg": cfg}
         try:
             t0 = time.time()
@@ -288,10 +295,13 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--shapes", default=",".join(f"{a}:{b}" for a, b in SHAPES))
     ap.add_argument("--child", default=None)
+    ap.add_argument("--tune", action="store_true", help="the tile/split crossover sweep over T")
     args = ap.parse_args()
     if args.child:
         child(args)
         return 0
+    if args.tune:
+        return tune(args)
 
     import torch
     import triton
@@ -313,7 +323,7 @@ def main() -> int:
         inp = make_inputs(count, start, "cuda")
         q, k, v, table, gate = inp
         ref = reference(q, k, v, table, start, gate)
-        fn = lambda: prefill_kernels.prefill_attention(q, k, v, table, start, gate, SCALE)  # noqa: E731
+        fn = lambda: prefill_kernels.prefill_attention_rows(q, k, v, table, start, gate, SCALE)  # noqa: E731
         rec = {"us": time_us(fn, args.reps)}
         rec.update(checks(fn, ref))
         head[(count, start)] = rec
@@ -415,6 +425,51 @@ def main() -> int:
     print(f"\nVERDICT: {verdict}: best at {KILL_SHAPE} = {us:.1f} us/layer ({cfg_name(best_at_kill['cfg'])}), "
           f"threshold {KILL_US:.0f} us; head {head[KILL_SHAPE]['us']:.1f} us")
     return 0 if verdict == "GO" else 3
+
+
+TUNE_T = [61, 128, 256, 400, 561, 700, 850, 1000, 1200, 1400, 1650]
+
+
+def tune(args) -> int:
+    """Per T (on a 3,600-token context, and 2,300 after 5,800): head, the auto choice and the
+    tiles/splits it chooses among; prints the best per T and auto's ratio to it."""
+    import torch
+
+    from engine.fast import flash_prefill
+
+    os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/triton_fpp")
+    scratch = Path(os.environ.get("TMPDIR", "/tmp")) / f"fpt_{os.getpid()}"
+    scratch.mkdir(parents=True, exist_ok=True)
+    shapes = [(t, 3600 - t) for t in TUNE_T] + [(2300, 5800)]
+    short = {"block_r": 8, "block_n": 64, "num_warps": 4, "num_stages": 1}
+    long = {"block_r": 16, "block_n": 128, "num_warps": 4, "num_stages": 1, "waves_per_eu": 1}
+    cfgs = [{"head": True}, {}]
+    cfgs += [{**short, "split": n} for n in (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)]
+    cfgs += [{**long, "split": n} for n in (1, 2, 3, 4)]
+    cfgs += [{"block_r": 16, "block_n": 64, "num_warps": 4, "num_stages": 1, "split": n} for n in (1, 2)]
+    jobs = [[c, s, cfg] for c, s in shapes for cfg in cfgs]
+    t0 = time.time()
+    res = run_children(jobs, args.reps, scratch)
+    print(f"tune: {len(jobs)} runs in {time.time() - t0:.0f} s", flush=True)
+    for r in sorted(res, key=lambda r: (r["count"], r.get("us", 1e18))):
+        if "us" in r:
+            print(f"TUNE {r['count']:>5}:{r['start']:<5} {cfg_name(r['cfg']):<40} {r['us']:9.1f} us  err {r['err']:.3e}  "
+                  f"repeat {r['repeat']}  graph {r['graph']}")
+        else:
+            print(f"TUNE {r['count']:>5}:{r['start']:<5} {cfg_name(r['cfg']):<40} FAILED {r['error']}")
+    print(f"\n{'new':>5} {'cached':>6} | {'head us':>9} | {'auto us':>8} {'auto choice':<34} | {'best us':>8} {'best':<34} | auto/best head/auto")
+    for c, s in shapes:
+        rows = [r for r in res if (r["count"], r["start"]) == (c, s) and "us" in r and r.get("repeat") and r.get("graph")]
+        head = next((r["us"] for r in rows if r["cfg"].get("head")), float("nan"))
+        auto = next((r["us"] for r in rows if not r["cfg"]), float("nan"))
+        flash = sorted((r for r in rows if r["cfg"] and not r["cfg"].get("head")), key=lambda r: r["us"])
+        ch = flash_prefill.choose(c, s, HEADS, QH // HEADS, CUS)
+        if flash:
+            b = flash[0]
+            print(f"{c:>5} {s:>6} | {head:9.1f} | {auto:8.1f} {cfg_name(ch):<34} | {b['us']:8.1f} {cfg_name(b['cfg']):<34} | "
+                  f"{auto / b['us']:8.2f} {head / auto:8.2f}")
+    del torch
+    return 0
 
 
 if __name__ == "__main__":

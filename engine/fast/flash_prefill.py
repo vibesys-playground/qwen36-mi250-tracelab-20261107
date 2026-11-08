@@ -1,4 +1,7 @@
-"""Plan 35 candidate (not wired): MFMA-tiled flash prefill attention over the paged KV cache.
+"""Plan 35: MFMA-tiled flash prefill attention over the paged KV cache.
+
+``prefill_kernels.prefill_attention`` calls it under ``ENGINE_PREFILL_FUSED`` (and
+``ENGINE_PREFILL_FLASH``, default on; 0 restores ``_prefill_attn_kernel``).
 
 Same interface, inputs and outputs as ``prefill_kernels.prefill_attention``: gated causal
 attention of ``q`` [T, QH, D] at positions ``start``... over the first ``start + T`` cached
@@ -173,27 +176,67 @@ if triton is not None:
         tl.store(out_ptr + row * D + d, _bf16(o * sig, WIDEN).to(tl.bfloat16))
 
 
+# Tile and split choice from shapes alone (plan 35, j163 and the tune sweep of its build job).
+# Short segments: 8 rows x GROUP heads per program, 64-key blocks, the keys split so the CUs
+# fill; long ones: 16 rows, 128-key blocks, no split once the tiles fill the CUs.
+LONG_FROM = 1000  # new tokens at which the 16-row x 128-key tile takes over
+SPLIT_PROGRAMS = 2.5  # target programs per CU of a split launch
+SPLIT_MAX = 16
+SPLIT_MIN_BLOCKS = 4  # key blocks per split at least
+
+_CUS: dict = {}
+
+
+def _cus(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 104
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _CUS:
+        _CUS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _CUS[idx]
+
+
+def choose(count: int, start: int, heads: int, group: int, cus: int = 104) -> dict:
+    """Launch knobs for a segment of ``count`` queries after ``start`` cached keys."""
+    if count >= LONG_FROM:
+        cfg = {"block_r": 16, "block_n": 128, "num_warps": 4, "num_stages": 1, "waves_per_eu": 1}
+    else:
+        cfg = {"block_r": 8, "block_n": 64, "num_warps": 4, "num_stages": 1}
+    cfg["block_r"] = max(cfg["block_r"], 16 // group)  # M = rows x group >= 16 for tl.dot
+    cfg["split"] = split_for(count, start, heads, cfg["block_r"], cfg["block_n"], cus)
+    return cfg
+
+
 def split_for(count: int, start: int, heads: int, rows: int, block_n: int, cus: int = 104) -> int:
     """Splits over the keys from shapes alone: enough programs for the CUs on short segments."""
     tiles = -(-count // rows) * heads
     if tiles >= cus:
         return 1
     blocks = -(-(start + count) // block_n)
-    return max(1, min(-(-cus // tiles), blocks // 4, 16))
+    want = math.ceil(SPLIT_PROGRAMS * cus / tiles)
+    return max(1, min(want, blocks // SPLIT_MIN_BLOCKS, SPLIT_MAX))
 
 
 def flash_prefill_attention(
     q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
     start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None, *,
-    block_r: int = 8, block_n: int = 64, split: int | None = None, kt: bool = True,
+    block_r: int | None = None, block_n: int = 64, split: int | None = None, kt: bool = True,
     num_warps: int = 4, num_stages: int = 1, **launch,
 ) -> torch.Tensor:
-    """As ``prefill_kernels.prefill_attention``; tile and launch knobs for the plan 35 sweep."""
+    """As ``prefill_kernels.prefill_attention``. Without ``block_r`` every knob comes from
+    ``choose`` (the engine's path); the knobs are for the plan 35 sweeps."""
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads
-    if split is None:
-        split = split_for(count, start, heads, block_r, block_n)
+    if block_r is None:
+        cfg = choose(count, start, heads, group, _cus(q.device))
+        block_r, block_n, split = cfg["block_r"], cfg["block_n"], cfg["split"]
+        num_warps, num_stages = cfg["num_warps"], cfg["num_stages"]
+        launch = {k: cfg[k] for k in ("waves_per_eu",) if k in cfg}
+    elif split is None:
+        split = split_for(count, start, heads, block_r, block_n, _cus(q.device))
+    if INTERPRET:
+        launch = {}  # AMD-only launch options
     if out is None:
         out = torch.empty((count, q_heads * dim), dtype=q.dtype, device=q.device)
     assert k_pool.stride() == v_pool.stride()

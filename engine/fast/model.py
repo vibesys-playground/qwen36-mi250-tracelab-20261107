@@ -470,7 +470,7 @@ class FastModel:
         ops: list[tuple[torch.device, Callable]] = [(self.embed.device, self._embed_op)]
         for i in range(len(self.layers)):
             ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i, verify)))
-        ops.append((self.final_norm.device, self._norm_op))
+        ops.append((self.final_norm.device, self._norm_op_for(verify)))
         ops.append((self.lm_head.device, self._verify_head_op if verify else self._head_op))
         segments: list[_Segment] = []
         for dev, op in ops:
@@ -702,8 +702,30 @@ class FastModel:
     def _norm_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         return _rms(x, self.final_norm, self.eps)
 
-    def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
+    def _norm_op_for(self, verify: bool) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
+        """The final norm of a decode (or verify) step: with the fused layers, the per-row
+        Triton RMSNorm, whose result for a row does not depend on how many rows run."""
+
+        def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
+            if self._fused_rows(x.shape[0], verify):
+                with kernels.on_device(x):
+                    return kernels.add_rms(x, None, self.final_norm, self.eps)[1]
+            return self._norm_op(x, meta)
+
+        return op
+
+    def _logits(self, x: torch.Tensor, verify: bool = False) -> torch.Tensor:
+        """fp32 logits of a decode (or verify) step's normed rows. With the fused layers the
+        lm_head runs through the fused GEMV, whose sum order is the same for every row count
+        (``engine.fast.fused``), so a slot's logits are the same in a decode step and in a
+        verify step; else ``F.linear`` (BF16 out, as the GEMV)."""
+        if self._fused_rows(x.shape[0], verify):
+            with kernels.on_device(x):
+                return self.fused.gemv(x, self.lm_head).float()
         return F.linear(x, self.lm_head).float()
+
+    def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
+        return self._logits(x)
 
     def _layer_op(self, i: int, verify: bool = False) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
         def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
@@ -1235,7 +1257,7 @@ class FastModel:
         """The verify step's last op: logits from the normed hidden ``x``, each row's greedy
         pick, and the MTP head on (hidden, pick) per row. Leaves ``[2, rows]`` (picks, drafts)
         in ``_verify_out``; returns the logits."""
-        logits = F.linear(x, self.lm_head).float()
+        logits = self._logits(x, verify=True)
         picks = logits.argmax(-1)
         self._verify_out = torch.stack((picks, self._mtp_decode(x, picks, meta)))
         return logits

@@ -1,6 +1,6 @@
 """Plan 22 step 0: work order and tiles of the fused MoE decode kernels on one gfx90a GCD.
 
-    python tools/moe_decode_bench.py [--devices 6,7] [--layers 4] [--samples 8] [--quick]
+    python tools/moe_decode_bench.py [--devices 6,7] [--layers 4] [--samples 8] [--quick] [--tp 2]
     TRITON_INTERPRET=1 python tools/moe_decode_bench.py --smoke     # CPU check of the kernels
 
 1. Routing and weights. One 2-GCD replica is loaded as the server loads it (``Generator.load``).
@@ -38,6 +38,11 @@
 3. The pick: per R the fastest up and down configs (any, and bitwise-identical), their
    up+down time per layer (kill rule: <= 150 us at R=4), and one fixed (up, down) config
    timed at every R.
+
+With ``--tp 2`` the model loads with ``ENGINE_TP=1`` (whole experts per GCD) and the sweep is
+repeated on rank 0's shard of a TP2 split (``engine.fast.tp._moe_shard``: expert and shared
+intermediate halved), the shape each GCD runs under the default ``ENGINE_TP=2``. The engine's
+own ``FusedDecode._moe`` is also timed at ``ENGINE_FUSED_MOE_ORDER`` 0 and 1 (plan 22 step 1).
 
 Prints ``RESULT`` lines. A hint for the plan, not the task's metric.
 """
@@ -262,7 +267,7 @@ def make_launchers(cus: int, max_rows: int):
             items = s.R * s.topk * triton.cdiv(L.I, bn)
             fused._moe_up_kernel[(min(items, 2 * cus),)](
                 s.h, s.idx, L.gu, act, s.R, L.gu.stride(0),
-                H=L.H, I=L.I, TOPK=s.topk, BN=bn, BK=min(1024, p2(L.H)), num_warps=4,
+                H=L.H, I=L.I, TOPK=s.topk, BN=bn, BK=min(1024, p2(L.H)), ORDER=0, num_warps=4,
             )
             return act
         o, g, bn, bk, w = cfg
@@ -285,7 +290,7 @@ def make_launchers(cus: int, max_rows: int):
             fused._moe_down_kernel[(min(items, 2 * cus),)](
                 act, s.r, s.idx, s.wt, L.dn, L.sd, s.x, outt, s.R, L.dn.stride(0), L.N3,
                 H=L.H, I=L.I, IS=L.IS, E=L.E, TOPK=s.topk, BN=bn,
-                BKI=min(1024, p2(L.I)), BKS=min(1024, p2(L.IS)), num_warps=4,
+                BKI=min(1024, p2(L.I)), BKS=min(1024, p2(L.IS)), ORDER=0, num_warps=4,
             )
             return outt
         o, g, bn, w = cfg
@@ -568,6 +573,7 @@ def smoke(args) -> None:
 
 def real(args) -> None:
     os.environ.setdefault("ENGINE_MTP", "1")
+    os.environ.setdefault("ENGINE_TP", "1")  # whole layers per GCD; the TP shard shape via --tp
     from engine.generator import CHECKPOINT, Generator
 
     started = time.perf_counter()
@@ -679,11 +685,16 @@ def real(args) -> None:
 
         def extra(up, down):
             # sanity: the cur launchers reproduce FusedDecode._moe bitwise; today's full MoE time
-            for R, sets in sets_by_r.items():
-                same = all(torch.equal(fd._moe(int(s.layer.name[1:]), s.x, s.h), s.ref_out) for s in sets)
-                us = time_us([lambda s=s: fd._moe(int(s.layer.name[1:]), s.x, s.h) for s in sets])
-                out(f"RESULT today_moe_full R={R} us={us:.1f} (router GEMV + top-k + up + down) "
-                    f"matches_cur_launchers={same} step_ms_41={us * 41 / 1e3:.2f}")
+            saved = fused.MOE_ORDER
+            for order in (0, 1):
+                fused.MOE_ORDER = order  # FusedDecode._moe as the engine runs it (plan 22 flag)
+                for R, sets in sets_by_r.items():
+                    same = all(torch.equal(fd._moe(int(s.layer.name[1:]), s.x, s.h), s.ref_out) for s in sets)
+                    us = time_us([lambda s=s: fd._moe(int(s.layer.name[1:]), s.x, s.h) for s in sets])
+                    out(f"RESULT engine_moe_full ENGINE_FUSED_MOE_ORDER={order} R={R} us={us:.1f} "
+                        f"(router GEMV + top-k + up + down) matches_cur_launchers={same} "
+                        f"step_ms_41={us * 41 / 1e3:.2f}")
+            fused.MOE_ORDER = saved
             big = torch.empty(int(256e6), dtype=torch.uint8, device=dev0)
             big2 = torch.empty_like(big)
             us = time_us([lambda: big2.copy_(big)], min_launches=8)
@@ -691,7 +702,34 @@ def real(args) -> None:
             del big, big2
 
         torch.cuda.set_device(dev0)
+        out("RESULT shape full experts (one GCD holds whole experts)")
         bench(sets_by_r, cus=cus, max_rows=fast.fused.max_rows, args=args, timing=True, extra=extra)
+        if args.tp > 1:
+            # Rank 0's shard of a TP split (engine.fast.tp._moe_shard): expert and shared
+            # intermediate width / tp; the router and shared_expert_gate replicated.
+            torch.cuda.empty_cache()
+            shard_sets: dict[int, list[Set]] = {}
+            shards = {}
+            for i in pick:
+                L = layers[i]
+                mlp = fast.layers[i].mlp
+                i2, s2 = L.I // args.tp, L.IS // args.tp
+                gu = torch.cat([L.gu[:, :i2], L.gu[:, L.I : L.I + i2]], dim=1).contiguous()
+                dn = L.dn[:, :, :i2].contiguous()
+                sd = L.sd[:, :s2].contiguous()
+                sh = mlp.shared_expert
+                w3 = torch.cat([mlp.gate.weight, sh.gate_proj.weight[:s2], sh.up_proj.weight[:s2],
+                                mlp.shared_expert_gate.weight]).contiguous()
+                shards[i] = Layer(f"L{i}", gu, dn, sd, w3=w3)
+            for R, sets in sets_by_r.items():
+                shard_sets[R] = []
+                for s in sets:
+                    i = int(s.layer.name[1:])
+                    r = fd._gemv(s.h, shards[i].w3)
+                    shard_sets[R].append(Set(shards[i], s.h, s.x, r, fast.top_k))
+            torch.cuda.synchronize()
+            out(f"RESULT shape tp{args.tp}-shard I={shards[pick[0]].I} IS={shards[pick[0]].IS}")
+            bench(shard_sets, cus=cus, max_rows=fast.fused.max_rows, args=args, timing=True)
 
 
 def main() -> None:
@@ -703,6 +741,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=48)
     parser.add_argument("--prompt-len", type=int, default=1800)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--tp", type=int, default=1, help="also sweep rank 0's TP shard shape")
     parser.add_argument("--smoke", action="store_true", help="CPU, TRITON_INTERPRET=1, bitwise only")
     args = parser.parse_args()
     if not args.smoke:

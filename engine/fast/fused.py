@@ -39,6 +39,9 @@ from engine.fast import kernels
 triton, tl = kernels.triton, kernels.tl
 
 MAX_ROWS = int(os.environ.get("ENGINE_FUSED_MAX_ROWS", "8"))
+# Every GEMV runs with the same row tile (``_pow2(MAX_ROWS)``) and K chunk whatever its row
+# count, so a row's result never depends on how many rows share the launch: a verify step
+# (two rows per slot) gives a slot's first token exactly the logits a decode step gives it.
 # Tiles: GEMV outputs per tile, K chunk for up to 4 rows and for 5-8 rows; expert rows per tile.
 # From a sweep on one gfx90a GCD (j71): 4 x 2048 beat 8 x 1024 and 16 x 512 at 4 and 8 rows.
 TILES = {"bn": 4, "bk4": 2048, "bk8": 1024, "moe_bn": 8}
@@ -395,6 +398,16 @@ class FusedDecode:
             return fast.mtp.layers[0]
         return fast.layers[i]
 
+    def _cus(self, dev: torch.device) -> int:
+        if dev not in self.cus:
+            self.cus[dev] = (torch.cuda.get_device_properties(dev).multi_processor_count
+                             if dev.type == "cuda" else 4)
+        return self.cus[dev]
+
+    def gemv(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """bf16(x @ w.T) for up to ``max_rows`` rows, with the row-count-independent tiles."""
+        return self._gemv(x.contiguous(), w)
+
     def _is_gdn(self, i: int) -> bool:
         return i < len(self.fast.layers) and self.fast.layer_types[i] == "linear_attention"
 
@@ -407,10 +420,12 @@ class FusedDecode:
         assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
-        bp = max(2, _pow2(rows))
+        # One row tile and K chunk for every row count (see ``MAX_ROWS``).
+        bp = max(2, _pow2(self.max_rows))
+        assert rows <= bp, (rows, bp)
         bk = min(TILES["bk4"] if bp <= 4 else TILES["bk8"], _pow2(k))
         bn = TILES["bn"]
-        grid = min(triton.cdiv(n, bn), 2 * self.cus[x.device])
+        grid = min(triton.cdiv(n, bn), 2 * self._cus(x.device))
         if conv is None:
             state, slots, cw, conv_n, kc = out, out, out, 0, 2
             stride_slot = 0
@@ -440,7 +455,7 @@ class FusedDecode:
         top_k = fast.top_k
         bn = TILES["moe_bn"]
         bk = min(1024, _pow2(hidden))
-        cus = 2 * self.cus[h.device]
+        cus = 2 * self._cus(h.device)
         idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
         wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
         _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,

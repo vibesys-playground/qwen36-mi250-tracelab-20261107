@@ -38,7 +38,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import kernels
+from engine.fast import kernels, moe_prefill
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -336,6 +336,9 @@ class FastModel:
             # Whole decode layers in a few launches (``engine.fast.fused``, ENGINE_FUSED_DECODE).
             "fused_decode": False,
             "fused_verify": False,
+            # Prefill routed experts as a sync-free grouped GEMM (``moe_prefill``) instead of
+            # the registered experts module (``engine.experts``); ENGINE_MOE_GROUPED=0 for that.
+            "moe_prefill": self.use_triton and moe_prefill.enabled(),
         }
         self.buckets = sorted(buckets)
         # The checkpoint's MTP head (``engine.mtp.MTPHead``) for self-speculative decoding
@@ -486,7 +489,7 @@ class FastModel:
         ops: list[tuple[torch.device, Callable]] = [(self.embed.device, self._embed_op)]
         for i in range(len(self.layers)):
             ops.append((self.layers[i].input_layernorm.weight.device, self._layer_op(i, verify)))
-        ops.append((self.final_norm.device, self._norm_op))
+        ops.append((self.final_norm.device, self._norm_op_for(verify)))
         ops.append((self.lm_head.device, self._verify_head_op if verify else self._head_op))
         segments: list[_Segment] = []
         for dev, op in ops:
@@ -634,6 +637,8 @@ class FastModel:
         compile and tune before the server answers. Decode is warmed by
         ``capture_all``.
         """
+        if self.triton_kernels["moe_prefill"]:
+            self._warm_moe_prefill(chunk)
         seen = set()
         for i, (conv, _) in self.gdn_state.items():
             weight = self.layers[i].linear_attn.conv1d.weight
@@ -672,6 +677,33 @@ class FastModel:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
 
+    def _warm_moe_prefill(self, chunk: int) -> None:
+        """Compile the grouped prefill experts for every tile shape up to ``chunk`` tokens
+        (and twice that, a packed pass), on every device that holds experts."""
+        seen = set()
+        layers = list(self.layers) + (list(self.mtp.layers) if self.mtp is not None else [])
+        for layer in layers:  # the MTP head's prefill MoE takes the same path (``_mtp_layer``)
+            experts = layer.mlp.experts
+            gate_up, down = experts.gate_up_proj, experts.down_proj
+            key = (gate_up.device, tuple(gate_up.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            num, _, hidden = gate_up.shape
+            shapes = {}
+            tokens = DECODE_EXPERT_TOKENS + 1
+            while tokens <= 2 * max(chunk, DECODE_EXPERT_TOKENS + 1):
+                shapes.setdefault(moe_prefill.config(tokens * self.top_k, num), tokens)
+                tokens *= 2
+            for tokens in shapes.values():
+                x = torch.zeros((tokens, hidden), dtype=gate_up.dtype, device=gate_up.device)
+                ids = torch.arange(tokens * self.top_k, device=gate_up.device) % num
+                weights = torch.full((tokens, self.top_k), 1.0 / self.top_k, device=gate_up.device)
+                if moe_prefill.supported(x, gate_up, down):
+                    moe_prefill.moe_prefill(
+                        x, ids.view(tokens, self.top_k), weights.to(x.dtype), gate_up, down
+                    )
+
     @staticmethod
     def snapshot_bytes(snap: Snapshot) -> int:
         """Bytes of the snapshot's own Gated DeltaNet state copies (its pages are the pool's)."""
@@ -692,8 +724,30 @@ class FastModel:
     def _norm_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
         return _rms(x, self.final_norm, self.eps)
 
-    def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
+    def _norm_op_for(self, verify: bool) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
+        """The final norm of a decode (or verify) step: with the fused layers, the per-row
+        Triton RMSNorm, whose result for a row does not depend on how many rows run."""
+
+        def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
+            if self._fused_rows(x.shape[0], verify):
+                with kernels.on_device(x):
+                    return kernels.add_rms(x, None, self.final_norm, self.eps)[1]
+            return self._norm_op(x, meta)
+
+        return op
+
+    def _logits(self, x: torch.Tensor, verify: bool = False) -> torch.Tensor:
+        """fp32 logits of a decode (or verify) step's normed rows. With the fused layers the
+        lm_head runs through the fused GEMV, whose sum order is the same for every row count
+        (``engine.fast.fused``), so a slot's logits are the same in a decode step and in a
+        verify step; else ``F.linear`` (BF16 out, as the GEMV)."""
+        if self._fused_rows(x.shape[0], verify):
+            with kernels.on_device(x):
+                return self.fused.gemv(x, self.lm_head).float()
         return F.linear(x, self.lm_head).float()
+
+    def _head_op(self, x: torch.Tensor, meta: _Device) -> torch.Tensor:
+        return self._logits(x)
 
     def _layer_op(self, i: int, verify: bool = False) -> Callable[[torch.Tensor, _Device], torch.Tensor]:
         def op(x: torch.Tensor, meta: _Device) -> torch.Tensor:
@@ -868,7 +922,9 @@ class FastModel:
     def _moe(self, mlp: torch.nn.Module, x: torch.Tensor, decode: bool = False) -> torch.Tensor:
         """Shared plus routed experts. Decode steps always use the in-place expert kernel,
         which never synchronizes with the host, so every batch bucket can be captured;
-        prefill chunks above ``DECODE_EXPERT_TOKENS`` use the registered experts module."""
+        prefill chunks above ``DECODE_EXPERT_TOKENS`` use the grouped GEMM of
+        ``moe_prefill`` (no host synchronization either), or, under
+        ``ENGINE_MOE_GROUPED=0`` or without Triton, the registered experts module."""
         tokens = x.shape[0]
         shared = mlp.shared_expert
         shared_out = F.linear(
@@ -889,6 +945,10 @@ class FastModel:
                 experts.down_proj,
                 use_triton=self.triton_kernels["moe"],
             )
+        elif self.triton_kernels["moe_prefill"] and moe_prefill.supported(
+            x, experts.gate_up_proj, experts.down_proj
+        ):  # prefill: the sync-free grouped GEMM over the real (token, expert) rows
+            routed = moe_prefill.moe_prefill(x, top_i, top_w, experts.gate_up_proj, experts.down_proj)
         else:  # prefill: the experts implementation the engine registered with Transformers
             routed = experts(x, top_i, top_w)
         return routed + torch.sigmoid(F.linear(x, mlp.shared_expert_gate.weight)) * shared_out
@@ -1219,7 +1279,7 @@ class FastModel:
         """The verify step's last op: logits from the normed hidden ``x``, each row's greedy
         pick, and the MTP head on (hidden, pick) per row. Leaves ``[2, rows]`` (picks, drafts)
         in ``_verify_out``; returns the logits."""
-        logits = F.linear(x, self.lm_head).float()
+        logits = self._logits(x, verify=True)
         picks = logits.argmax(-1)
         self._verify_out = torch.stack((picks, self._mtp_decode(x, picks, meta)))
         return logits

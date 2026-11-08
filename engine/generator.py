@@ -662,7 +662,8 @@ class Generator:
         """Run the fast path's prefill variants once in a free slot (see ``FastModel.warmup``)."""
         self._reclaim()
         if self._free_slots:
-            self.fast.warmup(self._free_slots[-1], self._chunk, token_ids)
+            other = self._free_slots[-2] if self.packing and len(self._free_slots) > 1 else None
+            self.fast.warmup(self._free_slots[-1], self._chunk, token_ids, other)
 
     def _reclaim(self) -> None:
         while self._released:

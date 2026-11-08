@@ -530,13 +530,17 @@ class FastModel:
         self._push_table(slot)
 
     @torch.inference_mode()
-    def warmup(self, slot: int, chunk: int, token_ids: Sequence[int]) -> None:
+    def warmup(
+        self, slot: int, chunk: int, token_ids: Sequence[int], other: int | None = None
+    ) -> None:
         """Run every prefill variant serving uses once, in ``slot`` (free), then reset it.
 
         Compiles the bucketed prefill conv problems up to ``chunk`` on every device
         and runs prefills fresh (short, and a whole chunk) and on top of a state,
-        so the GDN chunk kernels, the prefill experts and attention compile and tune
-        before the server answers. Decode is warmed by ``capture_all``.
+        and with ``other`` (a second free slot) packed passes of two segments, so
+        the GDN chunk kernels (varlen too), the prefill experts and attention
+        compile and tune before the server answers. Decode is warmed by
+        ``capture_all``.
         """
         seen = set()
         for i, (conv, _) in self.gdn_state.items():
@@ -557,8 +561,21 @@ class FastModel:
             self.prefill(slot, ids[37:101], 37)  # on top of a state
             self.reset(slot)
             self.prefill(slot, ids[:chunk], 0)  # a whole chunk
+            if other is not None:  # packed passes (``prefill_packed``) in ``slot`` and ``other``
+                self.reset(slot)
+                self.reset(other)
+                if len(ids) < 102:
+                    raise ValueError("warmup needs at least 102 token ids")
+                self.prefill(slot, ids[:37], 0)
+                # Two longer segments, one on top of a state: the varlen GDN kernels, packed
+                # attention; then a one-token segment beside a longer one.
+                self.prefill_packed([(slot, ids[37:101], 37), (other, ids[:64], 0)])
+                end = min(len(ids), max(chunk, 70))
+                self.prefill_packed([(slot, ids[101:102], 101), (other, ids[64:end], 64)])
         finally:
             self.reset(slot)
+            if other is not None:
+                self.reset(other)
         for dev in self.devices:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)

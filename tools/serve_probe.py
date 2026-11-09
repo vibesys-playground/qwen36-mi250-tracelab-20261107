@@ -35,6 +35,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+DECODE = None  # --text: token ids -> text
+
+
 def token_pool(model: str, revision: str | None, need: int, corpus: str = "source") -> list[int]:
     import transformers
     from transformers import AutoTokenizer
@@ -63,6 +66,7 @@ def stream(url: str, body: dict) -> dict:
     start = time.perf_counter()
     ids: list[int] = []
     times: list[float] = []
+    texts: list[str] = []
     usage = {}
     with httpx.stream("POST", url + "/v1/completions", json=body, timeout=3600) as response:
         response.raise_for_status()
@@ -74,8 +78,9 @@ def stream(url: str, body: dict) -> dict:
             for choice in chunk.get("choices", []):
                 got = choice.get("token_ids") or []
                 ids.extend(got)
+                texts.append(choice.get("text") or "")
                 times.extend([time.perf_counter()] * len(got))
-    return {"ids": ids, "times": times, "start": start, "usage": usage}
+    return {"ids": ids, "times": times, "start": start, "usage": usage, "text": "".join(texts)}
 
 
 def rounds_of(index: int, args) -> int:
@@ -90,6 +95,9 @@ def session(url: str, pool: list[int], index: int, args) -> list[dict]:
     offset = (index * stride) % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
     prompt = fresh[: args.first]
+    text_mode = getattr(args, "text", False)
+    if text_mode:  # as the replay: text prompts, the next one = prompt + output text + new text
+        prompt = DECODE(prompt)
     used = args.first
     out = []
     for r in range(rounds):
@@ -106,7 +114,10 @@ def session(url: str, pool: list[int], index: int, args) -> list[dict]:
         assert len(res["ids"]) == args.max_new, (len(res["ids"]), args.max_new)
         res["key"] = f"s{index}r{r}"
         out.append(res)
-        prompt = prompt + res["ids"] + fresh[used : used + args.grow]
+        if text_mode:
+            prompt = prompt + res["text"] + DECODE(fresh[used : used + args.grow])
+        else:
+            prompt = prompt + res["ids"] + fresh[used : used + args.grow]
         used += args.grow
     return out
 
@@ -216,6 +227,10 @@ def main() -> None:
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
     parser.add_argument(
+        "--text", action="store_true",
+        help="send prompts as text, growing by the output text and new text (as the replay)",
+    )
+    parser.add_argument(
         "--corpus",
         choices=("source", "synthetic"),
         default="source",
@@ -233,6 +248,12 @@ def main() -> None:
     revision = None if args.model else CHECKPOINT["revision"]
     need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
     pool = token_pool(model, revision, need, args.corpus)
+    if args.text:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(model, revision=revision)
+        global DECODE
+        DECODE = lambda ids: tok.decode(ids)  # noqa: E731
     print(json.dumps({"event": "shape", **vars(args)}), flush=True)
     outputs = {}
     for setting in args.settings.split(","):

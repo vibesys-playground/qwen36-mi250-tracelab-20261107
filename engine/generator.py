@@ -49,7 +49,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts, gdn, speculative
+from engine import batching, experts, gdn, reqstamps, speculative
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -160,6 +160,9 @@ class PrefixCache:
         return (
             0 < length < len(prompt)
             and (entry.tail or length % self._chunk == 0 or length == len(prompt) - 1)
+            # Plan 46: cheap element probes first, so only a real match pays the slice.
+            and prompt[length - 1] == key[-1]
+            and prompt[length >> 1] == key[length >> 1]
             and prompt[:length] == key
         )
 
@@ -231,9 +234,10 @@ class PrefixCache:
 
 @dataclass
 class _FastEntry:
-    snap: Any  # engine.fast.model.Snapshot
+    snap: Any  # engine.fast.model.Snapshot; None for a parked tail
     nbytes: int
     tail: bool
+    slot: int | None = None  # plan 69: a session tail parked in its own slot
 
 
 class FastPrefixCache:
@@ -246,6 +250,15 @@ class FastPrefixCache:
     extends it. ``max_bytes`` budgets the cloned Gated DeltaNet states; KV
     pages are bounded by the pool, which evicts the least recently used entry
     when it runs out.
+
+    Plan 69: a session tail may instead stay *parked* in the finished request's
+    own slot (``park``): nothing is cloned or moved, and the round that extends
+    it resumes in that slot (``lookup`` returns the slot number). At most
+    ``park_max`` tails are parked; beyond that, or when a request needs a slot
+    and none is free (``unpark_one``), the least recently used parked tail is
+    detached into an ordinary tail snapshot exactly as ``store_tail`` would have
+    done, and its slot is handed to ``on_free_slot`` for the reset. Evicting a
+    parked tail frees its pages at once and hands the slot over the same way.
     """
 
     def __init__(
@@ -266,6 +279,11 @@ class FastPrefixCache:
         self.bytes = 0
         self.tail_hits = 0
         self.evictions = 0
+        self.park_max = 0
+        self.on_free_slot: Any = None  # plan 69: called with a parked slot to reset and free
+        self.parked = 0
+        self.parked_hits = 0
+        self.unparks = 0
         fast.pool.on_pressure = self.evict_one
 
     _usable = PrefixCache._usable
@@ -276,7 +294,9 @@ class FastPrefixCache:
     def lookup(self, prompt: tuple[int, ...]) -> tuple[int, Any, bool]:
         """The longest usable snapshot for ``prompt``, how many tokens it covers, and whether
         it is a session tail. A tail is removed and the caller owns it (``FastModel.adopt``
-        or ``release`` it); any other snapshot stays cached and is restored by copy."""
+        or ``release`` it); any other snapshot stays cached and is restored by copy. A parked
+        tail is returned as its slot number (an ``int``): that slot already holds the state
+        and is the caller's now."""
         best = max(
             (k for k, e in self._entries.items() if self._usable(k, e, prompt)),
             key=len,
@@ -288,6 +308,9 @@ class FastPrefixCache:
         if entry.tail:
             self._remove(best)
             self.tail_hits += 1
+            if entry.slot is not None:
+                self.parked_hits += 1
+                return len(best), entry.slot, True
             return len(best), entry.snap, True
         self._entries.move_to_end(best)
         return len(best), entry.snap, False
@@ -320,6 +343,42 @@ class FastPrefixCache:
         snap = self._fast.detach(slot, len(key))
         self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=True))
 
+    def park(self, key: tuple[int, ...], slot: int) -> bool:
+        """Keep ``slot``'s state, which covers exactly ``key``, in place as a session tail.
+
+        False (nothing changed) when parking is off or the entry would not be kept; the
+        caller then stores the tail as ``store_tail`` does. On True the slot belongs to the
+        cache until ``lookup`` hands it out or it is unparked or evicted (``on_free_slot``).
+        """
+        if self.park_max <= 0 or key in self._entries or not self._admits(key):
+            return False
+        for older in [k for k, e in self._entries.items() if e.tail and key[: len(k)] == k]:
+            self._release(older)  # superseded: the new tail extends it
+        while self.parked >= self.park_max and self.unpark_one():
+            pass
+        self._insert(key, _FastEntry(None, 0, tail=True, slot=slot))
+        return True
+
+    def unpark_one(self) -> bool:
+        """Detach the least recently used parked tail into a tail snapshot (as ``store_tail``
+        does) and hand its slot to ``on_free_slot``; False when none is parked."""
+        if not self.parked:
+            return False
+        key, entry = next((k, e) for k, e in self._entries.items() if e.slot is not None)
+        slot = entry.slot
+        entry.snap = self._fast.detach(slot, len(key))
+        entry.slot = None
+        entry.nbytes = self._fast.snapshot_bytes(entry.snap)
+        self.parked -= 1
+        self.unparks += 1
+        self.bytes += entry.nbytes
+        self.on_free_slot(slot)
+        if self._max_bytes is not None and entry.nbytes > self._max_bytes:
+            self._release(key)
+        while self._max_bytes is not None and self.bytes > self._max_bytes:
+            self.evict_one()
+        return True
+
     def _admits(self, key: tuple[int, ...]) -> bool:
         return bool(key) and len(key) <= self._max_tokens and self._max_entries > 0
 
@@ -330,6 +389,8 @@ class FastPrefixCache:
         self._entries[key] = entry
         self._tokens += len(key)
         self.bytes += entry.nbytes
+        if entry.slot is not None:
+            self.parked += 1
         while (
             self._tokens > self._max_tokens
             or len(self._entries) > self._max_entries
@@ -341,10 +402,23 @@ class FastPrefixCache:
         entry = self._entries.pop(key)
         self._tokens -= len(key)
         self.bytes -= entry.nbytes
+        if entry.slot is not None:
+            self.parked -= 1
         return entry
 
     def _release(self, key: tuple[int, ...]) -> None:
-        self._fast.release(self._remove(key).snap)
+        entry = self._remove(key)
+        if entry.slot is None:
+            self._fast.release(entry.snap)
+            return
+        # A parked tail: give its pages back now (this may run under page pressure) and the
+        # slot to the generator, whose reset zeroes its states before reuse.
+        fast, slot = self._fast, entry.slot
+        with fast._lock:
+            for page in fast.slot_pages[slot]:
+                fast.pool.unref(page)
+            fast.slot_pages[slot] = []
+        self.on_free_slot(slot)
 
     def evict_one(self) -> bool:
         """Drop the least recently used snapshot; False when there is none."""
@@ -468,6 +542,25 @@ class Generation:
         g.keep_tail(key, cache)
 
 
+# Plan 46: tokenize completion prompts in the HTTP handler thread, incrementally (exact).
+REQ_FAST = os.environ.get("ENGINE_REQ_FAST", "1") == "1"
+
+
+def _prompt_encoder(tokenizer: Any) -> Any:
+    from engine.inctok import PromptEncoder
+
+    backend = None
+    source = getattr(tokenizer, "backend_tokenizer", None)
+    if source is not None:
+        try:
+            from tokenizers import Tokenizer
+
+            backend = Tokenizer.from_str(source.to_str())  # its own instance for handler threads
+        except Exception:  # noqa: BLE001 - full encodes only
+            backend = None
+    return PromptEncoder(lambda text: tokenizer.encode(text), backend)
+
+
 class Generator:
     """The model, its tokenizer and the prefix cache, owned by one thread."""
 
@@ -506,6 +599,13 @@ class Generator:
             self._free_slots = list(range(fast.slots - 1, -1, -1))
             # Slots of requests that ended or were dropped (list.append is atomic for finalizers).
             self._released: list[int] = []
+            # Plan 69 (ENGINE_SLOT_PARK, default on): a finished round's state stays in its
+            # slot as the session tail, for at most ENGINE_SLOT_PARK_MAX slots (default half).
+            if os.environ.get("ENGINE_SLOT_PARK", "1") == "1":
+                self._prefix_cache.park_max = int(
+                    os.environ.get("ENGINE_SLOT_PARK_MAX", str(fast.slots // 2))
+                )
+            self._prefix_cache.on_free_slot = self._released.append
         self._device = model.get_input_embeddings().weight.device
         # Prompt counters, shown on /health: tokens run through prefill vs reused from the cache.
         self.prefilled_tokens = 0
@@ -521,6 +621,9 @@ class Generator:
         self.verify_steps = 0
         self.mtp_proposed = 0
         self.mtp_accepted = 0
+        self._vocab_size = model.config.vocab_size
+        # Plan 46: exact incremental tokenization of growing prompts (``engine.inctok``).
+        self.prompt_encoder = _prompt_encoder(tokenizer)
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -622,6 +725,10 @@ class Generator:
         return generator
 
     def encode_text(self, prompt: str) -> tuple[int, ...]:
+        """Exactly ``tokenizer.encode(prompt)``; with ``ENGINE_REQ_FAST`` (default on) reusing
+        the ids of a recent prompt that ``prompt`` extends. Thread-safe."""
+        if REQ_FAST:
+            return self.prompt_encoder.encode(prompt)
         return tuple(self.tokenizer.encode(prompt))
 
     def encode_chat(self, request: ChatRequest) -> tuple[int, ...]:
@@ -721,7 +828,8 @@ class Generator:
         """``start``'s checks; the request's max_tokens."""
         if not prompt:
             raise RequestError("prompt must contain at least one token")
-        if any(t >= self.model.config.vocab_size for t in prompt):
+        # Plan 46: one C-level max, not a config attribute lookup per token (~4 ms at 3.6k).
+        if max(prompt) >= self._vocab_size:
             raise RequestError("prompt contains a token id outside the vocabulary")
         budget = self.max_model_len - len(prompt)
         if budget < 1 or (sampling.max_tokens is not None and sampling.max_tokens > budget):
@@ -759,6 +867,12 @@ class Generator:
             "prefix_cache_entries": len(pc),
             "prefix_cache_bytes": pc.bytes,
             "prefix_cache_evictions": pc.evictions,
+            **(
+                {"parked_tails": pc.parked, "parked_hits": pc.parked_hits, "unparks": pc.unparks}
+                if isinstance(pc, FastPrefixCache)
+                else {}
+            ),
+            **self.prompt_encoder.stats(),
         }
 
     # ---------------------------------------------------------------- fast path
@@ -792,30 +906,73 @@ class Generator:
         """Keep a finished request's slot state, covering exactly ``key``, for the next round.
 
         ``slot`` must not have been reset yet (it is reset only when reclaimed,
-        on this thread, at the next ``start``).
+        on this thread, at the next ``start``). Plan 69: the state stays parked in
+        ``slot`` when the prefix cache takes it (``FastPrefixCache.park``).
         """
         if slot in self._free_slots:
             return
+        t0 = reqstamps.now() if reqstamps.ENABLED else 0.0
         with torch.inference_mode():
-            self._prefix_cache.store_tail(key, slot)
+            pc = self._prefix_cache
+            if pc.park_max > 0 and slot in self._released:
+                self._released.remove(slot)
+                if pc.park(key, slot):
+                    if reqstamps.ENABLED:
+                        reqstamps.record("tail_park", reqstamps.now() - t0)
+                    return
+                self._released.append(slot)
+            pc.store_tail(key, slot)
+        if reqstamps.ENABLED:
+            reqstamps.record("tail_detach", reqstamps.now() - t0)
 
-    def _start_fast(self, prompt: tuple[int, ...], sampling: Sampling, max_tokens: int) -> Generation:
+    def _claim(self, prompt: tuple[int, ...]) -> tuple[int, int]:
+        """A slot holding ``prompt``'s longest usable cached prefix, and that prefix's length.
+
+        A parked session tail is resumed in its own slot, with nothing copied; otherwise a
+        free slot (if none, the least recently used parked tail is detached to free one)
+        takes a tail snapshot's pages and states (``adopt``) or a snapshot's copy."""
         self._reclaim()
+        pc = self._prefix_cache
+        if not self._free_slots:
+            # Plan 69: a parked tail never keeps a request out; detach one on demand.
+            t0 = reqstamps.now() if reqstamps.ENABLED else 0.0
+            with torch.inference_mode():
+                unparked = pc.unpark_one()
+            if unparked:
+                self._reclaim()
+                if reqstamps.ENABLED:
+                    reqstamps.record("unpark", reqstamps.now() - t0)
         if not self._free_slots:
             raise RequestError("all sequence slots are busy; retry later", 503)
+        t0 = reqstamps.now() if reqstamps.ENABLED else 0.0
+        reused, snap, tail = pc.lookup(prompt)
+        if reqstamps.ENABLED:
+            reqstamps.last_lookup = reqstamps.now() - t0
+        if tail and isinstance(snap, int):
+            return snap, reused  # parked: the slot already holds exactly this state
         slot = self._free_slots.pop()
-        snap = None
         try:
-            reused, snap, tail = self._prefix_cache.lookup(prompt)
             if snap is not None:
+                t0 = reqstamps.now() if reqstamps.ENABLED else 0.0
                 if tail:  # handed over: the slot takes the tail's pages and states
                     self.fast.adopt(snap, slot)
+                    if reqstamps.ENABLED:
+                        reqstamps.record("adopt", reqstamps.now() - t0)
                 else:
                     self.fast.restore(snap, slot)
-            logits = self._prefill_fast(prompt, reused, slot)
         except BaseException:
             if snap is not None and tail:
                 self.fast.release(snap)
+            self.fast.reset(slot)
+            self._free_slots.append(slot)
+            raise
+        return slot, reused
+
+    def _start_fast(self, prompt: tuple[int, ...], sampling: Sampling, max_tokens: int) -> Generation:
+        slot, reused = self._claim(prompt)
+        try:
+            logits = self._prefill_fast(prompt, reused, slot)
+        except BaseException:
             self.fast.reset(slot)
             self._free_slots.append(slot)
             raise
@@ -995,24 +1152,7 @@ class PackedPrefill:
         self._tickets += 1
         try:
             max_tokens = g._validate(prompt, sampling)
-            g._reclaim()
-            if not g._free_slots:
-                raise RequestError("all sequence slots are busy; retry later", 503)
-            slot = g._free_slots.pop()
-            snap, tail = None, False
-            try:
-                reused, snap, tail = g._prefix_cache.lookup(prompt)
-                if snap is not None:
-                    if tail:  # a session tail is handed over: the slot takes its pages
-                        g.fast.adopt(snap, slot)
-                    else:
-                        g.fast.restore(snap, slot)
-            except BaseException:
-                if snap is not None and tail:
-                    g.fast.release(snap)
-                g.fast.reset(slot)
-                g._free_slots.append(slot)
-                raise
+            slot, reused = g._claim(prompt)
         except Exception as exc:  # noqa: BLE001 - reported per request
             self._failed.append((ticket, exc))
             return ticket

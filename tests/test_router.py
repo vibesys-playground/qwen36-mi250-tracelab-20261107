@@ -271,3 +271,26 @@ def test_errors_and_non_streaming_pass_through(front: str) -> None:
     assert whole["usage"]["completion_tokens"] == 5
     assert httpx.get(f"{front}/nowhere").status_code == 404
     _ = router  # imported for the module under test
+
+
+def test_a_client_that_leaves_does_not_disturb_later_requests(front: str) -> None:
+    """A client leaving mid-stream cancels its job; later requests (token ids and growing
+    text prompts, tokenized incrementally) still stream whole."""
+    prompt = [11 + (i * 7) % 300 for i in range(2 * CHUNK + 3)]
+    want, _ = _completion(front, prompt, 12)
+    body = {"prompt": prompt, "max_tokens": 64, "temperature": 0, "ignore_eos": True,
+            "return_token_ids": True, "stream": True}
+    with httpx.stream("POST", f"{front}/v1/completions", json=body, timeout=TIMEOUT) as response:
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                break  # leave after the first chunk
+    for _ in range(6):
+        got, usage = _completion(front, prompt, 12)
+        assert got == want and usage["completion_tokens"] == 12
+    text = {"prompt": "def g(x):\n    return x\n", "max_tokens": 4, "temperature": 0,
+            "ignore_eos": True, "stream": True}
+    for _ in range(3):
+        with httpx.stream("POST", f"{front}/v1/completions", json=text, timeout=TIMEOUT) as r:
+            lines = [x for x in r.iter_lines() if x.startswith("data: ")]
+        assert lines[-1] == "data: [DONE]"
+        text["prompt"] += "x = 1\n"

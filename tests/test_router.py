@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -417,3 +418,257 @@ def test_a_moved_session_continues_token_for_token(tmp_path: Path) -> None:
     moves = runs["on"][1]["router"]["moves"]
     assert moves["committed"] >= 3 and moves["failed"] == 0, moves
     assert sum(r["migrate"]["import"] for r in runs["on"][1]["replicas"]) >= 3
+
+
+# ----------------------------------------------------------------------------- two holders (plan 70)
+
+
+def _two(replicas: int = 3, **kw) -> Affinity:
+    return Affinity(replicas, min_tokens=16, idle_seconds=0, two_holder=True, **kw)
+
+
+def test_a_synced_round_goes_to_the_less_busy_holder() -> None:
+    affinity = _two()
+    a = _session(1, 100)
+    r0, t0 = affinity.route(a, now=0.0)
+    sync = affinity.finish(t0, r0, now=1.0)
+    assert sync is not None and sync.src == r0 and sync.dst != r0
+    assert affinity.sync_done(sync, 105, 1.0, 1.0)
+    affinity.release(sync)
+    # Two other sessions now run on the home replica; the buddy is idle.
+    busy = [affinity.route(_session(s, 100), now=1.1) for s in (7, 8)]
+    for r, t in busy:
+        affinity._inflight[r] -= 1
+        affinity._inflight[r0] += 1
+    r1, t1 = affinity.route(a + _session(2, 10), now=1.2)
+    assert r1 == sync.dst and affinity.moved(t1) and affinity.required(t1) == 105
+    # With the home no busier than the buddy, the round stays home.
+    affinity2 = _two()
+    r0, t0 = affinity2.route(a, now=0.0)
+    sync = affinity2.finish(t0, r0, now=1.0)
+    affinity2.sync_done(sync, 105, 1.0, 1.0)
+    affinity2.release(sync)
+    r1, t1 = affinity2.route(a + _session(2, 10), now=1.2)
+    assert r1 == r0 and not affinity2.moved(t1) and affinity2.required(t1) is None
+
+
+def test_a_sync_in_flight_at_arrival_never_qualifies_nor_delays() -> None:
+    affinity = _two(prefer_buddy=True)
+    a = _session(1, 100)
+    r0, t0 = affinity.route(a, now=0.0)
+    sync = affinity.finish(t0, r0, now=1.0)
+    assert sync is not None
+    # The next round arrives while the copy is in flight: it goes home at once.
+    started = time.monotonic()
+    r1, t1 = affinity.route(a + _session(2, 10))
+    assert time.monotonic() - started < 0.05
+    assert r1 == r0 and not affinity.moved(t1)
+    assert affinity.stats()["syncs"]["in_flight_at_arrival"] == 1
+    # The copy lands late: the buddy holds round t0's state, an older version than the one
+    # round t1 will leave, so the round after t1 cannot go there either.
+    assert affinity.sync_done(sync, 105, 1.0, 1.0)
+    affinity.release(sync)
+    assert affinity._entries[t0].holders == {r0: t0, sync.dst: t0}
+    affinity.finish(t1, r1)  # a new sync of t1 starts (to the old buddy again)
+    entry = affinity._entries[t1]
+    assert entry.holders == {r1: t1} and entry.sync is not None and entry.sync.dst == sync.dst
+    r2, t2 = affinity.route(a + _session(2, 10) + _session(3, 10))
+    assert r2 == r1 and not affinity.moved(t2)
+    # A failed sync leaves only the home as a holder.
+    affinity.sync_failed(entry.sync, "test")
+    affinity.release(entry.sync if entry.sync else sync)
+
+
+def test_versions_follow_the_serving_replica_and_stale_copies_never_qualify() -> None:
+    affinity = _two(replicas=2, prefer_buddy=True)
+    prompt = _session(1, 100)
+    served = []
+    replica, ticket = affinity.route(prompt, now=0.0)
+    for turn in range(4):
+        served.append(replica)
+        sync = affinity.finish(ticket, replica)
+        assert sync is not None and sync.src == replica
+        assert affinity.sync_done(sync, 100 + turn, 1.0, 1.0)
+        affinity.release(sync)
+        prompt = prompt + _session(turn + 2, 10)
+        replica, ticket = affinity.route(prompt)
+        # Exactly one replica serves each round; with both holders current and idle, the
+        # test knob alternates them.
+        assert replica != served[-1] and affinity.moved(ticket)
+    # The replica that served a round is its only holder until a copy is acknowledged.
+    sync = affinity.finish(ticket, replica)
+    assert affinity._entries[ticket].holders == {replica: ticket}
+    affinity.sync_failed(sync, "lost")
+    affinity.release(sync)
+    nxt, t = affinity.route(prompt + _session(9, 10))
+    assert nxt == replica and not affinity.moved(t)
+
+
+def test_a_refused_buddy_round_goes_home() -> None:
+    affinity = _two(replicas=2, prefer_buddy=True)
+    a = _session(1, 100)
+    r0, t0 = affinity.route(a, now=0.0)
+    sync = affinity.finish(t0, r0)
+    affinity.sync_done(sync, 105, 1.0, 1.0)
+    affinity.release(sync)
+    r1, t1 = affinity.route(a + _session(2, 10))
+    assert r1 == sync.dst
+    assert affinity.reroute(t1) == r0
+    assert affinity._inflight == [1, 0] if r0 == 0 else [0, 1]
+    assert not affinity.moved(t1) and affinity.required(t1) is None
+    assert affinity.stats()["syncs"]["stale_refused"] == 1
+
+
+def test_short_prompts_and_busy_ends_do_not_sync() -> None:
+    affinity = _two(replicas=2)
+    r, t = affinity.route(_session(1, 4))
+    assert affinity.finish(t, r) is None
+    r1, t1 = affinity.route(_session(2, 100))
+    affinity.route(_session(3, 100))
+    r2, t2 = affinity.route(_session(4, 100))
+    assert r1 == r2
+    s1 = affinity.finish(t1, r1)
+    assert s1 is not None
+    assert affinity.finish(t2, r2) is None  # one copy out of a replica at a time
+    assert affinity.stats()["syncs"]["skipped_busy"] == 1
+
+
+class _FakeReplica(BaseHTTPRequestHandler):
+    """Answers like a replica: refuses (stale) any request that requires saved state."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args) -> None:
+        return
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.seen.append(self.headers.get("X-Engine-Require-Cached"))
+        if self.headers.get("X-Engine-Require-Cached") is not None:
+            status, body, extra = 409, b'{"error": "stale"}', {"X-Engine-Stale": "1"}
+        else:
+            status, body, extra = 200, json.dumps({"served_by": self.server.name}).encode(), {}
+        self.send_response(status)
+        for k, v in extra.items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_the_front_reroutes_a_stale_refusal_home() -> None:
+    fakes = []
+    for name in ("r0", "r1"):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeReplica)
+        server.name, server.seen = name, []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        fakes.append(server)
+    replicas = [router.Replica(i, (), s.server_address[1], None) for i, s in enumerate(fakes)]
+    affinity = _two(replicas=2, prefer_buddy=True)
+    front = router._Front(("127.0.0.1", 0), replicas, affinity)
+    threading.Thread(target=front.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{front.server_address[1]}/v1/completions"
+    try:
+        a = list(_session(1, 100))
+        first = httpx.post(url, json={"prompt": a}, timeout=10)
+        home = int(first.headers["x-engine-replica"])
+        # Pretend the copy to the buddy was acknowledged (no real replicas here).
+        (entry,) = [e for e in affinity._entries.values()]
+        deadline = time.monotonic() + 5
+        while entry.sync is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # The front's own copy fails against the fakes; wait for it to give up.
+        while affinity._sending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        entry.holders = {home: entry.ticket, 1 - home: entry.ticket}
+        entry.tail_tokens = 100
+        second = httpx.post(url, json={"prompt": a + [7, 8, 9]}, timeout=10)
+        assert second.status_code == 200
+        assert second.json()["served_by"] == f"r{home}"
+        assert second.headers["x-engine-replica"] == str(home)
+        assert "x-engine-moved" not in second.headers
+        assert fakes[1 - home].seen == ["100"]  # the buddy was asked, and refused
+        assert affinity.stats()["syncs"]["stale_refused"] == 1
+        while affinity._inflight != [0, 0] and time.monotonic() < deadline + 5:
+            time.sleep(0.01)  # the front finishes the request after the client has it
+        assert affinity._inflight == [0, 0]
+    finally:
+        front.shutdown()
+        for s in fakes:
+            s.shutdown()
+
+
+def test_two_holder_sessions_continue_token_for_token(tmp_path: Path) -> None:
+    """Two CPU replicas: every round's state is copied to the other replica and the test knob
+    sends each next round there; outputs and cached tokens match a front with one holder."""
+    checkpoint = tmp_path / "tiny"
+    write_checkpoint(checkpoint)
+    runs = {}
+    for name, env in (("off", {"ENGINE_TWO_HOLDER": "0"}),
+                      ("on", {"ENGINE_TWO_HOLDER": "1", "ENGINE_TWO_HOLDER_PREFER_BUDDY": "1"})):
+        process, url = _front(checkpoint, tmp_path / f"{name}.log", {"ENGINE_FAST": "1", **env})
+        try:
+            prompt = [5 + (i * 13) % 300 for i in range(3 * CHUNK + 3)]
+            rounds = []
+            for turn in range(5):
+                out, usage, headers = _moved_completion(url, prompt, 7)
+                rounds.append((out, usage["prompt_tokens_details"]["cached_tokens"],
+                               headers.get("x-engine-replica"), headers.get("x-engine-moved")))
+                prompt = prompt + out + [9 + (turn * 7 + i) % 300 for i in range(4)]
+                time.sleep(0.5)  # the tool wait: the copy lands in it
+            health = httpx.get(f"{url}/health", timeout=30).json()
+        finally:
+            process.terminate()
+            process.wait(timeout=60)
+        runs[name] = (rounds, health)
+    off, on = runs["off"][0], runs["on"][0]
+    assert [r[0] for r in on] == [r[0] for r in off]  # token-identical continuations
+    assert [r[1] for r in on] == [r[1] for r in off]  # the same real reuse, on the buddy
+    assert all(r[1] > 0 for r in on[1:])
+    assert len({r[2] for r in off}) == 1 and all(r[3] is None for r in off)
+    replicas = [r[2] for r in on]
+    assert all(x != y for x, y in zip(replicas, replicas[1:], strict=False))
+    assert all(r[3] == "1" for r in on[1:])
+    syncs = runs["on"][1]["router"]["syncs"]
+    assert syncs["committed"] >= 4 and syncs["failed"] == 0 and syncs["stale_refused"] == 0, syncs
+    assert syncs["buddy_rounds"] == 4
+    assert all("decode_seconds_by_batch" in r for r in runs["on"][1]["replicas"])
+
+
+def test_a_replica_refuses_a_round_without_the_required_state(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny"
+    write_checkpoint(checkpoint)
+    port = _free_port()
+    log = tmp_path / "one.log"
+    with log.open("w") as sink:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "engine.server", "--model", str(checkpoint), "--port",
+             str(port), "--prefill-chunk-tokens", str(CHUNK), "--replicas", "1"],
+            cwd=ROOT, stdout=sink, stderr=subprocess.STDOUT,
+            env={**os.environ, "HF_HUB_OFFLINE": "1", "ENGINE_FAST": "1"},
+        )
+    url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 300
+        while True:
+            assert process.poll() is None, log.read_text()
+            try:
+                if httpx.get(f"{url}/health", timeout=5).status_code == 200:
+                    break
+            except httpx.TransportError:
+                pass
+            assert time.monotonic() < deadline
+            time.sleep(0.2)
+        prompt = [5 + (i * 13) % 300 for i in range(3 * CHUNK + 3)]
+        body = {"prompt": prompt, "max_tokens": 4, "temperature": 0, "ignore_eos": True,
+                "stream": True}
+        refused = httpx.post(f"{url}/v1/completions", json=body, timeout=TIMEOUT,
+                             headers={"X-Engine-Require-Cached": str(len(prompt))})
+        assert refused.status_code == 409 and refused.headers.get("x-engine-stale") == "1"
+        ok = httpx.post(f"{url}/v1/completions", json=body, timeout=TIMEOUT,
+                        headers={"X-Engine-Require-Cached": "0"})
+        assert ok.status_code == 200 and "[DONE]" in ok.text
+    finally:
+        process.terminate()
+        process.wait(timeout=60)

@@ -78,6 +78,21 @@ class Job:
     run: Callable[[], Iterator[dict[str, Any] | AwaitDecode]]
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    # Plan 70: tokens of saved state this replica must reuse for the request (a round the
+    # router sent to a buddy replica); otherwise the request is refused as ``StaleState``.
+    require: int | None = None
+
+
+class StaleState(RequestError):
+    """This replica does not hold the whole saved state the router expected (plan 70)."""
+
+    def __init__(self, reused: int, required: int) -> None:
+        super().__init__(f"stale session state: {reused} of {required} tokens cached", 409)
+
+
+def _check_state(job: Job, generation: Generation) -> None:
+    if job.require is not None and generation.cached_tokens < job.require:
+        raise StaleState(generation.cached_tokens, job.require)
 
 
 @dataclass
@@ -111,6 +126,7 @@ class Worker:
         self._mover = mover
         self._controls: list[Control] = []  # started, not done
         self._jobs: queue.Queue[Job | Control] = queue.Queue()
+        self.decode_seconds: dict[int, list[float]] = {}  # batch -> [seconds, steps]
         threading.Thread(target=self._loop, name="engine-worker", daemon=True).start()
 
     def submit(self, job: Job | Control) -> None:
@@ -242,6 +258,8 @@ class Worker:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
             if self._controls:
                 self._poll_controls()
+            t_work = time.perf_counter()
+            prefill_s = 0.0
             if speculative.pending(g) and (
                 serial or prefilling or ready_pending(packer)
                 or any(job.cancelled.is_set() for job, _ in running)
@@ -258,8 +276,16 @@ class Worker:
                     self._fail(*prefilling.pop(ticket), exc)
                 if packer.busy:
                     stepped = True
-                    for ticket, result in packer.step():
+                    t_pf = time.perf_counter()
+                    finished_prefills = packer.step()
+                    prefill_s += time.perf_counter() - t_pf
+                    for ticket, result in finished_prefills:
                         job, events = prefilling.pop(ticket)
+                        if not isinstance(result, Exception):
+                            try:
+                                _check_state(job, result)
+                            except StaleState as exc:
+                                result = exc
                         if isinstance(result, Exception):
                             self._fail(job, events, result)
                         else:
@@ -290,8 +316,11 @@ class Worker:
             # Unpacked: each new job is prefilled and emits its first token before the next
             # job's prefill, after the running jobs' tokens (the order the base engine used).
             for job, events, prefill in serial:
+                t_pf = time.perf_counter()
                 try:
                     generation = g.start(prefill.prompt, prefill.sampling)
+                    prefill_s += time.perf_counter() - t_pf
+                    _check_state(job, generation)
                 except Exception as exc:  # noqa: BLE001 - this request only
                     self._fail(job, events, exc)
                     continue
@@ -320,6 +349,10 @@ class Worker:
                     g.decode([generation for _, _, generation in waiting], ahead_ok)
                 if mover is not None and not stepped and not serial:
                     mover.loop(len(waiting), time.perf_counter() - t_iter, moving)
+                # Plan 70: engine-thread seconds per decode batch size, prefill passes excluded.
+                row = self.decode_seconds.setdefault(len(waiting), [0.0, 0])
+                row[0] += time.perf_counter() - t_work - prefill_s
+                row[1] += 1
             except Exception as exc:  # the step failed for every request in it
                 g._ahead = None
                 for job, _, _ in waiting:
@@ -525,9 +558,13 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _send_json(self, status: int, body: dict[str, Any]) -> None:
+    def _send_json(
+        self, status: int, body: dict[str, Any], headers: dict[str, str] | None = None
+    ) -> None:
         payload = json.dumps(body).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -536,6 +573,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
             body = {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
+            body["decode_seconds_by_batch"] = {
+                str(b): [round(t, 4), int(n)]
+                for b, (t, n) in sorted(dict(self.server.worker.decode_seconds).items())
+            }
             if self.server.mover is not None:
                 body["migrate"] = self.server.mover.stats()
             self._send_json(200, body)
@@ -580,6 +621,9 @@ class _Handler(BaseHTTPRequestHandler):
         if mover is not None and ticket is not None and ticket.isdigit():
             on_tail = functools.partial(mover.remember, int(ticket))  # runs on the worker
         job = Job(run=lambda: job_of(generator, model, request, on_tail))
+        require = self.headers.get("X-Engine-Require-Cached")
+        if require is not None and require.isdigit():
+            job.require = int(require)
         self.server.worker.submit(job)
         self._respond(job, stream=request.stream)
 
@@ -620,7 +664,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _respond(self, job: Job, *, stream: bool) -> None:
         first = job.events.get()
         if isinstance(first, RequestError):
-            self._send_json(first.status, protocol.error_body(str(first), first.status))
+            self._send_json(first.status, protocol.error_body(str(first), first.status),
+                            {"X-Engine-Stale": "1"} if isinstance(first, StaleState) else None)
             self._drain(job)
             return
         if not stream:

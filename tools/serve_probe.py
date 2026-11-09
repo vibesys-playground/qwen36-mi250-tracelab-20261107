@@ -25,7 +25,12 @@ each round's output log-normal around ``--max-new``, and an exponential tool
 wait of mean ``--tool-wait`` seconds before each later round. These are
 synthetic, chosen without any recorded trace; every setting sees the same draws.
 ``replay`` keeps the uniform shape's lengths and adds the same kind of exponential
-tool wait (mean ``--replay-wait``) before each later round.
+tool wait (mean ``--replay-wait``) before each later round. ``trace`` (plan 70) takes
+each session's rounds, new input tokens, output lengths and tool waits from the task's
+recorded session table (``--trace``; lengths and waits only, the tokens are the pool's),
+so the load has the replay's own shape; only this client reads it, never the server.
+Each pass also reports, per replica, the share of decode-step time spent at each batch
+size (``decode_seconds_by_batch`` of the replicas' /health).
 
 Each request records the router's ``X-Engine-Replica`` and ``X-Engine-Moved``
 headers (plan 63): a pass reports how many rounds ran on state that moved
@@ -111,6 +116,8 @@ def plan_sessions(shape: str, args) -> list[dict]:
     rng = random.Random(args.seed)
     plans = []
     offset = 0
+    if shape == "trace":
+        return trace_sessions(args)
     for index in range(args.sessions):
         if shape == "replay":
             rounds = rounds_of(index, args)
@@ -139,13 +146,39 @@ def plan_sessions(shape: str, args) -> list[dict]:
     return plans
 
 
+def trace_sessions(args) -> list[dict]:
+    """The recorded table's sessions in id order: first input, each later round's new input,
+    output lengths, and the tool wait before each later round."""
+    import csv
+
+    rows: dict[int, list[dict]] = {}
+    with open(args.trace) as f:
+        for row in csv.DictReader(f):
+            rows.setdefault(int(row["session_id"]), []).append(row)
+    plans = []
+    offset = 0
+    for sid in sorted(rows)[: args.sessions]:
+        rs = sorted(rows[sid], key=lambda r: int(r["round_idx"]))
+        grows = [int(r["input_len"]) for r in rs[1:]]
+        plans.append({
+            "first": int(rs[0]["input_len"]),
+            "outs": [int(r["output_len"]) for r in rs],
+            "waits": [0.0] + [int(r["tool_wait_after_ms"]) / 1e3 for r in rs[:-1]],
+            "grows": grows,
+            "offset": offset,
+        })
+        offset += int(rs[0]["input_len"]) + sum(grows)
+    return plans
+
+
 def session(url: str, pool: list[int], index: int, args, plan: dict | None = None,
             shape: str = "uniform") -> list[dict]:
     if plan is None:  # the uniform shape (tools/live_compile_probe.py passes only lengths)
         rounds = rounds_of(index, args)
         plan = {"first": args.first, "outs": [args.max_new] * rounds, "waits": [0.0] * rounds,
                 "offset": index * (args.first + math.ceil(args.rounds) * args.grow)}
-    span = plan["first"] + len(plan["outs"]) * args.grow
+    grows = plan.get("grows") or [args.grow] * len(plan["outs"])
+    span = plan["first"] + sum(grows) + args.grow
     offset = plan["offset"] % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
     prompt = fresh[: plan["first"]]
@@ -167,8 +200,9 @@ def session(url: str, pool: list[int], index: int, args, plan: dict | None = Non
         assert len(res["ids"]) == max_new, (len(res["ids"]), max_new)
         res["key"] = f"{shape}:s{index}r{r}"
         out.append(res)
-        prompt = prompt + res["ids"] + fresh[used : used + args.grow]
-        used += args.grow
+        grow = grows[r] if r < len(grows) else args.grow
+        prompt = prompt + res["ids"] + fresh[used : used + grow]
+        used += grow
     return out
 
 
@@ -297,6 +331,23 @@ def report(setting, shape, load_s, wall, results, health, before, log) -> None:
     tpot_moved = [(r["times"][-1] - r["times"][0]) * 1e3 / (len(r["times"]) - 1)
                   for r in moved if len(r["times"]) > 1]
     migrate = [rep.get("migrate") for rep in health.get("replicas", [])]
+    # Per replica: decode-step seconds by batch size over this pass, and each size's share.
+    decode_by_batch = []
+    for index, rep in enumerate(health.get("replicas", [])):
+        now = rep.get("decode_seconds_by_batch") or {}
+        was = ((before.get("replicas") or [{}] * (index + 1))[index] or {}).get(
+            "decode_seconds_by_batch") or {}
+        secs = {b: now[b][0] - (was.get(b) or [0.0, 0])[0] for b in now}
+        steps = {b: now[b][1] - (was.get(b) or [0.0, 0])[1] for b in now}
+        total = sum(secs.values())
+        decode_by_batch.append({
+            "seconds": round(total, 3),
+            "share": {b: round(t / total, 4) for b, t in sorted(secs.items(), key=lambda x: int(x[0]))
+                      if total and t > 0},
+            "steps": {b: n for b, n in steps.items() if n},
+            "share_ge3": round(sum(t for b, t in secs.items() if int(b) >= 3) / total, 4)
+            if total else None,
+        })
     cached = sum(int((r["usage"].get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
                  for r in results)
     engine_lines = [x for x in log.read_text().splitlines() if x.startswith("engine:")]
@@ -324,6 +375,7 @@ def report(setting, shape, load_s, wall, results, health, before, log) -> None:
         "ttft_unmoved_later_ms_p90": pct(ttft_stayed, 0.9),
         "tpot_moved_ms_p50": pct(tpot_moved, 0.5),
         "replica_migrate_cumulative": migrate if any(migrate) else None,
+        "decode_by_batch": decode_by_batch,
         # Segments: a request's prefill spans (passes it takes part in); passes: shared passes.
         "prefill_segments_per_request": per_request(health, "prefill_segments", len(results)),
         "prefill_passes_per_request": per_request(health, "prefill_passes", len(results)),
@@ -350,6 +402,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="uneven shape's draws")
     parser.add_argument("--tool-wait", type=float, default=0.0,
                         help="uneven shape: mean seconds before each later round")
+    parser.add_argument("--trace", default=str(ROOT / ".vibesys/tasks/mi2508x-tracelab/recorded_sessions.csv"),
+                        help="trace shape: the recorded session table (lengths and waits)")
     parser.add_argument("--replay-wait", type=float, default=0.3,
                         help="replay shape: mean seconds before each later round")
     parser.add_argument(
@@ -370,7 +424,8 @@ def main() -> None:
     revision = None if args.model else CHECKPOINT["revision"]
     need = max(
         args.sessions * (args.first + math.ceil(args.rounds) * args.grow),
-        *(sum(p["first"] + len(p["outs"]) * args.grow for p in plan_sessions(shape, args))
+        *(sum(p["first"] + sum(p.get("grows") or [args.grow] * len(p["outs"])) + args.grow
+              for p in plan_sessions(shape, args))
           for shape in args.shapes.split(",")),
     ) + 1
     pool = token_pool(model, revision, need, args.corpus)

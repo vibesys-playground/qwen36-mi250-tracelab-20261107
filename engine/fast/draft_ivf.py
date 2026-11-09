@@ -51,6 +51,30 @@ GAP = float(os.environ.get("ENGINE_DRAFT_IVF_GAP", "17.875"))
 # Measuring only: also run the full draft and count the drafts that differ from it (one extra
 # GEMV and all-reduce per draft).
 AUDIT = os.environ.get("ENGINE_DRAFT_IVF_AUDIT", "0") == "1"
+# Profiling only: ENGINE_DRAFT_IVF_HIST=1 prints each rank's (link, slots) fallback histogram
+# every 30 s as one "engine: ivf_hist" line.
+HIST = os.environ.get("ENGINE_DRAFT_IVF_HIST", "0") == "1"
+_REG: list = []
+
+
+def _register(served) -> None:
+    _REG.append(served)
+    if HIST and len(_REG) == 1:
+        import json
+        import threading
+
+        def loop() -> None:
+            while True:
+                time.sleep(30)
+                for i, sv in enumerate(list(_REG)):
+                    try:
+                        print("engine: ivf_hist " + json.dumps(
+                            {"dev": str(sv.w.device), "hist": sv.hist.tolist(), "stats": sv.stats.tolist()}),
+                            flush=True)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"engine: ivf_hist error {exc!r}", flush=True)
+
+        threading.Thread(target=loop, daemon=True).start()
 
 
 def usable(w: torch.Tensor) -> bool:
@@ -452,6 +476,7 @@ if triton is not None:
         r = tl.arange(0, RB)
         ok = r < R
         f = tl.load(flag_ptr)
+        f0 = f
         if f == 0:
             t = tl.load(loc_ptr + r * 3, mask=ok, other=0.0)
             n = tl.load(loc_ptr + r * 3 + 2, mask=ok, other=0.0)
@@ -459,6 +484,12 @@ if triton is not None:
             tl.store(flag_ptr, f)
         tl.atomic_add(stats_ptr, R.to(tl.int64))
         tl.atomic_add(stats_ptr + 1, (R * f).to(tl.int64))
+        # profiling only (plan 47 profile): per (link, slot bin) steps, steps on the full pass
+        # (sticky included), steps where this link set the flag. Never read by the draft.
+        h = hist_ptr + ((link - 1) * 3 + tl.minimum(R, 3) - 1) * 3
+        tl.atomic_add(h, 1)
+        tl.atomic_add(h + 1, f.to(tl.int64))
+        tl.atomic_add(h + 2, (f * (1 - f0)).to(tl.int64))
 
     @triton.jit(do_not_specialize=["V", "offset"])
     def _pred_argmax_pack_kernel(flag_ptr, l_ptr, both_ptr, V, stride, offset, RANK: tl.constexpr,
@@ -562,9 +593,12 @@ class Served:
             self.flag = torch.zeros((1,), dtype=torch.int32, device=dev)
             # drafts, drafts on the full pass, audited drafts, audited drafts unlike the full one
             self.stats = torch.zeros((4,), dtype=torch.int64, device=dev)
+            self.hist = torch.zeros((8 * 3 * 3,), dtype=torch.int64, device=dev)
             self.rb = max(16, triton.next_power_of_2(max_rows))
             self._warm()
             self.stats.zero_()
+            self.hist.zero_()
+            _register(self)
             if w.is_cuda:
                 torch.cuda.empty_cache()  # the build's temporaries, before the KV pool is sized
         extra = 0 if peer is None else self.weights[1 - own].numel() * self.weights[1 - own].element_size()
@@ -572,7 +606,7 @@ class Served:
               f"{'copied' if src is not None else 'built'} in {time.perf_counter() - t0:.1f}s, "
               f"peer shard copy {extra / 2**30:.2f} GiB", flush=True)
 
-    def _search(self, y: torch.Tensor, ids: torch.Tensor) -> None:
+    def _search(self, y: torch.Tensor, ids: torch.Tensor, link: int = 1) -> None:
         """The IVF draft of every row into ``ids`` and ``loc``, then the fallback flag."""
         from engine.fast import mfma
 
@@ -588,7 +622,7 @@ class Served:
         _ivf_local_kernel[(rows,)](self.outv, self.outi, self.nxt, self.loc, ids, self.m, self.max_rows,
                                    self.part_rows, NP=self.np, BM=min(1024, triton.next_power_of_2(self.m)),
                                    num_warps=4)
-        _ivf_flag_kernel[(1,)](self.loc, self.flag, self.stats, rows, self.gap, RB=self.rb, num_warps=1)
+        _ivf_flag_kernel[(1,)](self.loc, self.flag, self.stats, self.hist, link, rows, self.gap, RB=self.rb, num_warps=1)
 
     def _full_pack(self, y: torch.Tensor, rank: int, offset: int, solo: bool) -> torch.Tensor:
         """When the flag is set: this rank's ``[rows, 4]`` argmax pack of its shard."""
@@ -623,7 +657,7 @@ class Served:
         if self.w.is_cuda:
             torch.cuda.synchronize(self.w.device)
 
-    def draft(self, y: torch.Tensor, model, first: bool = False) -> torch.Tensor:
+    def draft(self, y: torch.Tensor, model, first: bool = False, link: int = 1) -> torch.Tensor:
         """Each row's draft token (int64 [rows]) from the head's normed output ``y`` (the same
         bits on both ranks). ``first``: the step's first link (clears the fallback flag)."""
         y = y.contiguous()
@@ -633,7 +667,7 @@ class Served:
         if first:
             self.flag.zero_()
         ids = torch.empty((rows,), dtype=torch.int64, device=y.device)
-        self._search(y, ids)
+        self._search(y, ids, link)
         pack = self._full_pack(y, rank, offset, solo)
         if not solo:
             pack = tp.allreduce_pred(rank, pack, self.flag)  # both ranks run it, or neither

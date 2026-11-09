@@ -1794,7 +1794,7 @@ class FastModel:
                     if ivf is None:
                         d = self._argmax(self.fused.gemv(h, self.lm_head))
                     else:
-                        d = ivf.draft(h, self)
+                        d = ivf.draft(h, self, link=j + 1)
                     out[rows + (j + 1) * b: rows + (j + 2) * b].copy_(d)
                 self._chain_out = out
                 return logits
@@ -1815,7 +1815,7 @@ class FastModel:
                 if self.ivf is None:
                     d = self._argmax(self.fused.gemv(h, self.lm_head))
                 else:
-                    d = self.ivf.draft(h, self)
+                    d = self.ivf.draft(h, self, link=j + 1)
                 drafts.append(d)
             self._chain_out = torch.cat((picks, a, torch.stack(drafts).flatten()))
             return logits

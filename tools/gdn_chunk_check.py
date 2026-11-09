@@ -134,8 +134,8 @@ def main() -> int:
     p.add_argument("--sizes", default="64,576,1792,2048")
     p.add_argument("--counts", default="61,561,1650,2048")
     p.add_argument("--reps", type=int, default=50)
-    p.add_argument("--sweep", default="16,4,4,1;16,4,4,2;16,4,2,1;16,4,2,2;16,8,4,1;32,4,4,1;32,4,4,2;32,4,8,2;"
-                                      "64,4,4,2;16,2,4,1")
+    p.add_argument("--sweep", default="16,8,4,1;16,4,4,1;16,8,4,2;16,8,2,1;32,8,4,1;"
+                                      "16,4,2,1")
     args = p.parse_args()
     from engine import gdn
 
@@ -203,10 +203,10 @@ def main() -> int:
             us = getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0)
             if us:
                 per[e.key[:60]] = round(us / 5 / 1e3, 4)
-        fused_names = ("gdn_chunk_wy_kernel", "gdn_chunk_state_kernel", "_gdn_conv_state_kernel")
+        fused_names = ("gdn_chunk_wy_kernel", "gdn_chunk_state_kernel")  # the conv kernels are shared
         fused_dev = sum(v for k, v in per.items() if k.startswith(fused_names))
         result("time", size=size, count=count, fla_chain_ms=round(t_fla, 4), fused_ms=round(t_fused, 4),
-               ratio=round(t_fused / t_fla, 3), fused_kernels_device_ms=round(fused_dev, 4), sweep_ms=sweep,
+               ratio=round(t_fused / t_fla, 3), fused_wy_state_device_ms=round(fused_dev, 4), sweep_ms=sweep,
                per_kernel_ms_per_call=per)
     return 0
 

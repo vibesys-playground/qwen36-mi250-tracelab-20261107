@@ -6,7 +6,7 @@
 #
 # 1. tools/plan64_bench.py on GCD 0,1 alone: bitwise SEL 1/2 vs 0 and ORDER 0-3, per-call
 #    times, AR stress. Picks ON = the fastest bitwise SEL + AR_NORM with the bitwise ORDER.
-# 2. glue_split chain k=3 B=1,2 on GCD 0,1, OFF / ON / OFF / ON (nothing else runs).
+# 2. glue_split chain B=2 k=3 and B=1 k=7 on GCD 0,1, OFF / ON / OFF / ON (nothing else runs).
 # 3. in parallel with ON: spec_step_bench (spec == plain, GCD 0,1), chain_gate (GCD 2,3),
 #    tp_parity OFF reference then ON check (teacher-forced top-1, GCD 4,5), unit tests (GCD 6,7).
 # 4. served A/B OFF / ON / OFF / ON on the whole node: identical requests per pair, compiles
@@ -18,7 +18,7 @@ ts() { echo "=== $1 $(date +%T)"; }
 (python -c "import pytest" 2>/dev/null || pip install -q pytest) > /dev/null 2>&1
 
 ts "1 bench"
-HIP_VISIBLE_DEVICES=0,1 timeout 1200 python -u tools/plan64_bench.py --devices 0,1 2>&1 | tee $L/bench.log \
+HIP_VISIBLE_DEVICES=0,1 timeout 1200 python -u tools/plan64_bench.py --devices 0,1 --replays 500 2>&1 | tee $L/bench.log \
   | grep -E "RESULT|CHOICE|Traceback|Error" | cut -c1-700
 SEL=$(grep -oP 'CHOICE SEL=\K-?[0-9]+' $L/bench.log | tail -1); SEL=${SEL:-0}
 ORD=$(grep -oP 'CHOICE SEL=-?[0-9]+ ORDER=\K-?[0-9]+' $L/bench.log | tail -1); ORD=${ORD:--1}
@@ -28,10 +28,10 @@ echo "=== ON = $ON"
 [ "$SEL" = 0 ] && [ "$ORD" -lt 0 ] && { echo "=== nothing bitwise and faster: stop"; exit 0; }
 
 ts "2 glue_split OFF/ON/OFF/ON"
-GF='RESULT (wall|step|split chain3 B=(1|2) gcd=(0|1) item=(1_add_rms|2_topk|allreduce))|Traceback|Error'
+GF='RESULT (wall|step|split chain(3|7) B=(1|2) gcd=(0|1) item=(1_add_rms|2_topk|allreduce))|Traceback|Error'
 for s in OFF ON OFF ON; do
   echo "=== [$s] glue_split"
-  env ${!s} timeout 900 python -u tools/glue_split.py --devices 0,1 --configs chain:1:3,chain:2:3 2>&1 | grep -E "$GF"
+  env ${!s} timeout 900 python -u tools/glue_split.py --devices 0,1 --configs chain:2:3,chain:1:7 2>&1 | grep -E "$GF"
 done
 
 ts "3 exactness with ON"

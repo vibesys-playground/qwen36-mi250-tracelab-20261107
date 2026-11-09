@@ -196,7 +196,7 @@ def ar_norm(torch, args):
     good = []
     for order in (1, 0, 2, 3):
         tot = {"rows": 0, "sum": 0, "norm_a": 0, "norm_b": 0, "ranks_differ": 0}
-        for R in (1, 2, 8, 16, 64):
+        for R in (1, 2, 8, 16, 64, 112):
             for it in range(args.iters):
                 ksplit = 4 if (it % 2 and R <= mfma.BM) else 1
                 bs, ba, bb, rk = one(R, it, order, ksplit)

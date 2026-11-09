@@ -317,7 +317,7 @@ def _ar_norm_two_gpus(iters: int = 8) -> list[str]:
     g = torch.Generator(device="cpu").manual_seed(64)
     w = [(torch.randn(H, generator=g) * 0.3).to(torch.bfloat16).to(d) for d in devs]
     lines = []
-    for R in (1, 2, 8, 16, 64):
+    for R in (1, 2, 8, 16, 64, 112):
         for it in range(iters):
             ksplit = 4 if (it % 2 and R <= mfma.BM) else 1
             res = _hidden(g, R, H, "cpu")
@@ -369,7 +369,7 @@ def _topk_sel_cases() -> list[str]:
     lines = []
     saved = mfma.TOPK_SEL
     try:
-        for R in (1, 3, 8, 16):
+        for R in (1, 3, 8, 16, 56):
             for it in range(20):
                 h = (torch.randn(R, 2048, generator=g) * (0.25, 1.0, 4.0, 16.0)[it % 4]).to(torch.bfloat16).to(dev)
                 outs = {}

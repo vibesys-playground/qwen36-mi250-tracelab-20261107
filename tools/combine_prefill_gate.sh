@@ -12,6 +12,12 @@
 #   GCD 4,5  spec == plain (on), then Triton compiles after /health under a served load (on)
 #   GCD 6    GPU unit tests, tests/test_gdn_chunk.py
 #   GCD 7    GPU unit tests, tests/test_moe_prefill.py
+#
+# Result (job j292, commit d793496): unit tests 24/24 (gdn_chunk) and 154/154 (moe_prefill);
+# prefill logits on == off bit for bit at 61/561/1,650/2,300 x 2 corpora, eager and graphs, and
+# on recaptured == on; spec == plain 8/8; compiles after /health: 2, both fla's
+# l2norm_fwd_kernel (as at the head), none of the engine's own. Captured pass wall (ms, median of
+# 5) off -> on: 61 30.04 -> 29.90, 561 62.21 -> 59.91, 1,650 123.39 -> 112.71, 2,300 395.9 -> 152.17.
 L=/tmp/cp-logs
 mkdir -p $L
 (python -c "import pytest" 2>/dev/null || pip install -q pytest)

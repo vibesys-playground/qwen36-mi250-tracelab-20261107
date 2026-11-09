@@ -122,6 +122,8 @@ KBASE = 3  # deeper k needs the per-depth case and the margin (plan 58)
 PRIOR = (3.2, 4.0)  # (accepted, checked) pseudo-counts: a per-draft acceptance of 0.8
 DECAY = 0.95
 MARGIN = float(os.environ.get("ENGINE_SPEC_DEEP_MARGIN", "0.05"))
+# Slot buckets that may run k > 3 (default: every bucket with its own cost row).
+DEEP_SIZES = {int(x) for x in os.environ.get("ENGINE_SPEC_DEEP_SIZES", "").split(",") if x.strip()}
 # ms per chained verify step by (slot bucket, k): the captured ``verify_chain`` step under TP2
 # with HIP GDN, median of 200 (plan 58 stage 0, j268, 50f8f10). "k:ms" items are size 2.
 COST = ("1:1:7.37,1:3:10.13,1:4:11.18,1:5:12.77,1:7:15.49,"
@@ -168,7 +170,9 @@ def depths(size: int) -> list[int]:
     from engine.fast import mfma
 
     own = {k for s, k in _cost() if s == size}
-    return [k for k in KS if k <= mfma.KMAX and (k + 1) * size <= 64 and (k <= KBASE or k in own)]
+    deep_ok = not DEEP_SIZES or size in DEEP_SIZES
+    return [k for k in KS if k <= mfma.KMAX and (k + 1) * size <= 64
+            and (k <= KBASE or (k in own and deep_ok))]
 
 
 def acceptance(g: Generation) -> float:
@@ -391,12 +395,18 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
             [g.slot for g in generations], [g.length for g in generations], gather=gather,
         )
     nxt_handle = None
+    counts = generator.__dict__.setdefault("spec_ahead", {})
     if (
         _allowed(ahead_ok)
         and fast.chain_ready(handle["size"], handle["groups"])
         and all(_ahead_safe(g, k) for g in generations)
-        and choose_k(generator, generations) == k
     ):
+        same_k = choose_k(generator, generations) == k
+        why = "eligible_same_k" if same_k else "eligible_k_changed"
+    else:
+        same_k, why = False, "not_eligible"
+    counts[why] = counts.get(why, 0) + 1
+    if same_k:
         if timed:
             looptimers.add("choosek", looptimers.now() - t0)
         _wait_late(generator, handle)

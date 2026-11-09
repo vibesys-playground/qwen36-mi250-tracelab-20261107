@@ -750,6 +750,7 @@ class Generator:
             "mtp_accepted": self.mtp_accepted,
             # chained verify steps by "requests in the step:k" (plan 58)
             "spec_k_hist": dict(getattr(self, "spec_k_hist", {})),
+            "spec_ahead": dict(getattr(self, "spec_ahead", {})),
             "prefilled_tokens": self.prefilled_tokens,
             "cached_tokens": self.cached_tokens,
             "prefix_cache_tail_hits": pc.tail_hits,

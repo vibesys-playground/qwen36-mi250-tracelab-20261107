@@ -34,7 +34,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import cpu_place, experts, looptimers, protocol, router
+from engine import cpu_place, experts, looptimers, protocol, router, speculative
 from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
 from engine.protocol import (
     ChatRequest,
@@ -182,6 +182,12 @@ class Worker:
                     serial.append((job, events, want))
                 else:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
+            if speculative.pending(g) and (
+                serial or prefilling or ready_pending(packer)
+                or any(job.cancelled.is_set() for job, _ in running)
+            ):
+                # Plan 42: the batch is about to change; finish the step launched ahead first.
+                speculative.drain(g)
             if timed:
                 t = T.now()
                 T.add("poll", t - t_mark)
@@ -232,21 +238,30 @@ class Worker:
                     waiting.append((job, events, want.generation))
             running = [(job, events) for job, events, _ in waiting]
             if not waiting:
+                speculative.drain(g)  # every request of a step launched ahead has left
                 continue
             try:
+                # Run ahead only with nothing else to start: no job queued, no prefill pending.
+                ahead_ok = not serial and not prefilling and self._jobs.empty() and not ready_pending(packer)
                 if timed:
                     batch = [generation for _, _, generation in waiting]
                     T.add("pre", T.now() - t_mark)
-                    g.decode(batch)
+                    g.decode(batch, ahead_ok)
                     T.finish(prev_batch, arrivals, prefilled, T.cur.get("_tokens", 0))
                     prev_batch = len(batch)
                 else:
-                    g.decode([generation for _, _, generation in waiting])
+                    g.decode([generation for _, _, generation in waiting], ahead_ok)
             except Exception as exc:  # the step failed for every request in it
+                g._ahead = None
                 for job, _, _ in waiting:
                     job.events.put(_internal(exc))
                     job.events.put(_DONE)
                 running = []
+
+
+def ready_pending(packer: PackedPrefill | None) -> bool:
+    """Whether the packed prefill has work queued."""
+    return packer is not None and bool(packer.busy)
 
 
 class _Output:

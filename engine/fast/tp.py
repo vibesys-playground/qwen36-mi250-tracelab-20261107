@@ -235,6 +235,32 @@ if triton is not None:
         tl.store(out_ptr + r, tl.where(a0 >= a2, a1, a3).to(tl.int64), mask=ok)
 
 
+    @triton.jit(do_not_specialize=["B", "S", "W", "RING", "GDN_ROWS"])
+    def _chain_next_kernel(out_ptr, packed_ptr, B, S, W, RING, GDN_ROWS, G: tl.constexpr):
+        """Plan 42: the next chained verify step's packed inputs from this step's outputs, on
+        the GPU (``TPModel.chain_launch_next``). One program per slot b < B; ``out`` is the
+        step's ``[picks (G S), a (S), drafts (G - 1, S)]``, ``packed`` its ``[4, W]`` inputs
+        (tokens, slots, positions, GDN rows; rows ``j S + b``). Exactly what ``_chain_host``
+        builds after ``chain_step`` emitted all ``a + 1`` picks and advanced the ring by ``a``:
+        token 0 the pick after row a, tokens 1.. the head's next drafts, positions
+        ``p + a + 1 + j``, GDN rows ring entry ``bank + a + j``. Slots and padding rows stay."""
+        b = tl.program_id(0)
+        a = tl.load(out_ptr + G * S + b)
+        last = tl.load(out_ptr + a * S + b)
+        s = tl.load(packed_ptr + W + b)
+        p0 = tl.load(packed_ptr + 2 * W + b)
+        row0 = tl.load(packed_ptr + 3 * W + b)
+        bank = (row0 - s) // GDN_ROWS
+        for j in tl.static_range(G):
+            if j == 0:
+                tok = last
+            else:
+                tok = tl.load(out_ptr + G * S + S + (j - 1) * S + b)
+            tl.store(packed_ptr + j * S + b, tok)
+            tl.store(packed_ptr + 2 * W + j * S + b, p0 + a + 1 + j)
+            tl.store(packed_ptr + 3 * W + j * S + b, s + ((bank + a + j) % RING) * GDN_ROWS)
+
+
 def argmax_pack(logits: torch.Tensor, rank: int, offset: int) -> torch.Tensor:
     """The ``[rows, 4]`` fp32 block ``Group.argmax`` all-reduces, in one launch."""
     logits = logits.contiguous()
@@ -1367,6 +1393,159 @@ class TPModel:
             T.cur["_k"] = groups - 1
             T.picks_ready(batch, ev_start, ev_mid, ev_end, ev_launch)
         return logits, picks, acc, nxt
+
+    # ------------------------------------------------------------ run-ahead chained verify (plan 42)
+    #
+    # ``chain_launch`` starts a chained verify step (inputs built on the host, as
+    # ``verify_chain``) and queues the copy of its picks to pinned host memory;
+    # ``chain_launch_next`` starts the step after an in-flight one without waiting for it: a
+    # kernel on each rank's stream writes the next inputs from the in-flight step's outputs
+    # (every pick emitted, the ring advanced by the accepted count), then the same graphs
+    # replay. ``chain_collect`` waits for a step's picks. The steps, their inputs and kernels
+    # are those of ``verify_chain``; only who builds the inputs and when the host waits change.
+
+    def _chain_pinned(self) -> torch.Tensor:
+        bufs = self.__dict__.get("_chain_bufs")
+        if bufs is None:
+            n = 3 * self.ranks[0]._rows + 64
+            bufs = [torch.empty(n, dtype=torch.long, pin_memory=True) for _ in range(3)]
+            self.__dict__["_chain_bufs"] = bufs
+            self.__dict__["_chain_buf_i"] = 0
+        i = self.__dict__["_chain_buf_i"]
+        self.__dict__["_chain_buf_i"] = (i + 1) % len(bufs)
+        return bufs[i]
+
+    def _chain_d2h(self, out: torch.Tensor, handle: dict) -> None:
+        """Queue the copy of a step's outputs to pinned memory on rank 0's stream."""
+        dev = self.devices_tp[0]
+        n = out.numel()
+        buf = self._chain_pinned()
+        with torch.cuda.device(dev):
+            buf[:n].copy_(out, non_blocking=True)
+            event = torch.cuda.Event(enable_timing=looptimers.ENABLED)
+            event.record(torch.cuda.current_stream(dev))
+        handle["buf"], handle["n"], handle["event"] = buf, n, event
+
+    def chain_ready(self, size: int, groups: int) -> bool:
+        """Whether a step of bucket ``size`` with ``groups`` rows per slot replays captured graphs
+        (the run-ahead needs them: an uncaptured size would be captured mid-flight)."""
+        r0 = self.ranks[0]
+        return bool(
+            r0.use_graphs and self.graph_error is None and triton is not None
+            and all(size in m._segs(False, groups)[0].graphs for m in self.ranks)
+        )
+
+    def _timed_event(self, name: str, handle: dict) -> None:
+        if looptimers.ENABLED:
+            dev = self.devices_tp[0]
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record(torch.cuda.current_stream(dev))
+            handle[name] = ev
+
+    @torch.inference_mode()
+    def chain_launch(self, tokens, drafts, slots, positions, gather: bool = True) -> dict:
+        """Start a chained verify step (``verify_chain``'s inputs); ``chain_collect`` ends it.
+        ``gather``: also gather the logits after each last token (only non-speculating
+        requests use them)."""
+        r0 = self.ranks[0]
+        if not r0.chain:
+            raise RuntimeError("the chained verify needs the MTP head, Triton and ENGINE_SPEC_CHAIN=1")
+        batch = len(tokens)
+        groups = len(drafts[0]) + 1
+        size = r0.bucket(batch) if r0.use_graphs else batch
+        handle: dict = {"batch": batch, "size": size, "groups": groups}
+        timed = looptimers.ENABLED
+        if timed:
+            t0 = looptimers.now()
+        self._timed_event("ev_start", handle)
+        host = r0._chain_host(tokens, drafts, slots, positions, groups, size)
+        if timed:
+            t1 = looptimers.now()
+            looptimers.add("chost", t1 - t0)
+        self._load_inputs(host)
+        self._timed_event("ev_launch", handle)
+        if timed:
+            t2 = looptimers.now()
+            looptimers.add("h2d", t2 - t1)
+            looptimers.add("build", t2 - t0)
+            looptimers.cur["_build_t"] = t2
+            looptimers.replay_start()
+        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        self._chain_d2h(out, handle)
+        if gather:
+            handle["logits"] = self._gather([o[:batch] for o in outs])
+        if timed:
+            looptimers.add("launch", looptimers.now() - t2)
+        return handle
+
+    @torch.inference_mode()
+    def chain_launch_next(self, prev: dict) -> dict:
+        """Start the step after the in-flight step ``prev`` (same slots, same k), its inputs
+        written on the GPU from ``prev``'s outputs, without waiting for ``prev``. The caller
+        has made sure every slot emits all of ``prev``'s picks and runs the next step, and has
+        given each slot pages for it (``_ensure_pages``)."""
+        r0 = self.ranks[0]
+        batch, size, groups = prev["batch"], prev["size"], prev["groups"]
+        handle: dict = {"batch": batch, "size": size, "groups": groups, "ahead": True}
+        timed = looptimers.ENABLED
+        if timed:
+            t0 = looptimers.now()
+        self._timed_event("ev_start", handle)
+        for model in self.ranks:
+            out = model._chain_static[(size, groups)]
+            for meta in model.devices.values():
+                with kernels.on_device(meta.packed):
+                    _chain_next_kernel[(batch,)](
+                        out, meta.packed, batch, size, meta.packed.shape[1], model.ring,
+                        model.gdn_rows, G=groups, num_warps=1,
+                    )
+        self._timed_event("ev_launch", handle)
+        if timed:
+            t1 = looptimers.now()
+            looptimers.add("next_build", t1 - t0)
+        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        self._chain_d2h(out, handle)
+        if timed:
+            looptimers.add("launch", looptimers.now() - t1)
+        return handle
+
+    def chain_collect(self, handle: dict) -> tuple[torch.Tensor | None, list[list[int]], list[int], list[list[int]]]:
+        """Wait for a step started by ``chain_launch``/``chain_launch_next``: (logits after
+        each last token or None, picks, accepted counts, next drafts) as ``verify_chain``."""
+        timed = looptimers.ENABLED
+        if timed:
+            t0 = looptimers.now()
+        handle["event"].synchronize()
+        if timed:
+            t1 = looptimers.now()
+            looptimers.add("wait", t1 - t0)
+        batch, size, groups = handle["batch"], handle["size"], handle["groups"]
+        picks, acc, nxt = FastModel._chain_parse(handle["buf"][: handle["n"]], batch, size, groups)
+        if timed:
+            looptimers.add("parse", looptimers.now() - t1)
+            looptimers.cur["_k"] = groups - 1
+            if "ev_start" in handle:
+                looptimers.picks_ready(batch, handle["ev_start"], handle["event"], handle["event"],
+                                       handle["ev_launch"])
+        return handle.get("logits"), picks, acc, nxt
+
+    def warm_chain_next(self) -> None:
+        """Compile the run-ahead input kernel for every chain shape before serving."""
+        if triton is None:
+            return
+        from engine.fast import mfma
+
+        for model in self.ranks:
+            for meta in model.devices.values():
+                packed = meta.packed.clone()
+                out = torch.zeros(3 * packed.shape[1], dtype=torch.long, device=packed.device)
+                for groups in (2, 4, 8):
+                    if groups > mfma.RING:
+                        continue
+                    with kernels.on_device(packed):
+                        _chain_next_kernel[(1,)](out, packed, 1, 1, packed.shape[1], model.ring,
+                                                 model.gdn_rows, G=groups, num_warps=1)
+                torch.cuda.synchronize(packed.device)
 
     # ------------------------------------------------------------ graphs
 

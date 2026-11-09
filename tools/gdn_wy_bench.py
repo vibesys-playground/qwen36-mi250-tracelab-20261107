@@ -51,16 +51,16 @@ def parse(form: str):
     p = form.split(":")
     if p[0] in ("mono", "stack"):
         return (p[0], 0, 0, 0), int(p[1])
-    return (p[0], int(p[1]), int(p[2]), int(p[3])), None
+    return (p[0], *(int(x) for x in p[1:])), None
 
 
 def forms() -> list[str]:
-    out = [f"mono:{w}" for w in (8, 4, 2, 1)] + [f"stack:{w}" for w in (8, 4, 2, 1)]
-    for s in (1, 2, 4):
+    out = [f"mono:{w}" for w in (8, 4)] + [f"stack:{w}" for w in (8, 4)]
+    for s in (2, 4, 8):
         for u in (2, 4, 8):
             for bw in (64, 128):
-                out.append(f"split:{s}:{u}:{bw}")
-    out += [f"split1:{s}:4:64" for s in (1, 2, 4)]
+                out.append(f"split:{s}:{u}:{bw}:{s}")
+    out += [f"split1:{s}:4:128:{s}" for s in (2, 4)]
     return out
 
 
@@ -191,9 +191,25 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 result("form_error", size=size, count=count, form=form, error=f"{type(exc).__name__}: {exc}"[:600])
     key = 561 if 561 in times else counts[len(counts) // 2]
+    big = max(times)
     t = times[key]
     base = t.get(BASE)
     best = min(t, key=t.get)
+    if best.startswith("split") and big != key:
+        # the solve kernel's warps above SPLIT_NT chunks: the best S at the largest size with
+        # the same dot-kernel setting
+        kind, _, u, bw, _ = best.split(":")
+        alts = {f: v for f, v in times[big].items() if f.startswith(f"{kind}:") and f.split(":")[2:4] == [u, bw]}
+        if alts:
+            s2 = min(alts, key=alts.get).split(":")[1]
+            best = ":".join(best.split(":")[:4] + [s2])
+            if best not in todo:
+                for c in times:  # the combined form's time per size from its parts
+                    parts = [f for f in times[c] if f.split(":")[:4] == best.split(":")[:4]]
+                    nt = -(-sizes[counts.index(c)] // 64)
+                    src = f"{kind}:{s2}:{u}:{bw}:{s2}" if nt > 16 else (parts[0] if parts else None)
+                    if src in times[c]:
+                        times[c][best] = times[c][src]
     stacks = {f: v for f, v in t.items() if f.startswith("stack")}
     best_stack = min(stacks, key=stacks.get) if stacks else None
     summary = {}

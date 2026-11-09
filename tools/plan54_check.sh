@@ -7,8 +7,9 @@
 #   fastest form at 561 = BEST, and the fastest stacked-only form = STACK); GCD 7 unit tests.
 # B (parallel, TP2 pairs):
 #   GCD 0,1 captured prefill pass op split (tools/prefill_op_split.py) at 61/561/1,650 new
-#           tokens: ENGINE_GDN_WY=mono:8 (head), BEST, STACK
-#   GCD 2,3 teacher-forced top-1 of BEST, then STACK, against a mono:8 reference (tools/tp_parity.py)
+#           tokens: ENGINE_GDN_WY=mono:8 (head), BEST
+#   GCD 2,3 teacher-forced top-1 of BEST, then of the default, against a mono:8 reference
+#           (tools/tp_parity.py)
 #   GCD 4,5 spec == plain with BEST (tools/spec_step_bench.py), then Triton compiles after /health
 #           under a served replay-like load (tools/live_compile_probe.py) with BEST
 #   GCD 6,7 BEST greedy repeat in one process, then across processes
@@ -25,19 +26,19 @@ echo "=== A: form sweep (GCD 6) + unit tests (GCD 7)"
 wait
 grep -vE "$F" $L/tests.log
 grep -vE "$F" $L/bench.log | cut -c1-1500
-BEST=$(cat $L/best.txt 2>/dev/null || echo split:2:4:64)
+BEST=$(cat $L/best.txt 2>/dev/null || echo split:4:4:128:2)
 STACK=$(grep '"kind": "best"' $L/bench.log | python -c "import json,sys; print(json.loads(sys.stdin.read().split('RESULT ',1)[1])['best_stack'])" 2>/dev/null || echo stack:8)
 echo "BEST=$BEST STACK=$STACK"
 
 echo "=== B"
-( for v in mono:8 $BEST $STACK; do echo "=== op split (graph) ENGINE_GDN_WY=$v"; \
+( for v in mono:8 $BEST; do echo "=== op split (graph) ENGINE_GDN_WY=$v"; \
     env ENGINE_TP=2 ENGINE_GDN_WY=$v timeout 900 python -u tools/prefill_op_split.py all --devices 0,1 --news 61,561,1650 --reps 5; done ) > $L/split.log 2>&1 &
 ( E="ENGINE_TP=2 HIP_VISIBLE_DEVICES=2,3"; \
   env $E ENGINE_GDN_WY=mono:8 timeout 1200 python -u $P --mode ref --out /tmp/p54_ref.pt \
   && echo "--- top-1 ENGINE_GDN_WY=$BEST against mono:8" \
   && env $E ENGINE_GDN_WY=$BEST timeout 1200 python -u $P --mode check --ref /tmp/p54_ref.pt \
-  ; echo "--- top-1 ENGINE_GDN_WY=$STACK against mono:8" \
-  && env $E ENGINE_GDN_WY=$STACK timeout 1200 python -u $P --mode check --ref /tmp/p54_ref.pt ) > $L/parity.log 2>&1 &
+  && echo "--- top-1 default ENGINE_GDN_WY (unset) against mono:8" \
+  && env $E timeout 1200 python -u $P --mode check --ref /tmp/p54_ref.pt ) > $L/parity.log 2>&1 &
 ( echo "--- spec == plain ENGINE_GDN_WY=$BEST"; ENGINE_GDN_WY=$BEST timeout 1500 python -u tools/spec_step_bench.py --devices 4,5 --iters 10 --max-new 128; \
   echo "--- live compiles ENGINE_GDN_WY=$BEST"; HIP_VISIBLE_DEVICES=4,5 ENGINE_GDN_WY=$BEST timeout 1800 python -u tools/live_compile_probe.py ) > $L/live.log 2>&1 &
 ( E="ENGINE_TP=2 HIP_VISIBLE_DEVICES=6,7 ENGINE_GDN_WY=$BEST"; \

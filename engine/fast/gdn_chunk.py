@@ -61,25 +61,29 @@ def supported(m: torch.nn.Module, conv_state: torch.Tensor) -> bool:
     )
 
 
-WY_DEFAULT = "split:2:4:64"
+WY_DEFAULT = "split:4:4:128:2"
+NORM_WARPS = 8  # the fused kernel's (head default) warps: its l2norm row sums' order
+SPLIT_NT = 16  # chunks above which the split form's solve kernel takes its second warp count
 
 
-def wy_variant() -> tuple[str, int, int, int]:
+def wy_variant() -> tuple[str, int, int, int, int]:
     """The WY stage's form (plan 54), ``ENGINE_GDN_WY``, fields split by ``:`` (or ``,``):
     ``mono[:W]`` the one fused kernel (plan 40 part B) at W warps (default: the
     ``ENGINE_GDN_CHUNK_OPTS`` setting); ``stack[:W]`` the same with the four diagonal
-    substitutions stacked into one chain; ``split:S:U:BW`` / ``split1:S:U:BW`` the stacked
-    (``split1``: four chained) substitution and the block merges in ``gdn_chunk_solve_kernel``
-    at S warps, then the w / u / score dots in ``gdn_chunk_wu_kernel`` at U warps over
-    (chunks, HV, 1 + K/BW + V/BW) programs. Returns (kind, S or W (0: default), U, BW)."""
+    substitutions stacked into one chain; ``split:S:U:BW[:S2]`` / ``split1:...`` the q / k
+    l2norms in ``gdn_chunk_norm_kernel`` (at the fused kernel's 8 warps, so bitwise its
+    rounding), the stacked (``split1``: four chained) substitution and the block merges in
+    ``gdn_chunk_solve_kernel`` at S warps (S2 when the pass has more than ``SPLIT_NT``
+    chunks; 0: S), then the w / u / score dots in ``gdn_chunk_wu_kernel`` at U warps over
+    (chunks, HV, 1 + K/BW + V/BW) programs. Returns (kind, S or W (0: default), U, BW, S2)."""
     s = os.environ.get("ENGINE_GDN_WY", WY_DEFAULT).replace(",", ":").split(":")
     kind = s[0]
     assert kind in ("mono", "stack", "split", "split1"), s
     if kind in ("mono", "stack"):
-        return kind, int(s[1]) if len(s) > 1 else 0, 0, 0
-    d = [2, 4, 64]
+        return kind, int(s[1]) if len(s) > 1 else 0, 0, 0, 0
+    d = [4, 4, 128, 0]
     f = [int(x) for x in s[1:]] + d[len(s) - 1:]
-    return kind, f[0], f[1], f[2]
+    return kind, f[0], f[1], f[2], f[3]
 
 
 def _opts() -> tuple[int, int, int, int]:
@@ -353,13 +357,37 @@ if triton is not None:
                  mask=t3[:, None])
 
     @triton.jit(do_not_specialize=["T"])
+    def gdn_chunk_norm_kernel(mixed, meta_ptr, qn, kn, T, SM, H: tl.constexpr, K: tl.constexpr,
+                              BC: tl.constexpr, HAS_META: tl.constexpr, WIDEN: tl.constexpr):
+        """The l2-normalized q and k rows of one key head and 64-row chunk (grid chunks x H),
+        BF16 into ``qn``, ``kn``: the fused kernel's ``_norm`` on the same [BC, K] tiles, run
+        at its warp count so the row sums reduce in the same order (bitwise the same)."""
+        i_t = tl.program_id(0)
+        i_kh = tl.program_id(1)
+        if HAS_META:
+            n = tl.load(meta_ptr).to(tl.int32)
+        else:
+            n = T
+        o_i = tl.arange(0, BC)
+        d = tl.arange(0, K)
+        for j in tl.static_range(4):
+            r = i_t * (4 * BC) + j * BC + o_i
+            t = r < T
+            k = _norm(_ld(mixed, r, H * K + i_kh * K, T, SM, K), r < n, WIDEN)
+            q = _norm(_ld(mixed, r, i_kh * K, T, SM, K), t, WIDEN)
+            tl.store(kn + r.to(tl.int64)[:, None] * (H * K) + i_kh * K + d[None, :], k.to(tl.bfloat16),
+                     mask=t[:, None])
+            tl.store(qn + r.to(tl.int64)[:, None] * (H * K) + i_kh * K + d[None, :], q.to(tl.bfloat16),
+                     mask=t[:, None])
+
+    @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_solve_kernel(
         mixed, a_ptr, b_ptr, alog_ptr, dtb_ptr, meta_ptr, kn, gc, ai, T, SM, SA, SB,
         H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, BC: tl.constexpr, HAS_META: tl.constexpr,
         WIDEN: tl.constexpr, STACK: tl.constexpr,
     ):
         """The serial half of ``gdn_chunk_wy_kernel`` (plan 54 split; grid chunks x HV, few
-        warps): decay cumsum (``gc``), the l2-normalized k rows (``kn``, even heads), and
+        warps): decay cumsum (``gc``) and, from the normalized k rows ``kn``,
         (I + A)^-1 rounded to BF16 as fla stores it, into ``ai`` [T, HV, 4 BC] (row-major
         64-row block per chunk, zero above the diagonal). Same operations as the fused kernel."""
         i_t = tl.program_id(0)
@@ -400,18 +428,11 @@ if triton is not None:
         tl.store(gc + r2.to(tl.int64) * HV + i_h, c2, mask=t2)
         tl.store(gc + r3.to(tl.int64) * HV + i_h, c3, mask=t3)
 
-        kc0 = H * K + i_kh * K
-        k0 = _norm(_ld(mixed, r0, kc0, T, SM, K), m0, WIDEN)
-        k1 = _norm(_ld(mixed, r1, kc0, T, SM, K), m1, WIDEN)
-        k2 = _norm(_ld(mixed, r2, kc0, T, SM, K), m2, WIDEN)
-        k3 = _norm(_ld(mixed, r3, kc0, T, SM, K), m3, WIDEN)
-        d = tl.arange(0, K)
-        if i_h % (HV // H) == 0:
-            pk = kn + i_kh * K + d[None, :]
-            tl.store(pk + r0.to(tl.int64)[:, None] * (H * K), k0.to(tl.bfloat16), mask=t0[:, None])
-            tl.store(pk + r1.to(tl.int64)[:, None] * (H * K), k1.to(tl.bfloat16), mask=t1[:, None])
-            tl.store(pk + r2.to(tl.int64)[:, None] * (H * K), k2.to(tl.bfloat16), mask=t2[:, None])
-            tl.store(pk + r3.to(tl.int64)[:, None] * (H * K), k3.to(tl.bfloat16), mask=t3[:, None])
+        # The l2-normalized k rows, written by ``gdn_chunk_norm_kernel``.
+        k0 = _ldb(kn, r0, i_kh * K, H * K, T, K, WIDEN)
+        k1 = _ldb(kn, r1, i_kh * K, H * K, T, K, WIDEN)
+        k2 = _ldb(kn, r2, i_kh * K, H * K, T, K, WIDEN)
+        k3 = _ldb(kn, r3, i_kh * K, H * K, T, K, WIDEN)
 
         m_d = o_i[:, None] > o_i[None, :]
         A00 = tl.where(m_d, tl.dot(k0, tl.trans(k0)) * tl.exp2(c0[:, None] - c0[None, :]), 0.0) * b0[:, None]
@@ -464,8 +485,8 @@ if triton is not None:
         BW: tl.constexpr, HAS_META: tl.constexpr, WIDEN: tl.constexpr,
     ):
         """The dot half of ``gdn_chunk_wy_kernel`` (plan 54 split; grid chunks x HV x
-        (1 + K / BW + V / BW)) after ``gdn_chunk_solve_kernel``: role 0 the q l2norm (``qn``,
-        even heads) and the causal score block ``aqk``; then w = Ai (k * beta * exp2(c)) and
+        (1 + K / BW + V / BW)) after ``gdn_chunk_solve_kernel``: role 0 the causal score block ``aqk``
+        (from ``qn``, ``kn``); then w = Ai (k * beta * exp2(c)) and
         u = Ai (v * beta), BW columns per program. The same block dots, in the same order, as
         the fused kernel."""
         i_t = tl.program_id(0)
@@ -491,18 +512,10 @@ if triton is not None:
         c3 = tl.load(gc + r3.to(tl.int64) * HV + i_h, mask=t3, other=0.0)
         NW: tl.constexpr = K // BW
         if role == 0:
-            qc0 = i_kh * K
-            q0 = _norm(_ld(mixed, r0, qc0, T, SM, K), t0, WIDEN)
-            q1 = _norm(_ld(mixed, r1, qc0, T, SM, K), t1, WIDEN)
-            q2 = _norm(_ld(mixed, r2, qc0, T, SM, K), t2, WIDEN)
-            q3 = _norm(_ld(mixed, r3, qc0, T, SM, K), t3, WIDEN)
-            d = tl.arange(0, K)
-            if i_h % (HV // H) == 0:
-                pq = qn + i_kh * K + d[None, :]
-                tl.store(pq + r0.to(tl.int64)[:, None] * (H * K), q0.to(tl.bfloat16), mask=t0[:, None])
-                tl.store(pq + r1.to(tl.int64)[:, None] * (H * K), q1.to(tl.bfloat16), mask=t1[:, None])
-                tl.store(pq + r2.to(tl.int64)[:, None] * (H * K), q2.to(tl.bfloat16), mask=t2[:, None])
-                tl.store(pq + r3.to(tl.int64)[:, None] * (H * K), q3.to(tl.bfloat16), mask=t3[:, None])
+            q0 = _ldb(qn, r0, i_kh * K, H * K, T, K, WIDEN)
+            q1 = _ldb(qn, r1, i_kh * K, H * K, T, K, WIDEN)
+            q2 = _ldb(qn, r2, i_kh * K, H * K, T, K, WIDEN)
+            q3 = _ldb(qn, r3, i_kh * K, H * K, T, K, WIDEN)
             k0 = _ldb(kn, r0, i_kh * K, H * K, T, K, WIDEN)
             k1 = _ldb(kn, r1, i_kh * K, H * K, T, K, WIDEN)
             k2 = _ldb(kn, r2, i_kh * K, H * K, T, K, WIDEN)
@@ -660,7 +673,7 @@ def wy(mixed, a, b, a_log, dt_bias, meta, heads, qn, kn, w, u, gc, aqk, warps=No
     """The WY stage into ``qn``, ``kn``, ``w``, ``u``, ``gc``, ``aqk`` (see ``chunk``), in the
     form ``variant`` (default: ``wy_variant()``); ``warps``: the fused kernel's (default: the
     variant's, else the ``_opts`` setting)."""
-    kind, ws, ww, bw = wy_variant() if variant is None else variant
+    kind, ws, ww, bw, s2 = (wy_variant() if variant is None else tuple(variant) + (0,))[:5]
     tokens = mixed.shape[0]
     hv = a.shape[-1]
     kd = vd = 128
@@ -675,6 +688,12 @@ def wy(mixed, a, b, a_log, dt_bias, meta, heads, qn, kn, w, u, gc, aqk, warps=No
         )
         return
     ai = torch.empty((tokens, hv, BT), dtype=torch.bfloat16, device=mixed.device)
+    gdn_chunk_norm_kernel[(nt, heads)](
+        mixed, mp, qn, kn, tokens, mixed.stride(0), H=heads, K=kd, BC=BC, HAS_META=meta is not None,
+        WIDEN=_WIDEN, num_warps=NORM_WARPS,
+    )
+    if s2 and nt > SPLIT_NT:
+        ws = s2
     gdn_chunk_solve_kernel[(nt, hv)](
         mixed, a, b, a_log, dt_bias, mp, kn, gc, ai, tokens, mixed.stride(0), a.stride(0), b.stride(0),
         H=heads, HV=hv, K=kd, BC=BC, HAS_META=meta is not None, WIDEN=_WIDEN, STACK=kind == "split",

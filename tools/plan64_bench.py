@@ -151,6 +151,10 @@ def ar_norm(torch, args):
     from engine.fast import kernels, mfma, tp
 
     devs = [torch.device("cuda", int(i)) for i in range(2)]
+    for d in devs:  # both contexts up before the peer-access setup (j306: hipErrorInvalidDevice)
+        torch.zeros(1, device=d)
+        torch.cuda.synchronize(d)
+    torch.cuda.set_device(devs[0])
     group = tp.Group(devs)
     ll = group.ll
     H = tp.RMS_WIDTH
@@ -245,6 +249,7 @@ def main() -> None:
     p.add_argument("--replays", type=int, default=1000)
     p.add_argument("--iters", type=int, default=40)
     p.add_argument("--stress", type=int, default=2000)
+    p.add_argument("--skip-router", action="store_true")
     args = p.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", args.devices)
     os.environ["ENGINE_AR_NORM"] = "1"
@@ -252,7 +257,7 @@ def main() -> None:
 
     sel = order = None
     try:
-        sel = router(torch, args)
+        sel = None if args.skip_router else router(torch, args)
     except Exception as exc:  # noqa: BLE001
         out("router_error", error=repr(exc)[:2000])
     try:

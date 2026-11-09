@@ -1,4 +1,5 @@
-"""The replica router: layout, session affinity, and two CPU replicas of the tiny checkpoint.
+"""The replica router: layout, session affinity, and two replicas of the tiny checkpoint: on the
+CPU, or one GPU each when two GPUs are visible.
 
 Run with the CPU check's environment, from the project root:
 
@@ -31,6 +32,16 @@ from tiny_checkpoint import write_checkpoint  # noqa: E402
 
 CHUNK = 8
 TIMEOUT = 120
+# Two replicas need two GPUs; with fewer visible the front and its replicas run on the CPU.
+FRONT_GPUS = router.visible_gpus() >= 2
+
+
+def _front_env() -> dict[str, str]:
+    env = {**os.environ, "HF_HUB_OFFLINE": "1", "ENGINE_AFFINITY_MIN_TOKENS": "16"}
+    if not FRONT_GPUS:
+        # An invalid first index hides every device from HIP and CUDA alike.
+        env["HIP_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"] = "-1"
+    return env
 
 
 # ----------------------------------------------------------------------------- layout
@@ -171,7 +182,7 @@ def front(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             cwd=ROOT,
             stdout=sink,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "HF_HUB_OFFLINE": "1", "ENGINE_AFFINITY_MIN_TOKENS": "16"},
+            env=_front_env(),
         )
     url = f"http://127.0.0.1:{port}"
     try:
@@ -256,7 +267,7 @@ def test_a_repeated_prompt_hits_the_cache_through_the_router(front: str) -> None
     first, first_usage = _completion(front, prompt, 8)
     second, second_usage = _completion(front, prompt, 8)
     assert first_usage["prompt_tokens_details"]["cached_tokens"] == 0
-    assert second_usage["prompt_tokens_details"]["cached_tokens"] == repeat_reuse(len(prompt), CHUNK)
+    assert second_usage["prompt_tokens_details"]["cached_tokens"] == repeat_reuse(len(prompt), CHUNK, gpu=FRONT_GPUS)
     assert second == first
 
 

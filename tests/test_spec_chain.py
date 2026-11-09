@@ -80,13 +80,14 @@ def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest.fixture(scope="module")
 def fast(checkpoint: Path, chain_on):
     from engine.fast.model import FastModel
-    from engine.generator import Generator
     from engine.mtp import MTPHead
 
-    gen = Generator.load(str(checkpoint), None, max_model_len=1024, chunk_tokens=CHUNK,
-                         prefix_cache_tokens=0, prefix_cache_entries=0)
+    from conftest import load_weights, model_device
+
+    gen = load_weights(str(checkpoint), max_model_len=1024, chunk_tokens=CHUNK,
+                       prefix_cache_tokens=0, prefix_cache_entries=0)
     config = gen.model.config
-    head = MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), "cpu")
+    head = MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), model_device(gen))
     model = FastModel(gen.model, slots=4, max_len=1024, use_triton=True, use_graphs=False, mtp=head)
     assert model.fused is not None, model.fused_error
     assert model.ring == mfma.RING

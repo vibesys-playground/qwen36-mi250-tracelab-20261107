@@ -32,8 +32,11 @@ def load(path: str) -> dict[int, list[dict]]:
     return sessions
 
 
+PASS_SCALE = 1.0  # --pass-scale: a faster prefill pass (e.g. 67.7 / 71.7 for plan 40 part B)
+
+
 def P(n: int) -> float:
-    return 0.030 + 0.0000725 * n
+    return (0.030 + 0.0000725 * n) * PASS_SCALE
 
 
 def step(b: int) -> float:
@@ -136,7 +139,10 @@ def main() -> None:
     parser.add_argument("--cost-ms", type=float, action="append", default=[])
     parser.add_argument("--stall-ms", type=float, action="append", default=[])
     parser.add_argument("--label", action="append", default=[])
+    parser.add_argument("--pass-scale", type=float, default=1.0)
     args = parser.parse_args()
+    global PASS_SCALE
+    PASS_SCALE = args.pass_scale
     S = load(args.csv)
     base = run(S, "home")
     print("RESULT " + json.dumps({"kind": "sim", "policy": "home", **base}), flush=True)

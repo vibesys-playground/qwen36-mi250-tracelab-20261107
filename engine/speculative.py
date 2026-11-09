@@ -294,6 +294,14 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
     hist = generator.__dict__.setdefault("spec_k_hist", {})
     key = f"{len(generations)}:{k}"  # requests in the step : drafts per request
     hist[key] = hist.get(key, 0) + 1
+    # plan 58 counters for /health: tokens emitted by (requests : k), and k changes (a step whose
+    # k differs from the step before for the same requests)
+    emitted = generator.__dict__.setdefault("spec_k_tokens", {})
+    last = generator.__dict__.get("_spec_last")
+    ids = tuple(id(g) for g in generations)
+    if last is not None and last[0] == ids and last[1] != k:
+        generator.spec_k_changes = getattr(generator, "spec_k_changes", 0) + 1
+    generator._spec_last = (ids, k)
     for i, g in enumerate(generations):
         g.flipped = False
         g.advanced = 0
@@ -312,6 +320,7 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             adv += 1
         if adv:
             fast.advance(g.slot, adv)
+        emitted[key] = emitted.get(key, 0) + adv + 1
         g.advanced = adv
         g.length += adv + 1
         if adv == acc[i] and len(g.queue) == adv + 1 and g.continues_after(g.queue[-1], adv):
@@ -419,6 +428,8 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
     else:
         same_k, why = False, "not_eligible"
     counts[why] = counts.get(why, 0) + 1
+    if k > KBASE:
+        counts[f"{why}:deep"] = counts.get(f"{why}:deep", 0) + 1
     if same_k:
         if timed:
             looptimers.add("choosek", looptimers.now() - t0)

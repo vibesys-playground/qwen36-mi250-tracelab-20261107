@@ -4,23 +4,19 @@ One sequence of T rows of one layer on one tensor-parallel rank (HV value heads,
 HV % H == 0, key and value head dims K = V = 128 here), from the raw projection ``qkv``
 [T, 2*H*K + HV*V] (q | k | v, a column block per head; rows may be strided), the slot's conv
 state and the raw gate inputs ``a``, ``b`` [T, HV] to the core output [T, HV, V] and the slot's
-new conv and recurrent states, in three launches instead of the depthwise conv kernel and fla's
-chain behind ``torch_chunk_gated_delta_rule`` (q/k head repeat, two l2norms, the decay cumsum,
-kkt + solve, w/u, the state pass, the output pass, plus the gate, padding and state-row
-gather/scatter ops around it):
+new conv and recurrent states. After the short conv (``prefill_kernels.gdn_conv_``, unchanged),
+two launches replace fla's chain behind ``torch_chunk_gated_delta_rule`` (q/k head repeat, two
+l2norms, the decay cumsum, kkt + solve, w/u, the state pass, the output pass) and the gate,
+padding and state-row gather/scatter ops around it:
 
 - ``gdn_chunk_wy_kernel`` (grid: chunks x HV, all independent): per 64-row chunk and value
-  head, the causal depthwise conv + silu of the q, k and v channels it reads (the same
-  arithmetic and roundings as ``prefill_kernels.gdn_conv_``: fp32 taps in order, BF16 conv
-  output, BF16 silu), the decay ``g = -exp(A_log) * softplus(a + dt_bias)`` (fp32, as
-  ``gdn_gates``) and its in-chunk cumulative sum (log2 units, fla's ``RCP_LN2``), ``beta =
-  sigmoid(b)`` rounded to BF16, the l2-normalized q and k rows (fp32, eps 1e-6, rounded to
-  BF16, as fla's l2norm), fla's fused kkt + solve on 16-row sub-blocks ((I + A)^-1 with A =
-  beta * k k^T * exp(g_i - g_j), strictly lower; stored in BF16 as fla does) and fla's
-  ``recompute_w_u``: w = Ai (k * beta * exp(g)), u = Ai (v * beta); and the chunk's causal
-  score block q k^T * exp(g_i - g_j) (fla's ``chunk_fwd_o``'s A, rounded to BF16 as it is).
-- ``prefill_kernels._gdn_conv_state_kernel``: the conv state after the real rows (after the
-  conv above read the old one).
+  head, the decay ``g = -exp(A_log) * softplus(a + dt_bias)`` (fp32, as ``gdn_gates``) and
+  its in-chunk cumulative sum (log2 units, fla's ``RCP_LN2``), ``beta = sigmoid(b)`` rounded
+  to BF16, the l2-normalized q and k rows (fp32, eps 1e-6, rounded to BF16, as fla's l2norm;
+  key heads shared by HV / H value heads, no repeat), fla's fused kkt + solve on 16-row
+  sub-blocks ((I + A)^-1 with A = beta * k k^T * exp(g_i - g_j), strictly lower; BF16 as fla
+  stores it) and fla's ``recompute_w_u``: w = Ai (k * beta * exp(g)), u = Ai (v * beta); and
+  the chunk's causal score block q k^T * exp(g_i - g_j) (fla's ``chunk_fwd_o``'s A, BF16).
 - ``gdn_chunk_state_kernel`` (grid: V / BV x HV, sequential over chunks): fla's
   ``chunk_fwd_h`` and ``chunk_fwd_o`` in one pass that keeps the fp32 state in registers:
   per chunk, v_new = u - w h, o = scale * (q h * exp(g) + A_qk v_new), then
@@ -40,6 +36,7 @@ import os
 import torch
 
 from engine.fast.kernels import INTERPRET, on_device, tl, triton
+from engine.fast.prefill_kernels import gdn_conv_
 
 _WIDEN = INTERPRET  # the interpreter's BF16 dots: fp32 operands holding BF16 values
 RCP_LN2 = 1.4426950408889634
@@ -66,13 +63,12 @@ def supported(m: torch.nn.Module, conv_state: torch.Tensor) -> bool:
 
 def _opts() -> tuple[int, int, int, int]:
     """(BV, wy warps, state warps, state stages); ENGINE_GDN_CHUNK_OPTS="bv,w1,w2,stages"."""
-    o = [int(x) for x in os.environ.get("ENGINE_GDN_CHUNK_OPTS", "16,4,4,1").split(",")]
+    o = [int(x) for x in os.environ.get("ENGINE_GDN_CHUNK_OPTS", "16,8,4,1").split(",")]
     return o[0], o[1], o[2], o[3]
 
 
 if triton is not None:
     from engine.fast.moe_prefill import _bf16
-    from engine.fast.prefill_kernels import _gdn_conv_state_kernel
 
     @triton.jit
     def _rb(x, WIDEN: tl.constexpr):
@@ -91,22 +87,11 @@ if triton is not None:
             return x
 
     @triton.jit
-    def _conv(qkv, cstate, cw, rows, col0, T, SX, D: tl.constexpr, KC: tl.constexpr, WIDEN: tl.constexpr):
-        """silu(causal depthwise conv) of channels col0..col0+D at ``rows`` (< T), fp32 holding
-        BF16 values, as ``_gdn_conv_kernel``: row t reads inputs t-KC+1..t, those before row 0
-        from the conv state [C, KC]."""
+    def _ld(mixed, rows, col0, T, SM, D: tl.constexpr):
+        """Rows ``rows`` (< T) of the D columns from col0 of the convolved projection, fp32."""
         c = col0 + tl.arange(0, D)
-        ok = (rows < T)[:, None]
-        acc = tl.zeros([rows.shape[0], D], dtype=tl.float32)
-        for j in tl.static_range(KC):
-            src = rows + 1 + j - KC
-            from_x = (src >= 0)[:, None]
-            xv = tl.load(qkv + src.to(tl.int64)[:, None] * SX + c[None, :], mask=ok & from_x, other=0.0)
-            sv = tl.load(cstate + c[None, :] * KC + (src + KC)[:, None], mask=ok & (~from_x), other=0.0)
-            wj = tl.load(cw + c * KC + j).to(tl.float32)
-            acc += tl.where(from_x, xv, sv).to(tl.float32) * wj[None, :]
-        y = _bf16(acc, WIDEN)
-        return _bf16(y * tl.sigmoid(y), WIDEN)
+        return tl.load(mixed + rows.to(tl.int64)[:, None] * SM + c[None, :], mask=(rows < T)[:, None],
+                       other=0.0).to(tl.float32)
 
     @triton.jit
     def _norm(x, ok, WIDEN: tl.constexpr):
@@ -147,9 +132,9 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_wy_kernel(
-        qkv, cstate, cw, a_ptr, b_ptr, alog_ptr, dtb_ptr, meta_ptr, qn, kn, w, u, gc, aqk, T, SX, SA, SB,
+        mixed, a_ptr, b_ptr, alog_ptr, dtb_ptr, meta_ptr, qn, kn, w, u, gc, aqk, T, SM, SA, SB,
         H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BC: tl.constexpr,
-        KC: tl.constexpr, HAS_META: tl.constexpr, WIDEN: tl.constexpr,
+        HAS_META: tl.constexpr, WIDEN: tl.constexpr,
     ):
         i_t = tl.program_id(0)
         i_h = tl.program_id(1)
@@ -190,17 +175,17 @@ if triton is not None:
         tl.store(gc + r2.to(tl.int64) * HV + i_h, c2, mask=t2)
         tl.store(gc + r3.to(tl.int64) * HV + i_h, c3, mask=t3)
 
-        # conv + silu + l2norm of the chunk's k rows (zero past the real count) and q rows.
+        # l2norm of the chunk's k rows (zero past the real count) and q rows.
         kc0 = H * K + i_kh * K
-        k0 = _norm(_conv(qkv, cstate, cw, r0, kc0, T, SX, K, KC, WIDEN), m0, WIDEN)
-        k1 = _norm(_conv(qkv, cstate, cw, r1, kc0, T, SX, K, KC, WIDEN), m1, WIDEN)
-        k2 = _norm(_conv(qkv, cstate, cw, r2, kc0, T, SX, K, KC, WIDEN), m2, WIDEN)
-        k3 = _norm(_conv(qkv, cstate, cw, r3, kc0, T, SX, K, KC, WIDEN), m3, WIDEN)
+        k0 = _norm(_ld(mixed, r0, kc0, T, SM, K), m0, WIDEN)
+        k1 = _norm(_ld(mixed, r1, kc0, T, SM, K), m1, WIDEN)
+        k2 = _norm(_ld(mixed, r2, kc0, T, SM, K), m2, WIDEN)
+        k3 = _norm(_ld(mixed, r3, kc0, T, SM, K), m3, WIDEN)
         qc0 = i_kh * K
-        q0 = _norm(_conv(qkv, cstate, cw, r0, qc0, T, SX, K, KC, WIDEN), t0, WIDEN)
-        q1 = _norm(_conv(qkv, cstate, cw, r1, qc0, T, SX, K, KC, WIDEN), t1, WIDEN)
-        q2 = _norm(_conv(qkv, cstate, cw, r2, qc0, T, SX, K, KC, WIDEN), t2, WIDEN)
-        q3 = _norm(_conv(qkv, cstate, cw, r3, qc0, T, SX, K, KC, WIDEN), t3, WIDEN)
+        q0 = _norm(_ld(mixed, r0, qc0, T, SM, K), t0, WIDEN)
+        q1 = _norm(_ld(mixed, r1, qc0, T, SM, K), t1, WIDEN)
+        q2 = _norm(_ld(mixed, r2, qc0, T, SM, K), t2, WIDEN)
+        q3 = _norm(_ld(mixed, r3, qc0, T, SM, K), t3, WIDEN)
         d = tl.arange(0, K)
         if i_h % (HV // H) == 0:
             pk = kn + i_kh * K + d[None, :]
@@ -301,10 +286,10 @@ if triton is not None:
 
         # u = Ai (v * beta) [64, V]
         vc0 = 2 * H * K + i_h * V
-        v0 = _rb(_conv(qkv, cstate, cw, r0, vc0, T, SX, V, KC, WIDEN) * b0[:, None], WIDEN)
-        v1 = _rb(_conv(qkv, cstate, cw, r1, vc0, T, SX, V, KC, WIDEN) * b1[:, None], WIDEN)
-        v2 = _rb(_conv(qkv, cstate, cw, r2, vc0, T, SX, V, KC, WIDEN) * b2[:, None], WIDEN)
-        v3 = _rb(_conv(qkv, cstate, cw, r3, vc0, T, SX, V, KC, WIDEN) * b3[:, None], WIDEN)
+        v0 = _rb(_ld(mixed, r0, vc0, T, SM, V) * b0[:, None], WIDEN)
+        v1 = _rb(_ld(mixed, r1, vc0, T, SM, V) * b1[:, None], WIDEN)
+        v2 = _rb(_ld(mixed, r2, vc0, T, SM, V) * b2[:, None], WIDEN)
+        v3 = _rb(_ld(mixed, r3, vc0, T, SM, V) * b3[:, None], WIDEN)
         dv = tl.arange(0, V)
         pu = u + i_h * V + dv[None, :]
         tl.store(pu + r0.to(tl.int64)[:, None] * (HV * V), tl.dot(I00, v0).to(tl.bfloat16), mask=t0[:, None])
@@ -400,7 +385,6 @@ def chunk(
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and state.dtype == torch.float32 and state.is_contiguous()
     scale = kd ** -0.5 if scale is None else scale
     dev = qkv.device
-    weight = conv_weight.contiguous()
     qn = torch.empty((tokens, heads, kd), dtype=torch.bfloat16, device=dev)
     kn = torch.empty_like(qn)
     w = torch.empty((tokens, hv, kd), dtype=torch.bfloat16, device=dev)
@@ -409,15 +393,13 @@ def chunk(
     aqk = torch.empty((tokens, hv, BT), dtype=torch.bfloat16, device=dev)
     o = torch.empty((tokens, hv, vd), dtype=torch.bfloat16, device=dev)
     bv, w1, w2, stages = _opts()
+    # The short conv + silu and the conv state update (``prefill_kernels.gdn_conv_``).
+    mixed = gdn_conv_(qkv, conv_state, conv_weight, meta=meta)
     with on_device(qkv):
         gdn_chunk_wy_kernel[(triton.cdiv(tokens, BT), hv)](
-            qkv, conv_state, weight, a, b, a_log, dt_bias, meta if meta is not None else gc, qn, kn, w, u, gc, aqk,
-            tokens, qkv.stride(0), a.stride(0), b.stride(0), H=heads, HV=hv, K=kd, V=vd, BC=BC, KC=kc,
+            mixed, a, b, a_log, dt_bias, meta if meta is not None else gc, qn, kn, w, u, gc, aqk,
+            tokens, mixed.stride(0), a.stride(0), b.stride(0), H=heads, HV=hv, K=kd, V=vd, BC=BC,
             HAS_META=meta is not None, WIDEN=_WIDEN, num_warps=w1,
-        )
-        _gdn_conv_state_kernel[(triton.cdiv(width, 256),)](
-            qkv, conv_state, tokens, width, qkv.stride(0), meta if meta is not None else conv_state, K=kc,
-            BLOCK_C=256, HAS_META=meta is not None,
         )
         gdn_chunk_state_kernel[(vd // bv, hv)](
             qn, kn, w, u, gc, aqk, o, state, row if row is not None else gc, meta if meta is not None else gc,

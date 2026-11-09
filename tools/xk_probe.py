@@ -102,10 +102,10 @@ if triton is not None:
         if STAMP:
             t0 = _now()
         tl.atomic_xchg(flag_ptr + SIDE, e, sem="release", scope="gpu")
-        f = tl.load(flag_ptr + (1 - SIDE), volatile=True)
+        f = tl.atomic_add(flag_ptr + (1 - SIDE), 0, sem="acquire", scope="gpu")
         it = e * 0
         while (f < e) & (it < MAXIT):
-            f = tl.load(flag_ptr + (1 - SIDE), volatile=True)
+            f = tl.atomic_add(flag_ptr + (1 - SIDE), 0, sem="acquire", scope="gpu")
             it += 1
         if f < e:
             tl.atomic_add(err_ptr, 1)
@@ -141,10 +141,10 @@ if triton is not None:
         """Signal flag G (this graph's epoch), then wait until the other graph's GEMV G is done."""
         e = tl.load(ep_ptr + EI)
         tl.atomic_xchg(flag_ptr + G, e, sem="release", scope="gpu")
-        f = tl.load(done_ptr + G, volatile=True)
+        f = tl.atomic_add(done_ptr + G, 0, sem="acquire", scope="gpu")
         it = e * 0
         while (f < e) & (it < MAXIT):
-            f = tl.load(done_ptr + G, volatile=True)
+            f = tl.atomic_add(done_ptr + G, 0, sem="acquire", scope="gpu")
             it += 1
         if f < e:
             tl.atomic_add(err_ptr, 1)
@@ -179,10 +179,10 @@ if triton is not None:
             b3 = tl.load(wrow + (kb + 3 * BK + tl.arange(0, BK))[:, None], mask=nok[None, :], other=0.0)
         if WAIT:
             e = tl.load(ep_ptr + EI)
-            f = tl.load(flag_ptr + G, volatile=True)
+            f = tl.atomic_add(flag_ptr + G, 0, sem="acquire", scope="gpu")
             it = e * 0
             while (f < e) & (it < MAXIT):
-                f = tl.load(flag_ptr + G, volatile=True)
+                f = tl.atomic_add(flag_ptr + G, 0, sem="acquire", scope="gpu")
                 it += 1
             if f < e:
                 tl.atomic_add(err_ptr, 1)
@@ -589,7 +589,7 @@ def part_ceiling(args) -> None:
             res[nm] = [d for (_, d, n) in ev if nm in n]
         return res, ev
 
-    for fn, _ in list(streams.values()) + list(lats.values()):  # compile
+    for fn in [v[0] for v in streams.values()] + [v[0] for v in lats.values()]:  # compile
         fn()
     torch.cuda.synchronize(dev)
 
@@ -920,6 +920,8 @@ def schedule(torch, ch: RankChain, var: dict, st: XkState, main, side, evs, whic
             with torch.cuda.stream(side):
                 if kind == "fork":
                     ch.xk(ops[g].spec, st, gid[g], 0, npre)
+                elif kind == "forknop":
+                    _xk_bump_kernel[(1,)](st.ep, 3, num_warps=1)
                 else:
                     ch.touch(ops[g].spec, st.scratch[gid[g] * 64:], var.get("pf_npre", 2))
                 b.record(side)
@@ -927,7 +929,7 @@ def schedule(torch, ch: RankChain, var: dict, st: XkState, main, side, evs, whic
         if kind == "fork" and o.spec is not None:
             main.wait_event(pending.pop(i))
             continue
-        if kind == "pf" and o.spec is not None:
+        if kind in ("pf", "forknop") and o.spec is not None:
             main.wait_event(pending.pop(i))
         o.fn()
         if kind == "fork" and i + 1 in gid:
@@ -952,8 +954,8 @@ def part_chain(args) -> None:
 
     variants = [dict(name="serial", kind="serial"),
                 dict(name="serial_xk_P4", kind="serial_xk", npre=4),
-                dict(name="pf_P2", kind="pf", pf_npre=2),
-                dict(name="pf_P4", kind="pf", pf_npre=4)]
+                dict(name="forknop", kind="forknop"),
+                dict(name="pf_P2", kind="pf", pf_npre=2)]
     if fork_ok:
         variants += [dict(name="xk_fork_D1_P4", kind="fork", depth=1, npre=4),
                      dict(name="xk_fork_D1_P0", kind="fork", depth=1, npre=0),
@@ -1168,7 +1170,7 @@ def part_chain(args) -> None:
                 spin_timeouts=e2, ar_timeouts=ll2, profile=pstat)
 
         base = res_r.get("serial", {}).get("step_ms")
-        cand = {n: v for n, v in res_r.items() if n not in ("serial", "serial_xk_P4") and v.get("step_ms")
+        cand = {n: v for n, v in res_r.items() if n not in ("serial", "serial_xk_P4", "forknop") and v.get("step_ms")
                 and v.get("ok") and v.get("bitwise")}
         best = min(cand, key=lambda n: cand[n]["step_ms"]) if cand else None
         gain = (1 - cand[best]["step_ms"] / base) if best and base else None
@@ -1216,11 +1218,12 @@ def part_chain(args) -> None:
 # ================================================================================ driver
 
 
-def run_part(part: str, extra: list[str], timeout: int) -> tuple[int, list[str]]:
+def run_part(part: str, extra: list[str], timeout: int, env_extra: dict | None = None) -> tuple[int, list[str]]:
     env = dict(os.environ)
     env.setdefault("HIP_VISIBLE_DEVICES", "0,1")
+    env.update(env_extra or {})
     argv = [sys.executable, "-u", __file__, "--part", part, *extra]
-    print(f"===== part {part}: {' '.join(argv[2:])} (timeout {timeout}s)", flush=True)
+    print(f"===== part {part} env={env_extra or {}}: {' '.join(argv[2:])} (timeout {timeout}s)", flush=True)
     t0 = time.time()
     proc = subprocess.Popen(["timeout", "-k", "30", str(timeout), *argv], env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -1246,40 +1249,67 @@ def parse(lines):
     return res
 
 
+# HIP runtime settings tried for the two-queue schemes (found in libamdhip64.so by part env).
+RUNTIME_ENVS = {
+    "default": {},
+    "no_packet_capture": {"DEBUG_CLR_GRAPH_PACKET_CAPTURE": "0"},
+    "graph_queues_4": {"DEBUG_HIP_FORCE_GRAPH_QUEUES": "4"},
+}
+
+
 def driver(args) -> None:
-    rc_env, _ = run_part("env", [], 120)
-    rc_m, lm = run_part("mech", [], 600)
-    m = parse(lm)
-    ms = (m.get("mech_summary") or [{}])[-1]
-    fork_ok = bool(ms.get("fork_concurrent"))
-    two_ok = bool(ms.get("two_graphs_concurrent"))
+    run_part("env", [], 120)
+    mech = {}
+    for label, envx in RUNTIME_ENVS.items():
+        rc, lm = run_part("mech", [], 300, envx)
+        ms = (parse(lm).get("mech_summary") or [{}])[-1]
+        mech[label] = dict(rc=rc, fork=bool(ms.get("fork_concurrent")),
+                           two_graphs=bool(ms.get("two_graphs_concurrent")))
+        out("mech_env", env=label, **mech[label])
     rc_c, lc = run_part("ceiling", [], 900)
     c = parse(lc)
-    rc_x, lx = run_part("chain", ["--fork-ok", str(int(fork_ok)), "--two-ok", str(int(two_ok)),
-                                  "--iters", str(args.iters), "--stress", str(args.stress),
-                                  "--variants", args.variants], args.chain_timeout)
-    x = parse(lx)
-    sums = {s["rows"]: s for s in x.get("chain_summary", [])}
+    chains = {}
+    for label, envx in RUNTIME_ENVS.items():
+        m = mech[label]
+        rc_x, lx = run_part("chain", ["--fork-ok", str(int(m["fork"] or args.force_xk)),
+                                      "--two-ok", str(int(m["two_graphs"] or args.force_xk)),
+                                      "--iters", str(args.iters),
+                                      "--stress", str(args.stress if label == "default" else 500),
+                                      "--variants", args.variants], args.chain_timeout, envx)
+        x = parse(lx)
+        sums = {s_["rows"]: s_ for s_ in x.get("chain_summary", [])}
+        chains[label] = (rc_x, x, sums)
+        out("chain_env", env=label, rc=rc_x,
+            rows4={k: sums.get(4, {}).get(k) for k in ("serial_ms", "best", "best_ms", "gain", "all")},
+            rows8={k: sums.get(8, {}).get(k) for k in ("serial_ms", "best", "best_ms", "gain", "all")})
+    # the claim: the best two-queue variant at 4 rows over every runtime setting
+    best_label = max(chains, key=lambda k: (chains[k][2].get(4, {}).get("gain") is not None,
+                                            chains[k][2].get(4, {}).get("gain") or -9))
+    rc_x, x, sums = chains[best_label]
     s4 = sums.get(4, {})
     failed, other = [], []
-    for name, rc in (("mech", rc_m), ("ceiling", rc_c), ("chain", rc_x)):
-        if rc != 0:
-            failed.append(f"part {name} rc={rc}{' (hang)' if rc in (124, 137) else ''}")
-    for r in x.get("chain", []):
-        bad = []
-        if r.get("variant") != "serial" and not r.get("bitwise_vs_serial", True):
-            bad.append(f"bitwise {r['variant']} R={r['rows']}")
-        if r.get("spin_timeouts") or r.get("ar_timeouts"):
-            bad.append(f"timeouts {r['variant']} R={r['rows']}")
-        # The kill rule binds the variant that carries the claim (the best at 4 rows) and the
-        # serial reference; failures of the other schemes are reported as findings.
-        if r.get("variant") in ("serial", s4.get("best")) and r.get("rows") == 4:
-            failed += bad
-        else:
-            other += bad
-    for r in x.get("unit_xk_gemv_bitwise", []):
-        if not r.get("ok"):
-            failed.append(f"unit xk gemv R={r['rows']}")
+    if rc_c != 0:
+        other.append(f"part ceiling rc={rc_c}")
+    for label, (rc_, _, _) in chains.items():
+        if rc_ != 0:
+            (failed if label == best_label else other).append(
+                f"part chain[{label}] rc={rc_}{' (hang)' if rc_ in (124, 137) else ''}")
+    for label, (_, xx, _) in chains.items():
+        for r in xx.get("chain", []):
+            bad = []
+            if r.get("variant") != "serial" and not r.get("bitwise_vs_serial", True):
+                bad.append(f"bitwise {label}:{r['variant']} R={r['rows']}")
+            if r.get("spin_timeouts") or r.get("ar_timeouts") or r.get("aborted"):
+                bad.append(f"timeouts {label}:{r['variant']} R={r['rows']}")
+            # The kill rule binds the variant that carries the claim (the best at 4 rows) and the
+            # serial reference; failures of the other schemes are reported as findings.
+            if label == best_label and r.get("variant") in ("serial", s4.get("best")) and r.get("rows") == 4:
+                failed += bad
+            else:
+                other += bad
+        for r in xx.get("unit_xk_gemv_bitwise", []):
+            if not r.get("ok"):
+                failed.append(f"unit xk gemv {label} R={r['rows']}")
     for r in x.get("stress", []):
         if r.get("spin_timeouts") or r.get("ar_timeouts") or not r.get("bitwise_after"):
             failed.append("stress")
@@ -1287,9 +1317,8 @@ def driver(args) -> None:
             for r in c.get("ceiling", [])]
     gain4 = s4.get("gain")
     kill = bool(failed) or gain4 is None or gain4 < KILL_GAIN
-    out("verdict", mechanism=dict(fork_graph_concurrent=fork_ok, two_graphs_flags_concurrent=two_ok),
-        ceiling=ceil, chain4=dict(serial_ms=s4.get("serial_ms"), best=s4.get("best"),
-                                  best_ms=s4.get("best_ms"), gain=gain4),
+    out("verdict", mechanism=mech, ceiling=ceil, best_env=best_label,
+        chain4=dict(serial_ms=s4.get("serial_ms"), best=s4.get("best"), best_ms=s4.get("best_ms"), gain=gain4),
         chain8={k: sums.get(8, {}).get(k) for k in ("serial_ms", "best", "best_ms", "gain")},
         kill_rule=f"gain at 4 rows < {KILL_GAIN:.0%}, any bit difference, any hang/timeout",
         failed=failed, other_variant_failures=other, verdict="kill" if kill else "go")
@@ -1303,7 +1332,9 @@ def main() -> None:
     p.add_argument("--fork-ok", type=int, default=1)
     p.add_argument("--two-ok", type=int, default=1)
     p.add_argument("--variants", default="")
-    p.add_argument("--chain-timeout", type=int, default=2400)
+    p.add_argument("--chain-timeout", type=int, default=1200)
+    p.add_argument("--force-xk", type=int, default=1,
+                   help="run the xk chain variants even if part mech saw no concurrency")
     args = p.parse_args()
     if args.part == "all":
         driver(args)

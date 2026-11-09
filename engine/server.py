@@ -241,8 +241,13 @@ class Worker:
                 speculative.drain(g)  # every request of a step launched ahead has left
                 continue
             try:
-                # Run ahead only with nothing else to start: no job queued, no prefill pending.
-                ahead_ok = not serial and not prefilling and self._jobs.empty() and not ready_pending(packer)
+                # Run ahead only with nothing else to start: no job queued, no prefill pending
+                # (asked again right before the launch, which may wait for the step's end).
+                quiet = not serial and not prefilling and not ready_pending(packer)
+
+                def ahead_ok(quiet: bool = quiet) -> bool:
+                    return quiet and self._jobs.empty()
+
                 if timed:
                     batch = [generation for _, _, generation in waiting]
                     T.add("pre", T.now() - t_mark)

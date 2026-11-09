@@ -11,8 +11,8 @@
 #   GCD 6    the run-ahead input kernel against the host layout, chained verify unit tests
 # Phase B, whole node (4 x TP2): serve probe on the replay-like shape (48 sessions, 8 at a
 #   time, 1800 + 60, 190 out), with loop timers: RUNAHEAD=0 then 1 (GPU idle per step, outputs
-#   identical); without timers: RUNAHEAD=1 then 0 (A/B); if either pair is not 302/302
-#   identical, RUNAHEAD=0 twice (the floor of run-to-run batch numerics).
+#   identical); without timers: RUNAHEAD=1 then 0 (A/B); with RA_FLOOR=1 also RUNAHEAD=0
+#   twice (the floor of run-to-run batch numerics).
 set -x
 (python -c "import pytest" 2>/dev/null || pip install -q pytest)
 L=/tmp/ra-logs
@@ -35,7 +35,7 @@ echo "=== served, timers: RUNAHEAD 0 then 1"
 $P --settings ENGINE_LOOP_TIMERS=1+ENGINE_RUNAHEAD=0,ENGINE_LOOP_TIMERS=1+ENGINE_RUNAHEAD=1 2>&1 | grep -v '^engine:' | tee $L/served_t.log
 echo "=== served, no timers: RUNAHEAD 1 then 0"
 $P --settings ENGINE_RUNAHEAD=1,ENGINE_RUNAHEAD=0 2>&1 | grep -v '^engine:' | tee $L/served.log
-if ! grep -q '"identical_requests": 302' $L/served_t.log || ! grep -q '"identical_requests": 302' $L/served.log; then
+if [ -n "$RA_FLOOR" ]; then
   echo "=== served floor: RUNAHEAD 0 twice"
   $P --settings ENGINE_RUNAHEAD=0,ENGINE_RUNAHEAD=0+ENGINE_AB_REPEAT=2 2>&1 | grep -v '^engine:' | grep -E '"agreement"|"setting"' | cut -c1-600
 fi

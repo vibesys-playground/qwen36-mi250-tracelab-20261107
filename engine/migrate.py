@@ -133,7 +133,7 @@ def export_into(fast: Any, snap: Snapshot, bufs: Sequence[torch.Tensor]) -> Mani
         if buf.numel() < manifest.rank_bytes[r]:
             raise ValueError(f"rank {r} buffer of {buf.numel()} B < {manifest.rank_bytes[r]} B")
         with torch.cuda.device(buf.device) if buf.is_cuda else _null():
-            idx = torch.tensor(snap.pages, dtype=torch.long, device=buf.device)
+            idx = _index(snap.pages, buf.device)
             parts = iter(manifest.parts[r])
             for k_pool, v_pool in model.kv.values():
                 torch.index_select(k_pool, 0, idx, out=_view(buf, next(parts)))
@@ -163,7 +163,7 @@ def import_from(fast: Any, manifest: Manifest, bufs: Sequence[torch.Tensor]) -> 
     for r, model in enumerate(ranks(fast)):
         buf = bufs[r]
         with torch.cuda.device(buf.device) if buf.is_cuda else _null():
-            idx = torch.tensor(pages, dtype=torch.long, device=buf.device)
+            idx = _index(pages, buf.device)
             parts = iter(manifest.parts[r])
             for k_pool, v_pool in model.kv.values():
                 k_pool.index_copy_(0, idx, _view(buf, next(parts)))
@@ -173,6 +173,15 @@ def import_from(fast: Any, manifest: Manifest, bufs: Sequence[torch.Tensor]) -> 
                 rec = _view(buf, next(parts)).clone()
                 gdn.append((conv, rec))
     return Snapshot(length=manifest.length, gdn=gdn, pages=pages)
+
+
+def _index(pages: Sequence[int], device: torch.device) -> torch.Tensor:
+    """Page ids on ``device`` without a host wait: a pageable host-to-device copy waits for
+    the work already queued on the stream (a decode step), so copy from pinned memory."""
+    host = torch.tensor(pages, dtype=torch.long)
+    if device.type != "cuda":
+        return host
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 class _null:

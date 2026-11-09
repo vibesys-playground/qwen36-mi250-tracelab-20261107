@@ -301,6 +301,103 @@ def test_ar_rms_is_bitwise() -> None:
         pytest.skip("needs two GPUs or TRITON_INTERPRET=1")
 
 
+# ------------------------------------------------------------------ plan 64
+
+
+def _ar_norm_two_gpus(iters: int = 8) -> list[str]:
+    """``_ll_allreduce_kernel`` with the NORM tail (``tp.AR_NORM``) equals the all-reduce then
+    ``kernels.add_rms`` (both forms), plain and K-split inputs, on both ranks."""
+    from engine.fast import mfma, tp
+
+    devs = [torch.device("cuda", 0), torch.device("cuda", 1)]
+    group = tp.Group(devs)
+    ll = group.ll
+    H = tp.RMS_WIDTH
+    eps = 1e-6
+    g = torch.Generator(device="cpu").manual_seed(64)
+    w = [(torch.randn(H, generator=g) * 0.3).to(torch.bfloat16).to(d) for d in devs]
+    lines = []
+    for R in (1, 2, 8, 16, 64):
+        for it in range(iters):
+            ksplit = 4 if (it % 2 and R <= mfma.BM) else 1
+            res = _hidden(g, R, H, "cpu")
+            res_d = [res.to(d) for d in devs]
+            if ksplit > 1:
+                parts = [torch.randn(ksplit * mfma.BM * H, generator=g).to(d) for d in devs]
+
+                def mk(r):
+                    return mfma.KParts(parts[r], torch.empty((R, H), dtype=torch.bfloat16,
+                                                             device=devs[r]), ksplit)
+            else:
+                parts = [(torch.randn(R, H, generator=g) * (0.5 + it)).to(torch.bfloat16).to(d)
+                         for d in devs]
+
+                def mk(r):
+                    return parts[r]
+            s = [ll._launch(r, mk(r), None) for r in range(2)]
+            ref_a = [kernels.add_rms(res_d[r], s[r], w[r], eps) for r in range(2)]
+            got = [ll._launch(r, mk(r), res_d[r], norm=(w[r], eps)) for r in range(2)]
+            for d in devs:
+                torch.cuda.synchronize(d)
+            for r in range(2):
+                assert torch.equal(ref_a[r][0], got[r][0]), ("sum", R, it, r)
+                assert torch.equal(ref_a[r][1], got[r][1]), (
+                    "norm", R, it, r, int((ref_a[r][1] != got[r][1]).any(dim=1).sum()))
+            assert torch.equal(got[0][1].cpu(), got[1][1].cpu()), ("ranks", R, it)
+        lines.append(f"R={R} iters={iters} sum=bitwise norm=bitwise ranks_equal=True")
+    assert ll.timeouts() == 0, ll.timeouts()
+    return lines
+
+
+def test_ar_norm_is_bitwise() -> None:
+    if TWO_GPUS:
+        _ar_norm_two_gpus()
+    elif pytest is not None:
+        pytest.skip("needs two GPUs")
+
+
+def _topk_sel_cases() -> list[str]:
+    """``_ksum_router_kernel``'s selections (``mfma.TOPK_SEL`` 1, 2) equal today's (0)."""
+    from engine.fast import mfma
+
+    dev = torch.device("cuda", 0)
+    g = torch.Generator(device="cpu").manual_seed(65)
+    w = torch.randn(769, 2048, generator=g) * 0.02
+    w[17] = w[3]
+    w[101] = w[100]
+    w3 = w.to(torch.bfloat16).to(dev)
+    lines = []
+    saved = mfma.TOPK_SEL
+    try:
+        for R in (1, 3, 8, 16):
+            for it in range(20):
+                h = (torch.randn(R, 2048, generator=g) * (0.25, 1.0, 4.0, 16.0)[it % 4]).to(torch.bfloat16).to(dev)
+                outs = {}
+                for sel in (0, 1, 2):
+                    mfma.TOPK_SEL = sel
+                    idx = torch.full((R, 8), -1, dtype=torch.int32, device=dev)
+                    wt = torch.full((R, 8), float("nan"), dtype=torch.float32, device=dev)
+                    with kernels.on_device(h):
+                        r = mfma.gemv_topk(h, w3, idx, wt, 256, 8)
+                    outs[sel] = (r, idx, wt)
+                for sel in (1, 2):
+                    assert torch.equal(outs[sel][0], outs[0][0]), ("logits", sel, R, it)
+                    assert torch.equal(outs[sel][1], outs[0][1]), ("idx", sel, R, it)
+                    assert torch.equal(outs[sel][2].view(torch.int32), outs[0][2].view(torch.int32)), (
+                        "wt", sel, R, it)
+            lines.append(f"R={R} sel1=bitwise sel2=bitwise")
+    finally:
+        mfma.TOPK_SEL = saved
+    return lines
+
+
+def test_topk_sel_is_bitwise() -> None:
+    if GPU:
+        _topk_sel_cases()
+    elif pytest is not None:
+        pytest.skip("needs a GPU")
+
+
 if __name__ == "__main__":
     if not RUNNABLE:
         print("RESULT test_fused_glue SKIPPED (needs a GPU or TRITON_INTERPRET=1)")
@@ -308,6 +405,8 @@ if __name__ == "__main__":
     ok = True
     for name, fn in (("moe", _moe_cases), ("topk_mass", lambda: [_topk_mass()]),
                      ("argmax", _argmax_cases),
+                     ("topk_sel", _topk_sel_cases if GPU else (lambda: ["SKIPPED"])),
+                     ("ar_norm", _ar_norm_two_gpus if TWO_GPUS else (lambda: ["SKIPPED"])),
                      ("ar_rms", _ar_rms_two_gpus if TWO_GPUS else
                       (_ar_rms_interpret if kernels.INTERPRET else (lambda: ["SKIPPED (one GPU)"])))):
         try:

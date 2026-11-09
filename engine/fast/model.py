@@ -905,10 +905,14 @@ class FastModel:
         layer = fused._layer(i)
         states = slots if states is None else states
         arrms = tp_mod.GLUE_ARRMS
+        # Plan 64: in a captured graph, each norm after an all-reduce in that all-reduce's tail.
+        arnorm = (tp_mod.AR_NORM and not arrms and x.is_cuda and x.dim() == 2
+                  and x.shape[1] == tp_mod.RMS_WIDTH and x.dtype == torch.bfloat16
+                  and torch.cuda.is_current_stream_capturing())
         # Plan 29: the previous layer's MoE all-reduce already normed x for this layer.
         pending = self.__dict__.pop("_glue_next", None)
         with kernels.on_device(x):
-            if arrms and pending is not None and pending[0] == i and pending[1] is x:
+            if (arrms or arnorm) and pending is not None and pending[0] == i and pending[1] is x:
                 h = pending[2]
             else:
                 _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
@@ -924,15 +928,17 @@ class FastModel:
             if arrms:
                 x, h = self.tp.allreduce_rms(self.rank, h, x, layer.post_attention_layernorm.weight,
                                              self.eps)
+            elif arnorm:
+                x, h = self.tp.allreduce_norm(self.rank, h, x, layer.post_attention_layernorm.weight,
+                                              self.eps)
             else:
                 h = self._reduce(h)
                 x, h = kernels.add_rms(x, h, layer.post_attention_layernorm.weight, self.eps)
             moe = fused._moe(i, None if fused_mod.GLUE_NOZERO else torch.zeros_like(x), h)
-            if arrms and i + 1 < len(self.layers):
+            if (arrms or arnorm) and i + 1 < len(self.layers):
                 # The next layer's input RMSNorm in the same kernel as this all-reduce.
-                x, h = self.tp.allreduce_rms(
-                    self.rank, moe, x, fused._layer(i + 1).input_layernorm.weight, self.eps
-                )
+                ar = self.tp.allreduce_rms if arrms else self.tp.allreduce_norm
+                x, h = ar(self.rank, moe, x, fused._layer(i + 1).input_layernorm.weight, self.eps)
                 self._glue_next = (i + 1, x, h)
                 return x
             return self._reduce(moe, x)

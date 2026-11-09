@@ -53,6 +53,14 @@ BM = 16  # the fixed row tile
 # 9.285 -> 9.002 ms (k=1), 13.75 -> 13.427 ms (k=3); served A/B 0/1/0/1 302/302 requests
 # identical across all four processes; 0 Triton compiles after /health.
 TOPK_EPI = os.environ.get("ENGINE_TOPK_EPI", "1") == "1"
+# Plan 64 (a): how the top-k program of ``_ksum_router_kernel`` selects (ENGINE_TOPK_SEL):
+# 0 (default) today's TOPK rounds of a float max and an index min (2 TOPK serial one-wave
+# reductions); 1 TOPK rounds of one int64 max over keys ``p bits << 32 | (E - 1 - e)``; 2 one
+# reduction whose combine keeps the top 8 keys (a bitonic merge of two sorted 8-lists; TOPK 8
+# only). All three pick the same experts in the same order (max p first, ties to the lowest
+# index: p >= 0, so its bits order as its values) and build and renormalize the weights with
+# the same code, so idx/wt are bitwise equal.
+TOPK_SEL = int(os.environ.get("ENGINE_TOPK_SEL", "0"))
 
 # Tiles per weight shape (N, K): outputs per tile, K chunk, warps, K split. Never by row count.
 # in_proj and lm_head from j143's sweep (TP2 shard); the small shapes split K so a launch has
@@ -149,10 +157,78 @@ if triton is not None:
         sel_w = sel_w / tl.sum(sel_w, axis=0)
         return sel_i, sel_w.to(tl.bfloat16).to(tl.float32)
 
+    @triton.jit
+    def _cx(a, b):
+        return tl.maximum(a, b), tl.minimum(a, b)
+
+    @triton.jit
+    def _top8_combine(a0, a1, a2, a3, a4, a5, a6, a7, b0, b1, b2, b3, b4, b5, b6, b7):
+        """The 8 largest of two descending 8-lists, descending: max(a_i, b_{7-i}) is bitonic
+        and holds them; a bitonic merge (distances 4, 2, 1) sorts it."""
+        c0 = tl.maximum(a0, b7)
+        c1 = tl.maximum(a1, b6)
+        c2 = tl.maximum(a2, b5)
+        c3 = tl.maximum(a3, b4)
+        c4 = tl.maximum(a4, b3)
+        c5 = tl.maximum(a5, b2)
+        c6 = tl.maximum(a6, b1)
+        c7 = tl.maximum(a7, b0)
+        c0, c4 = _cx(c0, c4)
+        c1, c5 = _cx(c1, c5)
+        c2, c6 = _cx(c2, c6)
+        c3, c7 = _cx(c3, c7)
+        c0, c2 = _cx(c0, c2)
+        c1, c3 = _cx(c1, c3)
+        c4, c6 = _cx(c4, c6)
+        c5, c7 = _cx(c5, c7)
+        c0, c1 = _cx(c0, c1)
+        c2, c3 = _cx(c2, c3)
+        c4, c5 = _cx(c4, c5)
+        c6, c7 = _cx(c6, c7)
+        return c0, c1, c2, c3, c4, c5, c6, c7
+
+    @triton.jit
+    def _key_pick(sel_i, sel_w, kk, key, j: tl.constexpr, E: tl.constexpr):
+        i = (E - 1 - (key & 0xFFFFFFFF)).to(tl.int32)
+        w = (key >> 32).to(tl.int32).to(tl.float32, bitcast=True)
+        return tl.where(kk == j, i, sel_i), tl.where(kk == j, w, sel_w)
+
+    @triton.jit
+    def _topk_vals_sel(p, ee, E: tl.constexpr, TOPK: tl.constexpr, TOPKP: tl.constexpr,
+                       SEL: tl.constexpr):
+        """``_topk_vals`` with the selection of ``TOPK_SEL`` (1 or 2): the same softmax, the
+        same experts in the same order, the same renormalization code."""
+        p = tl.exp(p - tl.max(p, axis=0))
+        p = p / tl.sum(p, axis=0)
+        kk = tl.arange(0, TOPKP)
+        sel_w = tl.zeros([TOPKP], dtype=tl.float32)
+        sel_i = tl.zeros([TOPKP], dtype=tl.int32)
+        key = (p.to(tl.int32, bitcast=True).to(tl.int64) << 32) | (E - 1 - ee).to(tl.int64)
+        if SEL == 2:
+            neg = tl.full([E], -1, tl.int64)
+            k0, k1, k2, k3, k4, k5, k6, k7 = tl.reduce(
+                (key, neg, neg, neg, neg, neg, neg, neg), 0, _top8_combine)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k0, 0, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k1, 1, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k2, 2, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k3, 3, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k4, 4, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k5, 5, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k6, 6, E)
+            sel_i, sel_w = _key_pick(sel_i, sel_w, kk, k7, 7, E)
+        else:
+            for j in tl.static_range(TOPK):
+                mk = tl.max(key, axis=0)
+                sel_i, sel_w = _key_pick(sel_i, sel_w, kk, mk, j, E)
+                key = tl.where(key == mk, -1, key)
+        sel_w = sel_w / tl.sum(sel_w, axis=0)
+        return sel_i, sel_w.to(tl.bfloat16).to(tl.float32)
+
     @triton.jit(do_not_specialize=["R", "N"])
     def _ksum_router_kernel(part_ptr, out_ptr, idx_ptr, wt_ptr, R, N, stride_out,
                             KSPLIT: tl.constexpr, BM: tl.constexpr, BLOCK: tl.constexpr,
-                            E: tl.constexpr, TOPK: tl.constexpr, TOPKP: tl.constexpr):
+                            E: tl.constexpr, TOPK: tl.constexpr, TOPKP: tl.constexpr,
+                            SEL: tl.constexpr = 0):
         """``_ksum_kernel`` (programs < cdiv(R N, BLOCK)) plus, in R extra programs, each
         row's router top-k (``TOPK_EPI``). One wave per program (num_warps=1)."""
         pid = tl.program_id(0)
@@ -174,7 +250,10 @@ if triton is not None:
             for p in tl.static_range(1, KSPLIT):
                 s += tl.load(part_ptr + (p * BM + row) * N + ee)
             v = s.to(tl.bfloat16).to(tl.float32)
-            sel_i, sel_w = _topk_vals(v, ee, E, TOPK, TOPKP)
+            if SEL == 0:
+                sel_i, sel_w = _topk_vals(v, ee, E, TOPK, TOPKP)
+            else:
+                sel_i, sel_w = _topk_vals_sel(v, ee, E, TOPK, TOPKP, SEL)
             tl.store(idx_ptr + row * TOPK + kk, sel_i, mask=kk < TOPK)
             tl.store(wt_ptr + row * TOPK + kk, sel_w, mask=kk < TOPK)
 
@@ -367,6 +446,7 @@ def gemv_topk(x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor, wt: torch.Ten
     out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
     part = torch.empty((ksplit * BM * n,), dtype=torch.float32, device=x.device)
     block = 256
+    sel = TOPK_SEL if (TOPK_SEL != 2 or top_k == 8) else 1
     for r0 in range(0, rows, BM):
         r1 = min(rows, r0 + BM)
         xr, orr = x[r0:r1], out[r0:r1]
@@ -377,7 +457,7 @@ def gemv_topk(x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor, wt: torch.Ten
         _ksum_router_kernel[(triton.cdiv((r1 - r0) * n, block) + (r1 - r0),)](
             part, orr, idx[r0:r1], wt[r0:r1], r1 - r0, n, orr.stride(0), KSPLIT=ksplit,
             BM=BM, BLOCK=block, E=experts, TOPK=top_k, TOPKP=triton.next_power_of_2(top_k),
-            num_warps=1,
+            SEL=sel, num_warps=1,
         )
     return out
 

@@ -103,6 +103,16 @@ GLUE_ARGMAX = os.environ.get("ENGINE_GLUE_ARGMAX", "1") == "1"
 # consumes it (``_ll_allreduce_kernel`` with KSPLIT > 1): the same fp32 additions in part order
 # and the same BF16 rounding, so bitwise the two launches it replaces.
 AR_KSUM = os.environ.get("ENGINE_AR_KSUM", "1") == "1"
+# Plan 64 (b) (ENGINE_AR_NORM=1, default off): in a captured graph, the zero-centered RMSNorm
+# that follows a layer's all-reduce (the post-mixer norm, and the next layer's input norm after
+# the MoE all-reduce) runs in the tail of ``_ll_allreduce_kernel`` (NORM): each program, after
+# storing its words of bf16(res + allreduce(x)), adds 1 to its row's counter (acq_rel, GPU
+# scope; never reset: a call adds CPR per row, so ``old % CPR == CPR - 1`` marks the row's last
+# program), and the last program of a row loads the row and writes its norm. The sum of
+# squares is formed as ``kernels._add_rms_kernel`` (4 warps) forms it: per 512-column quarter
+# in one wave, then the four partials in the order ``AR_NORM_ORDER`` names (see the kernel).
+AR_NORM = os.environ.get("ENGINE_AR_NORM", "0") == "1"
+AR_NORM_ORDER = int(os.environ.get("ENGINE_AR_NORM_ORDER", "1"))
 ARGMAX_BLOCK = 8192
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)
@@ -116,11 +126,44 @@ def size() -> int:
 
 if triton is not None:
 
-    @triton.jit(do_not_specialize=["NW"])
+    @triton.jit
+    def _quarter_sum(part, ORDER: tl.constexpr):
+        """The four quarter partials [4] combined in the order ``ORDER`` names: 0
+        (q0 + q1) + (q2 + q3), 1 (q0 + q2) + (q1 + q3), 2 ((q0 + q1) + q2) + q3, 3 tl.sum.
+        Each q_k is extracted exactly (a sum of q_k and zeros)."""
+        if ORDER == 3:
+            return tl.sum(part, axis=0)
+        q = tl.arange(0, 4)
+        q0 = tl.sum(tl.where(q == 0, part, 0.0), axis=0)
+        q1 = tl.sum(tl.where(q == 1, part, 0.0), axis=0)
+        q2 = tl.sum(tl.where(q == 2, part, 0.0), axis=0)
+        q3 = tl.sum(tl.where(q == 3, part, 0.0), axis=0)
+        if ORDER == 0:
+            return (q0 + q1) + (q2 + q3)
+        elif ORDER == 1:
+            return (q0 + q2) + (q1 + q3)
+        else:
+            return ((q0 + q1) + q2) + q3
+
+    @triton.jit
+    def _row_norm(row_ptr, w_ptr, h_ptr, eps, NC: tl.constexpr, ORDER: tl.constexpr):
+        """``kernels._add_rms_kernel`` (HAS_H False) on one row of NC BF16 values, read as
+        [4, NC / 4]: out = x * rsqrt(sum(x x) / NC + eps) * (1 + w)."""
+        QW: tl.constexpr = NC // 4
+        offs = tl.arange(0, 4)[:, None] * QW + tl.arange(0, QW)[None, :]
+        x = tl.load(row_ptr + offs, cache_modifier=".cv").to(tl.float32)
+        var = _quarter_sum(tl.sum(x * x, axis=1), ORDER) / NC
+        w = tl.load(w_ptr + offs).to(tl.float32)
+        y = x * tl.rsqrt(var + eps) * (1.0 + w)
+        tl.store(h_ptr + offs, y.to(tl.bfloat16))
+
+    @triton.jit(do_not_specialize=["NW", "eps"])
     def _ll_allreduce_kernel(
         x_ptr, res_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr, NW, CAP, part_ptr, N,
+        outb_ptr, w_ptr, h_ptr, cnt_ptr, eps,
         CHUNK: tl.constexpr, BF16: tl.constexpr, RES: tl.constexpr, MAXIT: tl.constexpr,
-        KSPLIT: tl.constexpr, BM: tl.constexpr,
+        KSPLIT: tl.constexpr, BM: tl.constexpr, NORM: tl.constexpr = False,
+        NC: tl.constexpr = 2048, ORDER: tl.constexpr = 1,
     ):
         """out = [res +] (x_self + x_peer) over 32-bit words of BF16 pairs or fp32 values,
         rounded as ``bf16(fp32(a) + fp32(b))`` (then ``bf16(res + that)``); see the module doc.
@@ -180,6 +223,13 @@ if triton is not None:
             res = s.to(tl.int32, bitcast=True)
         tl.store(out_ptr + offs, res, mask=m)
         tl.store(epoch_ptr + p, e)
+        if NORM:  # plan 64 (b): the row's last program writes the row's RMSNorm
+            CPR: tl.constexpr = NC // 2 // CHUNK
+            row = p // CPR
+            old = tl.atomic_add(cnt_ptr + row, 1, sem="acq_rel", scope="gpu")
+            if (old & (CPR - 1)) == CPR - 1:
+                base = row.to(tl.int64) * NC
+                _row_norm(outb_ptr + base, w_ptr, h_ptr + base, eps, NC, ORDER)
 
 
     @triton.jit(do_not_specialize=["NW"])
@@ -375,6 +425,9 @@ class _LL:
         self.epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.loop_epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.err = [torch.zeros(1, dtype=torch.int32, device=d) for d in self.devices]
+        # Plan 64: per-row arrival counters of the NORM all-reduce (never reset; see AR_NORM).
+        self.norm_cnt = [torch.zeros(CAPACITY // (RMS_WIDTH // 2) + 1, dtype=torch.int32, device=d)
+                         for d in self.devices]
         self.rms_cap = RMS_ROWS * RMS_WIDTH
         self.rms_ready = False
         if GLUE_ARRMS:
@@ -399,6 +452,15 @@ class _LL:
                     x = torch.zeros((1, 256), dtype=torch.bfloat16, device=dev)
                     part = torch.zeros((ksplit * mfma.BM * 256,), dtype=torch.float32, device=dev)
                     self._launch(rank, mfma.KParts(part, x, ksplit), None, loop=True)
+            if AR_NORM:  # plan 64: the NORM variants (residual; plain and each K split)
+                wn = torch.zeros(RMS_WIDTH, dtype=torch.bfloat16, device=dev)
+                x = torch.zeros((1, RMS_WIDTH), dtype=torch.bfloat16, device=dev)
+                self._launch(rank, x, x, loop=True, norm=(wn, 1e-6))
+                for ksplit in sorted({mfma.tiles_for(n, k)[3] for n, k in mfma.TILES} - {1}):
+                    x = torch.zeros((1, RMS_WIDTH), dtype=torch.bfloat16, device=dev)
+                    part = torch.zeros((ksplit * mfma.BM * RMS_WIDTH,), dtype=torch.float32, device=dev)
+                    self._launch(rank, mfma.KParts(part, x, ksplit), x.clone(), loop=True,
+                                 norm=(wn, 1e-6))
             one = torch.ones(1, dtype=torch.int32, device=dev)
             self._launch_pred(rank, torch.zeros((1, 4), dtype=torch.float32, device=dev), one, loop=True)
             torch.cuda.synchronize(dev)
@@ -418,9 +480,10 @@ class _LL:
         return _Raw(ptr.value, torch.int64)
 
     def _launch(self, rank: int, x, residual: torch.Tensor | None,
-                loop: bool = False) -> torch.Tensor:
+                loop: bool = False, norm: tuple[torch.Tensor, float] | None = None):
         """``x`` a tensor, or ``mfma.KParts`` (plan 51: the K-sum in the prologue; the result
-        is written to its ``out``)."""
+        is written to its ``out``). With ``norm`` (weight, eps; plan 64, BF16 rows of
+        ``RMS_WIDTH``): returns (out, its RMSNorm) from the same launch."""
         ksplit, part, n = 1, None, 1
         if isinstance(x, mfma.KParts):
             ksplit, part, n = x.ksplit, x.part, x.out.shape[-1]
@@ -443,15 +506,24 @@ class _LL:
         local = (self.loop if loop else self.recv)[rank]
         peer = local if loop else self.recv[1 - rank]
         epoch = (self.loop_epoch if loop else self.epoch)[rank]
+        h = None
+        if norm is not None:
+            if (x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != RMS_WIDTH
+                    or (RMS_WIDTH // 2) % CHUNK or not out.is_contiguous()):
+                raise ValueError(f"all-reduce + norm of {tuple(x.shape)} {x.dtype} is not supported")
+            h = torch.empty_like(out)
         with torch.cuda.device(x.device):
             _ll_allreduce_kernel[(triton.cdiv(nw, CHUNK),)](
                 x.view(-1).view(torch.int32), res.view(-1).view(torch.int32),
                 out.view(-1).view(torch.int32), local, peer, epoch, self.err[rank], nw, CAPACITY,
                 part if part is not None else x, n,
+                out, norm[0] if norm is not None else x, h if h is not None else x,
+                self.norm_cnt[rank], norm[1] if norm is not None else 0.0,
                 CHUNK=CHUNK, BF16=x.dtype == torch.bfloat16, RES=residual is not None,
-                MAXIT=MAXIT, KSPLIT=ksplit, BM=mfma.BM, num_warps=1,
+                MAXIT=MAXIT, KSPLIT=ksplit, BM=mfma.BM, NORM=norm is not None, NC=RMS_WIDTH,
+                ORDER=AR_NORM_ORDER, num_warps=1,
             )
-        return out
+        return out if norm is None else (out, h)
 
     def _launch_pred(self, rank: int, x: torch.Tensor, flag: torch.Tensor, loop: bool = False) -> torch.Tensor:
         """fp32 ``x_self + x_peer`` only when ``flag[0] != 0`` (``_ll_allreduce_pred_kernel``);
@@ -593,6 +665,18 @@ class Group:
                 and self.ll is not None and self.ll.rms_fits(x)):
             return self.ll._launch_rms(rank, x, residual, weight, eps)
         return kernels.add_rms(residual, self.allreduce(rank, x), weight, eps)
+
+    def allreduce_norm(self, rank: int, x, residual: torch.Tensor, weight: torch.Tensor,
+                       eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """(residual + allreduce(x), its RMSNorm by ``weight``) = ``kernels.add_rms(residual +
+        allreduce(x), None, weight, eps)``; in a captured graph one ``_ll_allreduce_kernel``
+        launch with the NORM tail (plan 64, ``AR_NORM``). ``x`` may be ``mfma.KParts``."""
+        if (AR_NORM and not self.solo and self.ll is not None and residual.is_cuda
+                and torch.cuda.is_current_stream_capturing() and residual.dim() == 2
+                and residual.shape[1] == RMS_WIDTH and residual.dtype == torch.bfloat16):
+            return self.ll._launch(rank, x, residual, norm=(weight, eps))
+        total = self.allreduce(rank, x, residual)
+        return total, kernels.add_rms(total, None, weight, eps)[1]
 
     def allreduce_pred(self, rank: int, x: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
         """``allreduce`` of fp32 ``x`` that, in a captured graph, runs only when ``flag[0] !=

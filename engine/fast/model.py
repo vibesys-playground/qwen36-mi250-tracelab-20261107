@@ -40,7 +40,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import fla_pin, kernels, mfma, moe_prefill, prefill_kernels
+from engine.fast import fla_pin, gdn_chunk, kernels, mfma, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -333,6 +333,10 @@ class FastModel:
             # Plan 40 (ENGINE_PREFILL_MERGED): a prefill pass's input projections of a layer
             # as one GEMM over its packed weight (``prefill_kernels.project``).
             "prefill_merged": prefill_kernels.merged_enabled(),
+            # Plan 40 part B (ENGINE_GDN_CHUNK): a prefill pass's GDN chunked delta rule (with
+            # the q/k l2norm, decay, beta and padding) as two launches (``gdn_chunk``)
+            # instead of fla's chain; the state row is read and written in place.
+            "gdn_chunk": self.use_triton and gdn_chunk.enabled(),
         }
         # fla's autotuned prefill kernels: one fixed config each, the same in every process
         # (``fla_pin``; timing picks differ between processes and so would greedy outputs).
@@ -1271,6 +1275,11 @@ class FastModel:
         conv = conv_state.index_select(0, st.grow)[0]
         mixed = prefill_kernels.gdn_conv_(qkv, conv, m.conv1d.weight, meta=st.meta)
         conv_state.index_copy_(0, st.grow, conv[None])
+        if self.triton_kernels["gdn_chunk"] and gdn_chunk.supported(m):
+            core = gdn_chunk.chunk(mixed, a, b, m.A_log, m.dt_bias, rec_state, m.num_k_heads, row=st.grow,
+                                   meta=st.meta)
+            out = prefill_kernels.gated_rms(core, z, m.norm.weight, m.norm.variance_epsilon)
+            return F.linear(out, m.out_proj.weight)
         q, k, v = torch.split(mixed, [m.key_dim, m.key_dim, m.value_dim], dim=-1)
         q = q.reshape(tokens, -1, m.head_k_dim)
         k = k.reshape(tokens, -1, m.head_k_dim)
@@ -1354,6 +1363,10 @@ class FastModel:
         tokens = x.shape[0]
         qkv, z, b, a = self._gdn_project(m, x, prefill=True)
         mixed = prefill_kernels.gdn_conv_(qkv, conv_state[slot], m.conv1d.weight)
+        if self.triton_kernels["gdn_chunk"] and gdn_chunk.supported(m):
+            core = gdn_chunk.chunk(mixed, a, b, m.A_log, m.dt_bias, rec_state[slot], m.num_k_heads)
+            out = prefill_kernels.gated_rms(core, z, m.norm.weight, m.norm.variance_epsilon)
+            return F.linear(out, m.out_proj.weight)
         q, k, v = torch.split(mixed, [m.key_dim, m.key_dim, m.value_dim], dim=-1)
         q = q.reshape(tokens, -1, m.head_k_dim)
         k = k.reshape(tokens, -1, m.head_k_dim)

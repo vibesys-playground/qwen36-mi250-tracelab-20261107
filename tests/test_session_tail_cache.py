@@ -241,11 +241,14 @@ def test_a_tail_from_a_batched_decode_holds_only_its_own_rows(loaded: Generator)
 # The engine's own forward (engine.fast): a tail is the finished request's slot state.
 
 
-def _fast_generator(model: Generator, budget: int | None, entries: int = 64) -> Generator:
+def _fast_generator(
+    model: Generator, budget: int | None, entries: int = 64, park: int = 0, slots: int = 4
+) -> Generator:
+    """``park``: tails parked in their slots at most (plan 69); 0 detaches every tail."""
     from engine.fast.model import FastModel
 
-    fast = FastModel(model.model, slots=4, max_len=4096, use_triton=False, use_graphs=False)
-    return Generator(
+    fast = FastModel(model.model, slots=slots, max_len=4096, use_triton=False, use_graphs=False)
+    gen = Generator(
         model.model,
         model.tokenizer,
         model.eos_ids,
@@ -256,6 +259,8 @@ def _fast_generator(model: Generator, budget: int | None, entries: int = 64) -> 
         prefix_cache_bytes=budget,
         fast=fast,
     )
+    gen._prefix_cache.park_max = park
+    return gen
 
 
 def test_fast_path_rounds_resume_from_the_slot_state(loaded: Generator) -> None:
@@ -300,3 +305,147 @@ def test_fast_path_tails_respect_the_byte_budget(loaded: Generator) -> None:
         _run(gen, [p], n)
         assert gen._prefix_cache.bytes <= int(2.5 * tail_bytes)
     assert gen._prefix_cache.evictions > 0
+
+
+# Plan 69: a session tail parked in its own slot (no clone, no adopt copy) must resume exactly
+# as a detached tail does: the same state, logits, tokens and cached-token counts.
+
+
+def _rounds(gen: Generator, sessions: dict[int, list[int]], plan: list[tuple[int, int]],
+            packed: bool) -> tuple[list, list, list]:
+    """Rounds of all ``sessions`` together (round r+1 = prompt + output + new tokens); per
+    round the outputs, cached counts and each request's first logits."""
+    outs_all, cached_all, logits_all = [], [], []
+    prompts = dict(sessions)
+    for index, (new, n) in enumerate(plan):
+        sampling = Sampling(max_tokens=n, temperature=0.0, ignore_eos=True)
+        keys = sorted(prompts)
+        reqs = [(tuple(prompts[s]), sampling) for s in keys]
+        live = gen.start_many(reqs) if packed else [gen.start(p, smp) for p, smp in reqs]
+        assert not any(isinstance(g, Exception) for g in live), live
+        logits_all.append([g.logits.clone() for g in live])
+        cached_all.append([g.cached_tokens for g in live])
+        outputs: list[list[int]] = [[] for _ in keys]
+        running = list(range(len(keys)))
+        while running:
+            waiting = []
+            for i in running:
+                step = live[i].next_step()
+                outputs[i].append(step.token_id)
+                if step.finish is None:
+                    waiting.append(i)
+                else:
+                    live[i].retire()
+            running = waiting
+            if running:
+                gen.decode([live[i] for i in running])
+        outs_all.append(outputs)
+        for i, s in enumerate(keys):
+            prompts[s] = prompts[s] + outputs[i] + _new_tokens(90 + 7 * s + index, new)
+    return outs_all, cached_all, logits_all
+
+
+def _slot_state(gen: Generator, slot: int, length: int):
+    fast = gen.fast
+    row = fast._g(slot)
+    gdn = [(c[row].clone(), r[row].clone()) for c, r in fast.gdn_state.values()]
+    return gdn, _kv(gen, fast.slot_pages[slot], length)
+
+
+def _kv(gen: Generator, pages: list[int], length: int) -> list[torch.Tensor]:
+    from engine.fast.model import PAGE
+
+    out = []
+    for k_pool, v_pool in gen.fast.kv.values():
+        for pool in (k_pool, v_pool):
+            rows = [pool[p][:, : min(PAGE, length - j * PAGE)] for j, p in enumerate(pages)
+                    if j * PAGE < length]
+            out.append(torch.cat(rows, dim=1))
+    return out
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_parked_tails_resume_bitwise_as_detached_tails(loaded: Generator, packed: bool) -> None:
+    plan = [(0, 9), (2 * CHUNK + 3, 5), (1, 1), (70, 12), (3, 4)]
+    sessions = {s: _new_tokens(80 + s, 60 + 9 * s) for s in range(3)}  # tails cross pages
+    parked = _fast_generator(loaded, None, park=4, slots=6)
+    detached = _fast_generator(loaded, None, park=0, slots=6)
+    a = _rounds(parked, sessions, plan, packed)
+    b = _rounds(detached, sessions, plan, packed)
+    assert a[0] == b[0]  # tokens
+    assert a[1] == b[1]  # cached prompt tokens, every round
+    assert all(c > 0 for c in a[1][1])
+    for la, lb in zip(a[2], b[2], strict=True):
+        for x, y in zip(la, lb, strict=True):
+            assert torch.equal(x, y)  # first logits after each prefill, bit for bit
+    pc = parked._prefix_cache
+    assert pc.parked_hits == 3 * (len(plan) - 1) == detached._prefix_cache.tail_hits
+    assert pc.unparks == 0 and detached._prefix_cache.parked_hits == 0
+    # The last round's tails: parked state == detached snapshot, GDN rows and KV, exactly.
+    tails = {k: e for k, e in pc._entries.items() if e.tail}
+    assert len(tails) == 3 and all(e.slot is not None for e in tails.values())
+    for key, entry in tails.items():
+        snap = detached._prefix_cache._entries[key].snap
+        gdn, kv = _slot_state(parked, entry.slot, len(key))
+        for (c1, r1), (c2, r2) in zip(gdn, snap.gdn, strict=True):
+            assert torch.equal(c1, c2) and torch.equal(r1, r2)
+        for x, y in zip(kv, _kv(detached, snap.pages, len(key)), strict=True):
+            assert torch.equal(x, y)
+
+
+def test_a_parked_tail_never_keeps_a_request_out(loaded: Generator) -> None:
+    """All slots parked: a new session takes the oldest parked slot (detached on demand),
+    and the session whose tail that was resumes from the detached snapshot."""
+    gen = _fast_generator(loaded, None, park=3, slots=3)
+    cold = _fast_generator(loaded, None, entries=0, slots=3)
+    free_at_start = gen.fast.pool.free
+    prompts = {s: _new_tokens(110 + s, 40 + 30 * s) for s in range(5)}
+    outs = {}
+    for s in range(3):
+        outs[s] = _run(gen, [prompts[s]], 5)[0][0]
+    pc = gen._prefix_cache
+    assert pc.parked == 3 and not gen._free_slots and not gen._released
+    out, cached = _run(gen, [prompts[3]], 5)  # needs a slot: session 0's is unparked
+    assert out[0] == _run(cold, [prompts[3]], 5)[0][0] and cached == [0]
+    assert pc.unparks == 1
+    for s in (0, 1):  # 0 resumes from its detached snapshot, 1 from its parked slot
+        grown = prompts[s] + outs[s] + _new_tokens(120 + s, 11)
+        out, cached = _run(gen, [grown], 6)
+        assert cached == [len(prompts[s]) + 4]
+        assert out[0] == _run(cold, [grown], 6)[0][0]
+    # Two requests at once, more than the free slots: both served.
+    many = [prompts[4], prompts[2] + outs[2] + [5, 6, 7]]
+    got, cached = _run(gen, many, 4)
+    assert got == [_run(cold, [p], 4)[0][0] for p in many]
+    assert cached == [0, len(prompts[2]) + 4]
+    # Every page comes back once the cache lets go of its entries (parked ones included).
+    gen._reclaim()
+    while pc.evict_one():
+        pass
+    gen._reclaim()
+    assert pc.parked == 0 and sorted(gen._free_slots) == [0, 1, 2]
+    assert gen.fast.pool.free == free_at_start
+
+
+def test_parked_tails_respect_budgets_and_page_pressure(loaded: Generator) -> None:
+    """Evicting a parked tail (entry count or KV pages) frees its pages and its slot."""
+    gen = _fast_generator(loaded, None, entries=2, park=4, slots=6)
+    cold = _fast_generator(loaded, None, entries=0, slots=6)
+    prompts = [_new_tokens(130 + s, 70) for s in range(4)]
+    outs = [_run(gen, [p], 3)[0][0] for p in prompts]
+    pc = gen._prefix_cache
+    assert len(pc) <= 2 and pc.parked <= 2 and pc.evictions >= 2
+    gen._reclaim()
+    assert len(gen._free_slots) == 6 - pc.parked
+    # Page pressure: take pages until the pool evicts the parked tails.
+    fast = gen.fast
+    taken = []
+    while pc.parked:
+        taken.append(fast.pool.alloc())
+    for page in taken:
+        fast.pool.unref(page)
+    gen._reclaim()
+    assert sorted(gen._free_slots) == list(range(6))
+    grown = prompts[3] + outs[3] + [9]
+    out, cached = _run(gen, [grown], 4)
+    assert cached == [0] and out[0] == _run(cold, [grown], 4)[0][0]

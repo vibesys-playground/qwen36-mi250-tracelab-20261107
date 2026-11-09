@@ -22,10 +22,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import os
 import subprocess
 import sys
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -88,17 +90,31 @@ def rounds_of(index: int, args) -> int:
     return max(1, math.floor((index + 1) * args.rounds) - math.floor(index * args.rounds))
 
 
+def first_of(index: int, args) -> int:
+    """Session ``index``'s first-round prompt length: ``--first``, or with ``--first-max`` one of
+    ``--sessions`` evenly spaced lengths from ``--first`` to ``--first-max``, in a fixed shuffled
+    order (so long and short first rounds are mixed in time)."""
+    top = getattr(args, "first_max", 0) or args.first
+    if top <= args.first or args.sessions < 2:
+        return args.first
+    order = list(range(args.sessions))
+    random.Random(0).shuffle(order)
+    return args.first + round(order[index % args.sessions] * (top - args.first) / (args.sessions - 1))
+
+
 def session(url: str, pool: list[int], index: int, args) -> list[dict]:
     rounds = rounds_of(index, args)
-    span = args.first + rounds * args.grow
-    stride = args.first + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
+    first = first_of(index, args)
+    top = max(args.first, getattr(args, "first_max", 0) or 0)
+    span = first + rounds * args.grow
+    stride = top + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
     offset = (index * stride) % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
-    prompt = fresh[: args.first]
+    prompt = fresh[: first]
     text_mode = getattr(args, "text", False)
     if text_mode:  # as the replay: text prompts, the next one = prompt + output text + new text
         prompt = DECODE(prompt)
-    used = args.first
+    used = first
     out = []
     for r in range(rounds):
         body = {
@@ -145,6 +161,8 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
     elif setting is not None:
         env["ENGINE_FAST"] = setting
     name = "".join(c if c.isalnum() else "_" for c in setting or "default")
+    if len(name) > 80:  # a long value (a bucket list): keep the file name short
+        name = f"{name[:60]}_{zlib.crc32(name.encode()):08x}"
     log = Path(f"/tmp/serve-probe-{name}.log")
     with log.open("w") as sink:
         proc = subprocess.Popen(
@@ -223,6 +241,8 @@ def main() -> None:
         "--concurrency", type=int, default=None, help="sessions in flight at once (default: all)"
     )
     parser.add_argument("--first", type=int, default=2000)
+    parser.add_argument("--first-max", type=int, default=0,
+                        help="spread first rounds evenly over --first..--first-max tokens")
     parser.add_argument("--grow", type=int, default=300)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
@@ -239,14 +259,14 @@ def main() -> None:
     parser.add_argument(
         "--settings",
         default="ENGINE_REPLICAS=4,ENGINE_REPLICAS=2,ENGINE_REPLICAS=1",
-        help="comma-separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
+        help="comma- (or ';'-) separated, in order: an ENGINE_FAST value, 'default', or KEY=VALUE[+KEY=VALUE]",
     )
     args = parser.parse_args()
     from engine.generator import CHECKPOINT
 
     model = args.model or CHECKPOINT["model"]
     revision = None if args.model else CHECKPOINT["revision"]
-    need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
+    need = args.sessions * (max(args.first, args.first_max) + math.ceil(args.rounds) * args.grow) + 1
     pool = token_pool(model, revision, need, args.corpus)
     if args.text:
         from transformers import AutoTokenizer
@@ -255,19 +275,21 @@ def main() -> None:
         global DECODE
         DECODE = lambda ids: tok.decode(ids)  # noqa: E731
     print(json.dumps({"event": "shape", **vars(args)}), flush=True)
-    outputs = {}
-    for setting in args.settings.split(","):
-        outputs[setting] = serve_and_run(None if setting == "default" else setting, args.port, args, pool)
-    names = list(outputs)
-    if len(names) == 2:
-        a, b = outputs[names[0]], outputs[names[1]]
-        same = sum(a[k] == b[k] for k in a)
+    runs = []
+    # ';'-separated when a value holds commas (a bucket list), else ','-separated.
+    for setting in args.settings.split(";" if ";" in args.settings else ","):
+        runs.append((setting, serve_and_run(None if setting == "default" else setting, args.port, args, pool)))
+    # Every run against the first (a repeated setting gives repeatability, another one agreement).
+    for index in range(1, len(runs)):
+        a, b = runs[0][1], runs[index][1]
+        same = sum(a[k] == b.get(k) for k in a)
         first_div = []
         for k in a:
-            n = next((i for i, (x, y) in enumerate(zip(a[k], b[k])) if x != y), None)
+            n = next((i for i, (x, y) in enumerate(zip(a[k], b.get(k, []))) if x != y), None)
             if n is not None:
                 first_div.append(n)
-        print(json.dumps({"event": "agreement", "identical_requests": same, "requests": len(a),
+        print(json.dumps({"event": "agreement", "runs": [0, index], "settings": [runs[0][0], runs[index][0]],
+                          "identical_requests": same, "requests": len(a),
                           "first_divergence_positions": sorted(first_div)[:16]}), flush=True)
 
 

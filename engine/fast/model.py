@@ -366,7 +366,7 @@ class FastModel:
         # Plan 47: the chain's drafts from an IVF shortlist of this lm_head (shard), with a
         # predicated full-vocabulary fallback (``engine.fast.draft_ivf``). Verify is unchanged.
         self.ivf = None
-        if self.chain and self.use_graphs and draft_ivf.ENABLED:
+        if self.chain and self.use_graphs and draft_ivf.ENABLED and draft_ivf.usable(self.lm_head):
             self.ivf = draft_ivf.Served(self.lm_head, max_rows=max(self.buckets))
         # A verify step runs two rows per slot; any batch has at most one (two) rows per slot.
         self._rows = max(max(self.buckets) * (2 if mtp is not None else 1), slots)

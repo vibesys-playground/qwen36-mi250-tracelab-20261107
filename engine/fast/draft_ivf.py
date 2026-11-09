@@ -45,6 +45,15 @@ CLUSTERS = int(os.environ.get("ENGINE_DRAFT_IVF_CLUSTERS", "4096"))
 CAP = 64
 ITERS = 16
 GAP = float(os.environ.get("ENGINE_DRAFT_IVF_GAP", "17.875"))
+# Read the shortlisted rows from a cluster-sorted copy of the shard (+1 copy of the shard's
+# bytes) instead of through the permutation; for measuring the two.
+SORTED = os.environ.get("ENGINE_DRAFT_IVF_SORTED", "0") == "1"
+
+
+def usable(w: torch.Tensor) -> bool:
+    """Whether a shard is big enough for the index (at least 8 rows per cluster on average;
+    the tiny test checkpoints are not)."""
+    return w.shape[0] >= 8 * CLUSTERS
 
 try:  # the GPU kernels; the index build and the reference need only torch
     import triton
@@ -399,7 +408,7 @@ if triton is not None:
         tl.store(base + 4 + (1 - RANK), other)
 
     @triton.jit(do_not_specialize=["R", "gap"])
-    def _ivf_decide_kernel(pack_ptr, ids_ptr, fb_ptr, flag_ptr, R, gap, RB: tl.constexpr):
+    def _ivf_decide_kernel(pack_ptr, ids_ptr, fb_ptr, flag_ptr, stats_ptr, R, gap, RB: tl.constexpr):
         """Per row: the draft over both ranks (larger shortlist max, ties to rank 0) into
         ids, and whether it falls back (its max minus the best unscanned centroid score on
         either rank is below ``gap``); flag[0] = any row falls back."""
@@ -416,7 +425,10 @@ if triton is not None:
         fb = (top - tl.maximum(n0, n1)) < gap
         tl.store(ids_ptr + r, tl.where(win, a1, a3).to(tl.int64), mask=ok)
         tl.store(fb_ptr + r, fb.to(tl.int32), mask=ok)
-        tl.store(flag_ptr, tl.max((fb & ok).to(tl.int32), axis=0))
+        nfb = tl.sum((fb & ok).to(tl.int32), axis=0)
+        tl.store(flag_ptr, tl.minimum(nfb, 1))
+        tl.atomic_add(stats_ptr, R.to(tl.int64))  # drafts, and drafts that fell back
+        tl.atomic_add(stats_ptr + 1, nfb.to(tl.int64))
 
     @triton.jit(do_not_specialize=["R", "N"])
     def _pred_gemv_kernel(flag_ptr, x_ptr, w_ptr, out_ptr, R, N, stride_out, K: tl.constexpr,
@@ -506,11 +518,14 @@ class Served:
             self.outi = torch.empty((max_rows, self.m), dtype=torch.int32, device=dev)
             self.fb = torch.empty((max_rows,), dtype=torch.int32, device=dev)
             self.flag = torch.zeros((1,), dtype=torch.int32, device=dev)
+            self.stats = torch.zeros((2,), dtype=torch.int64, device=dev)
+            self.ws = w.index_select(0, idx.perm).contiguous() if SORTED else w
             self.rb = max(16, triton.next_power_of_2(max_rows))
             self._warm()
+            self.stats.zero_()
             if w.is_cuda:
                 torch.cuda.empty_cache()  # the build's temporaries, before the KV pool is sized
-        print(f"engine: IVF drafts on {w.device}: {clusters} clusters, P {p}, gap {gap}, "
+        print(f"engine: IVF drafts on {w.device}: {clusters} clusters, P {p}, gap {gap}, sorted {SORTED}, "
               f"built in {idx.build_s:.1f}s (sizes {idx.stats['min']}..{idx.stats['max']})", flush=True)
 
     def _warm(self) -> None:
@@ -533,8 +548,8 @@ class Served:
         sel = self.sel[:rows]
         _radix_topp_kernel[(rows,)](s, sel, self.nxt, C=self.cent.shape[0], P=self.p, num_warps=4)
         _ivf_gather_kernel[(rows, self.p, self.ch)](
-            y, self.w, self.ids, self.offsets, sel, self.outv, self.outi, self.p,
-            K=self.w.shape[1], CH=self.ch, BR=self.BR, BK=self.BK, READ_ONLY=False, PERM=True,
+            y, self.ws, self.ids, self.offsets, sel, self.outv, self.outi, self.p,
+            K=self.w.shape[1], CH=self.ch, BR=self.BR, BK=self.BK, READ_ONLY=False, PERM=not SORTED,
             num_warps=4)
         pack = torch.empty((rows, 6), dtype=torch.float32, device=y.device)
         _ivf_pack_kernel[(rows,)](self.outv, self.outi, self.nxt, pack, self.m, offset, RANK=rank,
@@ -543,7 +558,8 @@ class Served:
 
     def _decide(self, pack, rows) -> torch.Tensor:
         ids = torch.empty((rows,), dtype=torch.int64, device=pack.device)
-        _ivf_decide_kernel[(1,)](pack, ids, self.fb, self.flag, rows, self.gap, RB=self.rb, num_warps=1)
+        _ivf_decide_kernel[(1,)](pack, ids, self.fb, self.flag, self.stats, rows, self.gap, RB=self.rb,
+                                 num_warps=1)
         return ids
 
     def _full(self, y, flag, rank, offset, solo, mfma) -> torch.Tensor:

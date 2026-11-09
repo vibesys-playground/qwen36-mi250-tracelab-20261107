@@ -63,6 +63,7 @@ def main() -> None:
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--today", default=None, help="spec_step_bench RESULT lines, chain off")
+    parser.add_argument("--skip-accept", action="store_true", help="step times only")
     parser.add_argument("--baseline-ms", type=float, default=None,
                         help="a k=1 verify B=2 step time given by the lead (another commit)")
     args = parser.parse_args()
@@ -142,6 +143,18 @@ def main() -> None:
             logits = fast.prefill(slot, prompt[begin:end], begin, follow)
         return logits
 
+    def ivf_stats() -> list[int] | None:
+        """(drafts, drafts that fell back) of plan 47's IVF draft on rank 0, or None."""
+        iv = getattr(r0, "ivf", None)
+        return None if iv is None else [int(v) for v in iv.stats.tolist()]
+
+    def ivf_delta(before):
+        now = ivf_stats()
+        if before is None or now is None:
+            return None
+        d, f = now[0] - before[0], now[1] - before[1]
+        return {"drafts": d, "fallback": f, "fallback_rate": round(f / max(1, d), 4)}
+
     # ------------------------------------------------------------ 2. step time
     KS = [k for k in (1, 3, 7) if k <= mfma.KMAX]  # k up to the ring (ENGINE_SPEC_KMAX)
     step_ms = {}
@@ -156,6 +169,8 @@ def main() -> None:
                 fn = lambda: fast.verify_chain(lasts, drafts, slots, [length] * nslots)  # noqa: E731
                 for _ in range(3):
                     fn()
+                sync()
+                st0 = ivf_stats()
                 times = []
                 for _ in range(args.iters):
                     sync()
@@ -167,11 +182,16 @@ def main() -> None:
                     step_ms[k] = statistics.median(times)
                 out("step", k=k, slots=nslots, rows=nslots * (k + 1),
                     verify_chain_ms=round(statistics.median(times), 3),
-                    p10=round(sorted(times)[len(times) // 10], 3), graph_error=fast.graph_error)
+                    p10=round(sorted(times)[len(times) // 10], 3), graph_error=fast.graph_error,
+                    ivf=ivf_delta(st0))
             except Exception:  # noqa: BLE001
                 out("error", what=f"step k={k} slots={nslots}", error=traceback.format_exc().replace("\n", " | ")[-1500:])
         for s in slots:
             fast.reset(s)
+
+    if args.skip_accept:
+        out("done", seconds=round(time.perf_counter() - started))
+        return
 
     # ------------------------------------------------------------ 3. acceptance and parity
     groups = {
@@ -221,6 +241,7 @@ def main() -> None:
             tot_tokens = tot_steps = 0
             same = 0
             proposed = accepted = 0
+            st_set = ivf_stats()
             for p0 in range(0, 2 * args.pairs, 2):
                 idx = [p0, p0 + 1]
                 want = plain(name, idx)
@@ -277,7 +298,7 @@ def main() -> None:
                 p_j=p_j,
                 verify_steps=tot_steps, tokens_per_slot_step=round(e, 3),
                 drafts_checked=proposed, drafts_accepted=accepted,
-                per_draft_rate=round(accepted / max(1, proposed), 4))
+                per_draft_rate=round(accepted / max(1, proposed), 4), ivf=ivf_delta(st_set))
     os.environ["ENGINE_SPEC_K"] = ""
     fast.verify_chain = real_verify_chain
     out("parity_summary", identical=f"{parity_same}/{parity_total}", verdict="PASS" if parity_same == parity_total else "FAIL")

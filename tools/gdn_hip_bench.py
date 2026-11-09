@@ -23,6 +23,15 @@ per slot, 8 slots + dummy; ring entry 0 is the slot's own state row (in place, a
    at n=2, G=4: prologue (state loads, conv, gates, norms), chain, epilogue; median and max over
    blocks (j244: ~67 cycles per realtime tick, i.e. a 25 MHz realtime clock at ~1.7 GHz).
 Prints ``RESULT`` lines and the plan's pass / kill rule. A hint for the plan, not the metric.
+
+j244 (563d158, MI210, real weights): best 0.760 ms per 30 layers at 2 x 4 (L4x4 sep) vs today
+1.323; 1 x 4 0.712 vs 1.283. Chain ~5.7k cycles per row at 32 blocks; fused-conv prologue slow.
+j247 (c666a1f, hoisted loads + column splits): 2 x 4 0.560 (L8x4_v2) vs 1.320 (pass bar 0.55);
+1 x 4 0.435 (L16x4_v4) vs 1.284; 2 x 2 0.446 vs 0.768; 1 x 2 0.360 vs 0.748; 4 x 4 0.886 (L4x4
+sep) vs 1.516; streaming ceiling 0.31 / 0.16-0.26 ms. Error vs fp64 0.95-1.02x today's (state and
+core), conv rings bitwise, eager == graph replay bitwise for all 26 variants, no hang. Chain
+1.5-2.4k cycles per row with splits; the prologue (~12-13k cycles, ~7.5 us) is now the largest
+phase. Stage 0: GO (save 0.76 ms at 2 x 4; 2 x 4 misses 0.55 by 0.01 ms, 1 x 4 passes).
 """
 
 from __future__ import annotations

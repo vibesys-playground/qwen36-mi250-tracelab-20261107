@@ -460,6 +460,10 @@ def name_bucket(name: str) -> str:
         return "gdn heads prep (split, beta, g, repeat_interleave)"
     if "_gated_rms" in n:
         return "gdn gated norm"
+    if "_qk_prologue" in n:
+        return "attn qk prologue (fused, plan 56)"
+    if "_tiles_one_kernel" in n or "_tiles_kernel" in n:
+        return "moe tile table"
     if cls == "conv":
         return "gdn conv (pad + MIOpen)"
     if "repeat_interleave" in n:
@@ -482,8 +486,15 @@ def attribute_by_name(xs: list, note: str) -> dict:
     out_rows = defaultdict(dict)
     for (dev, b), (ms, n) in table.items():
         out_rows[b][dev] = (round(ms, 3), n)
+    # Plan 56: every kernel name, ms and launches per GCD (sum over GCDs / GCDs).
+    per_name: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
+    for e in gpu:
+        cell = per_name[e["name"][:90]]
+        cell[0] += float(e.get("dur", 0)) / 1e3 / max(1, len(devs))
+        cell[1] += 1 / max(1, len(devs))
     return {
         "devices": devs, "mode": "names", "note": note, "buckets": out_rows,
+        "names": {k: (round(v[0], 3), round(v[1], 1)) for k, v in sorted(per_name.items(), key=lambda kv: -kv[1][0])},
         "bucket_top_names": {b: [(n, round(t, 3)) for n, t in c.most_common(12)] for b, c in names.items()},
     }
 
@@ -681,6 +692,24 @@ def report(splits: list[dict], hosts: list[dict]) -> None:
         print(f"\nN={n}: wall median {s['wall_ms_median']} ms; kernel_sum_ms {s.get('kernel_sum_ms')}; busy_ms {s.get('busy_ms')}; "
               f"busy_any {s.get('busy_any_ms')}; idle_any {s.get('idle_any_ms')}; kernels {s.get('kernels')}; "
               f"clock spread {s.get('clock_spread_us')} us over {s.get('clock_pairs')} pairs; attribution {s.get('attribution') or s.get('note')}")
+    if any("names" in by_n[n] for n in ns):  # plan 56: the per-kernel-name split (graph mode)
+        names = set()
+        for n in ns:
+            names |= set(by_n[n].get("names", {}))
+        mid = ns[len(ns) // 2]
+        order_n = sorted(names, key=lambda k: -by_n[mid].get("names", {}).get(k, (0, 0))[0])
+        print("\n=== per kernel name, ms per GCD [launches per GCD] ===")
+        print(f"{'kernel':<92}" + "".join(f" {f'{n} ms':>9} {'#':>6}" for n in ns))
+        for k in order_n[:60]:
+            line = f"{k[:92]:<92}"
+            for n in ns:
+                ms, cnt = by_n[n].get("names", {}).get(k, (0.0, 0))
+                line += f" {ms:>9.3f} {cnt:>6.0f}"
+            print(line)
+        for n in ns:
+            tot = by_n[n].get("names", {})
+            result("names_total", new_tokens=n, ms_per_gcd=round(sum(v[0] for v in tot.values()), 3),
+                   launches_per_gcd=round(sum(v[1] for v in tot.values()), 1))
     for h in hosts:
         print(f"host N={h['new_tokens']}: wall {h['wall_ms_median']} ms; per-rank prefill host ms {h['rank_prefill_host_ms']}; "
               f"rendezvous {h['exchange_host_ms']}")

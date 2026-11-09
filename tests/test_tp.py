@@ -1,6 +1,7 @@
 """Tensor parallelism over two ranks (``engine.fast.tp``, ENGINE_TP=2) against the one-device
-fast path, on a tiny checkpoint with a random MTP head. Both ranks run on the CPU here (the
-eager all-reduce through the host mailbox); the in-graph all-reduce needs two GPUs.
+fast path, on a tiny checkpoint with a random MTP head. The ranks run on two GPUs when two are
+visible, else both on the CPU (the eager all-reduce through the host mailbox); the in-graph
+all-reduce needs two GPUs.
 """
 
 from __future__ import annotations
@@ -19,12 +20,14 @@ sys.path.insert(0, str(ROOT / ".vibesys" / "shared" / "cpu_check"))
 
 from engine.fast import tp  # noqa: E402
 from engine.fast.model import FastModel  # noqa: E402
-from engine.generator import Generator  # noqa: E402
 from engine.mtp import MTPHead  # noqa: E402
+from conftest import load_on_cpu, load_weights, model_device  # noqa: E402
 from test_speculative import write_mtp_checkpoint  # noqa: E402
 
 CHUNK = 8
 CPU = [torch.device("cpu"), torch.device("cpu")]
+TWO_GPUS = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+RANKS = [torch.device("cuda", 0), torch.device("cuda", 1)] if TWO_GPUS else CPU
 
 
 @pytest.fixture(scope="module")
@@ -35,13 +38,15 @@ def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _load(checkpoint: Path, parallel: bool):
-    gen = Generator.load(str(checkpoint), None, max_model_len=1024, chunk_tokens=CHUNK,
-                         prefix_cache_tokens=0, prefix_cache_entries=0)
+    # Without two GPUs the ranks run on the CPU, and the one-device model with them.
+    load = load_weights if TWO_GPUS else load_on_cpu
+    gen = load(str(checkpoint), max_model_len=1024, chunk_tokens=CHUNK,
+               prefix_cache_tokens=0, prefix_cache_entries=0)
     config = gen.model.config
-    head = MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), "cpu")
+    head = MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), model_device(gen))
     options = dict(slots=4, max_len=1024, use_triton=False, use_graphs=False, mtp=head)
     if parallel:
-        return tp.TPModel(gen.model, devices=CPU, **options)
+        return tp.TPModel(gen.model, devices=RANKS, **options)
     return FastModel(gen.model, **options)
 
 
@@ -67,6 +72,7 @@ def _prefill(fast, slot: int, prompt: list[int]) -> torch.Tensor:
 
 
 def _close(a: torch.Tensor, b: torch.Tensor) -> None:
+    b = b.to(a.device)  # with two GPUs the one-device model's logits may sit on the other
     scale = float(a.abs().max())
     assert a.shape == b.shape
     assert float((a - b).abs().max()) <= 0.03 * scale + 1e-3, float((a - b).abs().max())

@@ -31,6 +31,7 @@ autotunes before the server answers; ``ENGINE_WARMUP=0`` skips it.
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 import time
@@ -181,6 +182,24 @@ def _fla_chunk(
     cu_seqlens: torch.Tensor | None = None,
     **kwargs: Any,
 ):
+    if not query.is_cuda:  # a CPU caller in a process whose model is on a GPU
+        rule = functools.partial(_torch_rule("torch_chunk_gated_delta_rule"), chunk_size=chunk_size,
+                                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+        if cu_seqlens is None:
+            return rule(query, key, value, g=g, beta=beta, initial_state=initial_state,
+                        output_final_state=output_final_state)
+        # fla's varlen form: one sequence per ``cu_seqlens`` span, each from its own state.
+        cores, finals = [], []
+        bounds = cu_seqlens.tolist()
+        for n, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+            core, final = rule(
+                query[:, lo:hi], key[:, lo:hi], value[:, lo:hi], g=g[:, lo:hi], beta=beta[:, lo:hi],
+                initial_state=None if initial_state is None else initial_state[n : n + 1],
+                output_final_state=True,
+            )
+            cores.append(core)
+            finals.append(final)
+        return torch.cat(cores, dim=1), (torch.cat(finals, dim=0) if output_final_state else None)
     kernels = fla_kernels()
     with torch.cuda.device(query.device):
         return kernels.chunk(
@@ -200,6 +219,18 @@ def _fla_chunk(
 fla_chunk = _fla_chunk  # what ``install`` binds for the chunked rule under ENGINE_GDN=fla
 
 
+def _torch_rule(name: str) -> Any:
+    """Transformers' torch ``name`` (the rule ``install`` replaced with fla's).
+
+    ``install`` rebinds module globals, so under ``ENGINE_GDN=fla`` every caller in the process
+    gets fla's kernels, which take only GPU tensors; a model (or a tensor-parallel rank) that
+    the same process runs on the CPU uses the torch rule instead.
+    """
+    for saved in _ORIGINAL.values():
+        return _unwrapped(saved[name])
+    raise RuntimeError(f"{name}: no GDN module was installed")
+
+
 def _fla_recurrent(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -212,6 +243,13 @@ def _fla_recurrent(
     cu_seqlens: torch.Tensor | None = None,
     **kwargs: Any,
 ):
+    if not query.is_cuda:  # a CPU caller in a process whose model is on a GPU
+        if cu_seqlens is not None:
+            raise ValueError("the torch gated delta rule takes no cu_seqlens")
+        return _torch_rule("torch_recurrent_gated_delta_rule")(
+            query, key, value, g=g, beta=beta, initial_state=initial_state,
+            output_final_state=output_final_state, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
     kernels = fla_kernels()
     with torch.cuda.device(query.device):
         return kernels.recurrent(
@@ -228,6 +266,8 @@ def _fla_recurrent(
 
 
 def _fla_norm_forward(self: torch.nn.Module, hidden_states: torch.Tensor, gate: torch.Tensor):
+    if not hidden_states.is_cuda:  # a CPU module in a process whose model is on a GPU
+        return _ORIGINAL_NORM[type(self)](self, hidden_states, gate)
     kernels = fla_kernels()
     with torch.cuda.device(hidden_states.device):
         return kernels.rms_norm_gated(

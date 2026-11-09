@@ -116,6 +116,36 @@ def size() -> int:
     return int(os.environ.get("ENGINE_TP", "2"))
 
 
+# CUDA graphs held when a device faulted (a sticky error such as "unspecified launch failure"):
+# never destroyed. On ROCm, ``~CUDAGraph`` of a graph that began a capture synchronizes the
+# device under a throwing check, and a throw from a destructor terminates the process, at
+# garbage collection or at exit, instead of raising where the fault happened.
+_FAULTED_GRAPHS: list[torch.cuda.CUDAGraph] = []
+
+
+def devices_ok(devices: Sequence[torch.device]) -> bool:
+    """Whether every CUDA device of ``devices`` still synchronizes (no sticky fault)."""
+    for dev in devices:
+        if dev.type != "cuda":
+            continue
+        try:
+            torch.cuda.synchronize(dev)
+        except Exception:  # noqa: BLE001 - torch.AcceleratorError and older RuntimeErrors
+            return False
+    return True
+
+
+def keep_forever(graphs: Sequence[Any]) -> None:
+    """Keep ``graphs`` alive for the life of the process, through interpreter shutdown too (one
+    reference the interpreter never drops): see ``_FAULTED_GRAPHS``."""
+    incref = ctypes.pythonapi.Py_IncRef
+    incref.argtypes = [ctypes.py_object]
+    for graph in graphs:
+        if isinstance(graph, torch.cuda.CUDAGraph) and all(graph is not g for g in _FAULTED_GRAPHS):
+            incref(graph)
+            _FAULTED_GRAPHS.append(graph)
+
+
 if triton is not None:
 
     @triton.jit(do_not_specialize=["NW"])
@@ -1105,6 +1135,13 @@ class TPModel:
         self.last_drafts = drafts[0].clone() if drafts[0] is not None else None
         return self._gather(outs)
 
+    def graphs(self) -> list[torch.cuda.CUDAGraph]:
+        """Every CUDA graph this model holds: the ranks' decode and verify graphs and the
+        captured prefill passes."""
+        out = [g for m in self.ranks for seg in m._all_segments() for g in seg.graphs.values()]
+        out += [g for graphs, _, _, _ in self.pg.values() for g in graphs]
+        return out
+
     def capture_prefill(self) -> None:
         """Capture one prefill graph per rank for every size of ``PG_BUCKETS`` (largest first,
         sharing one memory pool per GPU; one pass replays at a time). Each size is first run
@@ -1116,6 +1153,9 @@ class TPModel:
             return
         dummy = r0.dummy
         scratch = r0.slot_pages[dummy][0]
+        vocab = r0.embed.shape[0]
+        made: list[torch.cuda.CUDAGraph] = []  # every graph this call creates
+        healthy = True
         pools = {m.embed.device: torch.cuda.graph_pool_handle() for m in self.ranks}
         streams = {m.embed.device: torch.cuda.Stream(m.embed.device) for m in self.ranks}
         modes = getattr(self, "_capture_modes", None) or ["global", "thread_local", "relaxed"]
@@ -1129,9 +1169,16 @@ class TPModel:
                     for meta in m.devices.values():
                         meta.page_table[dummy].fill_(scratch)
                 for size in sorted(PG_BUCKETS, reverse=True):
+                    if size > r0.max_len:
+                        # No pass is longer than a slot holds (``max_len`` tokens); the warm and
+                        # captured passes of a larger size would index the dummy slot's page
+                        # table past its ``max_pages`` entries.
+                        continue
                     count = max(DECODE_EXPERT_TOKENS + 1, size - 3)
-                    host = FastModel.pg_host(size, [(7 * j) % 1000 + 100 for j in range(count)], 0, None,
-                                             dummy, r0._g(dummy))
+                    # Token ids 100..1099, taken modulo the vocabulary (a no-op for the real one):
+                    # an id past the embedding's rows faults the device.
+                    host = FastModel.pg_host(size, [((7 * j) % 1000 + 100) % vocab for j in range(count)],
+                                             0, None, dummy, r0._g(dummy))
                     bufs = [m._pg_inputs(size) for m in self.ranks]
                     for buf in bufs:
                         buf.copy_(host)
@@ -1151,6 +1198,7 @@ class TPModel:
                     def cap(m: FastModel, mode: str, size: int = size, bufs: list = bufs):
                         dev = m.embed.device
                         graph = torch.cuda.CUDAGraph()
+                        made.append(graph)
                         # no_grad, not inference_mode (as the decode graphs): the first capture of
                         # a process creates torch's generator graph state, and created as inference
                         # tensors it would fail every later capture outside inference mode.
@@ -1180,19 +1228,29 @@ class TPModel:
                     else:
                         raise RuntimeError(f"size {size}: {' | '.join(errors)}")
             except Exception as exc:  # noqa: BLE001 - prefill stays eager
-                self.pg.clear()
                 self.pg_error = f"{type(exc).__name__}: {exc}"
+                healthy = devices_ok(self.devices_tp)
+                if not healthy:
+                    # A device fault: no graph may be destroyed now (``_FAULTED_GRAPHS``), and
+                    # nothing can run eagerly either.
+                    keep_forever(made + self.graphs())
+                    self.pg.clear()
+                    raise RuntimeError(
+                        f"a GPU faulted during prefill graph capture: {self.pg_error}"
+                    ) from exc
+                self.pg.clear()
                 print(f"engine: prefill graph capture failed, prefill stays eager: {self.pg_error}", flush=True)
             finally:
-                r0._push_table(dummy)
-                for m in self.ranks:
-                    for conv, rec in m.gdn_state.values():
-                        for row in (dummy, dummy + m.gdn_rows):
-                            if row < conv.shape[0]:
-                                conv[row].zero_()
-                                rec[row].zero_()
-                for dev in self.devices_tp:
-                    torch.cuda.synchronize(dev)
+                if healthy:  # after a fault these would raise over the fault's own error
+                    r0._push_table(dummy)
+                    for m in self.ranks:
+                        for conv, rec in m.gdn_state.values():
+                            for row in (dummy, dummy + m.gdn_rows):
+                                if row < conv.shape[0]:
+                                    conv[row].zero_()
+                                    rec[row].zero_()
+                    for dev in self.devices_tp:
+                        torch.cuda.synchronize(dev)
         if self.pg:
             print(f"engine: prefill graphs for {len(self.pg)} sizes {min(self.pg)}..{max(self.pg)} "
                   f"in {time.perf_counter() - t0:.1f}s (BLAS {self.pg_blas}); reserved "
@@ -1714,6 +1772,11 @@ class TPModel:
             # A failed capture clears that rank's graphs of every bucket: clear both ranks' (the
             # next steps recapture what they need), and drop the capture streams, which a
             # broken capture may leave unusable.
+            if not devices_ok(self.devices_tp):
+                # A device fault, not a capture-mode refusal: see ``_FAULTED_GRAPHS``.
+                keep_forever(self.graphs())
+                raise RuntimeError(f"a GPU faulted while capturing bucket {size} (verify={verify}): "
+                                   f"{[r for r in results if r]}")
             for m in self.ranks:
                 for seg in m._all_segments():
                     seg.graphs.clear()

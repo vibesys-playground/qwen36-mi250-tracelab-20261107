@@ -352,7 +352,11 @@ class FastModel:
         }
         # fla's autotuned prefill kernels: one fixed config each, the same in every process
         # (``fla_pin``; timing picks differ between processes and so would greedy outputs).
-        self.fla_pins = fla_pin.apply() if self.use_triton else {}
+        # Also on a GPU without the engine's Triton kernels: the GDN rules there are still fla's
+        # (``engine.gdn``), and an unpinned autotuner benchmarks its candidates, which two
+        # tensor-parallel rank threads calling it at once race on (Triton's ``Autotuner.nargs``,
+        # "'NoneType' object is not a mapping").
+        self.fla_pins = fla_pin.apply() if self.use_triton or on_gpu else {}
         self.buckets = sorted(buckets)
         # Tensor parallelism (``engine.fast.tp``): this model is one rank's shard and ``tp`` the
         # group whose all-reduces join the partial sums; None runs the whole model here.

@@ -19,6 +19,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for path in (PROJECT_ROOT, PROJECT_ROOT / ".vibesys" / "shared" / "cpu_check"):
@@ -31,7 +32,7 @@ CHUNK = 8  # small prefill chunks, so short prompts cross chunk boundaries
 _STARTUP_GUARD_SECONDS = 180
 
 
-def repeat_reuse(n: int, chunk: int = CHUNK) -> int:
+def repeat_reuse(n: int, chunk: int = CHUNK, gpu: bool | None = None) -> int:
     """Tokens a repeat of an ``n``-token prompt reuses from its first run's snapshots.
 
     The Transformers path (and the fast path with ``ENGINE_PREFILL_ONE_PASS_MAX=0``)
@@ -39,13 +40,62 @@ def repeat_reuse(n: int, chunk: int = CHUNK) -> int:
     snapshot for an uncached part within the limit, and the last chunk boundary
     before the end for a longer one. Exact for prompts within the default limit,
     or for a prompt whose first run started cold.
+
+    Which path the server runs is ``engine.generator.use_fast_path``: ``ENGINE_FAST``,
+    and with it unset, whether the server sees a GPU (``gpu``; default: whether this
+    process does, as a server started from it with the same environment).
     """
+    from engine.generator import use_fast_path
+
+    if gpu is None:
+        gpu = torch.cuda.is_available()
     one_pass_max = int(os.environ.get("ENGINE_PREFILL_ONE_PASS_MAX", "4096"))
-    if os.environ.get("ENGINE_FAST") != "1" or one_pass_max == 0:
+    if not use_fast_path(os.environ.get("ENGINE_FAST"), gpu) or one_pass_max == 0:
         return max(n - 1, 0)
     if n <= one_pass_max:
         return 0
     return ((n - 1) // chunk) * chunk
+
+
+def load_weights(model: str, **options: int):
+    """``Generator.load`` on the Transformers path (``ENGINE_FAST=0``), for a test that builds
+    its own fast models over ``generator.model``.
+
+    With ``ENGINE_FAST`` unset a GPU host loads the fast path, and with two visible GPUs that
+    is a ``TPModel``, whose sharding frees the loaded weights (``engine.fast.tp.shard_model``):
+    every model built on them afterwards would read empty tensors. On the CPU this is the
+    default load.
+    """
+    from engine.generator import Generator
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("ENGINE_FAST", "0")
+        return Generator.load(model, None, **options)
+
+
+def load_on_cpu(model: str, **options: int):
+    """``load_weights`` with the weights on the CPU, in a process that may see GPUs: for a test
+    whose premise holds only on the CPU (exact agreement of two numerically different paths).
+
+    The GDN kernels stay as a GPU load installs them (``engine.gdn``), which on CPU tensors
+    run Transformers' torch rules, as on a CPU host.
+    """
+    from engine import gdn
+    from engine.generator import Generator
+
+    load_weights(model, **options)  # the GDN kernels as this host serves them
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("ENGINE_FAST", "0")
+        patch.setattr(torch.cuda, "is_available", lambda: False)
+        patch.setattr(gdn, "install", lambda *a, **k: {"mode": "as installed", "layers": 0,
+                                                       "fla": None, "fla_error": None})
+        return Generator.load(model, None, **options)
+
+
+def model_device(generator) -> torch.device:
+    """The device of the loaded model's lm_head: where its MTP head must sit
+    (``engine.speculative.load_head``, ``FastModel``)."""
+    return generator.model.get_output_embeddings().weight.device
 
 
 @dataclass(frozen=True)

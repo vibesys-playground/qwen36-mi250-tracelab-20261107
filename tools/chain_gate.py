@@ -143,17 +143,25 @@ def main() -> None:
             logits = fast.prefill(slot, prompt[begin:end], begin, follow)
         return logits
 
-    def ivf_stats() -> list[int] | None:
-        """(drafts, drafts that fell back) of plan 47's IVF draft on rank 0, or None."""
-        iv = getattr(r0, "ivf", None)
-        return None if iv is None else [int(v) for v in iv.stats.tolist()]
+    rank_models = list(fast.ranks) if hasattr(fast, "ranks") else [fast]
+
+    def ivf_stats() -> list[list[int]] | None:
+        """Plan 47's IVF draft counters per rank: (drafts, drafts on the full pass, audited
+        drafts, audited drafts unlike the full pass), or None."""
+        if getattr(r0, "ivf", None) is None:
+            return None
+        sync()
+        return [[int(v) for v in m.ivf.stats.tolist()] for m in rank_models]
 
     def ivf_delta(before):
         now = ivf_stats()
         if before is None or now is None:
             return None
-        d, f = now[0] - before[0], now[1] - before[1]
-        return {"drafts": d, "fallback": f, "fallback_rate": round(f / max(1, d), 4)}
+        d = [[a - b for a, b in zip(n_, b_, strict=True)] for n_, b_ in zip(now, before, strict=True)]
+        res = {"drafts": d[0][0], "fallback_rate": [round(r[1] / max(1, r[0]), 4) for r in d]}
+        if any(r[2] for r in d):
+            res["audit_unlike"] = [f"{r[3]}/{r[2]}" for r in d]
+        return res
 
     # ------------------------------------------------------------ 2. step time
     KS = [k for k in (1, 3, 7) if k <= mfma.KMAX]  # k up to the ring (ENGINE_SPEC_KMAX)
@@ -229,8 +237,16 @@ def main() -> None:
     depth_a: dict = {}
     real_verify_chain = fast.verify_chain
 
+    walls: list[float] = []
+
     def logged(tokens, drafts, slots_, positions):
+        # the wall time of each real verify step (synced on both sides): the step at the
+        # fallback rate of real drafts, not the junk drafts of section 2
+        sync()
+        t0 = time.perf_counter()
         res = real_verify_chain(tokens, drafts, slots_, positions)
+        sync()
+        walls.append((time.perf_counter() - t0) * 1e3)
         calls.append((len(drafts[0]), list(res[2])))
         return res
 
@@ -242,6 +258,7 @@ def main() -> None:
             same = 0
             proposed = accepted = 0
             st_set = ivf_stats()
+            set_walls: list[tuple[int, int, float]] = []
             for p0 in range(0, 2 * args.pairs, 2):
                 idx = [p0, p0 + 1]
                 want = plain(name, idx)
@@ -267,6 +284,8 @@ def main() -> None:
                     if live:
                         g.decode([gens[i] for i in live])
                 g._reclaim()
+                set_walls += [(c[0], len(c[1]), w_) for c, w_ in
+                              zip(calls[first_call + 1 : -3], walls[first_call + 1 : -3], strict=True)]
                 # conditional acceptance by depth, the first step after prefill left out (its
                 # drafts beyond the first are padding) and the last steps (max_tokens) too
                 for kk, accs in calls[first_call + 1 : -3]:
@@ -299,6 +318,14 @@ def main() -> None:
                 verify_steps=tot_steps, tokens_per_slot_step=round(e, 3),
                 drafts_checked=proposed, drafts_accepted=accepted,
                 per_draft_rate=round(accepted / max(1, proposed), 4), ivf=ivf_delta(st_set))
+            by = {}
+            for kk, rows_, w_ in set_walls:
+                by.setdefault((kk, rows_), []).append(w_)
+            for (kk, rows_), ws in sorted(by.items()):
+                if len(ws) >= 5:
+                    ws.sort()
+                    out("gen_step", k=kname or "adaptive", set=name, draft_k=kk, slots=rows_, n=len(ws),
+                        ms_p50=round(statistics.median(ws), 3), ms_p90=round(ws[int(0.9 * (len(ws) - 1))], 3))
     os.environ["ENGINE_SPEC_K"] = ""
     fast.verify_chain = real_verify_chain
     out("parity_summary", identical=f"{parity_same}/{parity_total}", verdict="PASS" if parity_same == parity_total else "FAIL")

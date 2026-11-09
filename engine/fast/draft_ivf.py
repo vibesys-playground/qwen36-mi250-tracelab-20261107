@@ -35,19 +35,20 @@ import torch
 
 # The served draft (``Served``, used by ``FastModel._chain_head_op``): ENGINE_DRAFT_IVF=1 (default)
 # picks each chained MTP draft from the top ``P`` of ``CLUSTERS`` spherical clusters of the rank's
-# lm_head shard rows, and falls back to today's full-vocabulary pass for a row whose shortlist
-# top logit is within ``GAP`` of the best unscanned centroid score (plan 47 stage 0, j237:
-# P 64, gap 17.875; agreement with the full draft >= 99.36% at every depth on held-out natural
-# text and prose). ENGINE_DRAFT_IVF=0 restores the full pass for every draft.
+# lm_head shard rows (plan 47; stage 0, j237: P 64, a gap rule at 17.875). Each rank decides on
+# its own shard, before the draft's one all-reduce: when a row's shortlist max is within ``GAP``
+# of the rank's best unscanned centroid score, that rank takes its full shard pass instead (for
+# every row, and for the rest of the step's chain). The all-reduce and pick are today's, so a
+# fallback adds no rendezvous. ENGINE_DRAFT_IVF=0 restores the full pass for every draft.
 ENABLED = os.environ.get("ENGINE_DRAFT_IVF", "1") == "1"
 P_SERVED = int(os.environ.get("ENGINE_DRAFT_IVF_P", "64"))
 CLUSTERS = int(os.environ.get("ENGINE_DRAFT_IVF_CLUSTERS", "4096"))
 CAP = 64
 ITERS = 16
 GAP = float(os.environ.get("ENGINE_DRAFT_IVF_GAP", "17.875"))
-# Read the shortlisted rows from a cluster-sorted copy of the shard (+1 copy of the shard's
-# bytes) instead of through the permutation; for measuring the two.
-SORTED = os.environ.get("ENGINE_DRAFT_IVF_SORTED", "0") == "1"
+# Measuring only: also run the full draft and count the drafts that differ from it (one extra
+# GEMV and all-reduce per draft).
+AUDIT = os.environ.get("ENGINE_DRAFT_IVF_AUDIT", "0") == "1"
 
 
 def usable(w: torch.Tensor) -> bool:
@@ -242,16 +243,20 @@ if triton is not None:
     @triton.jit
     def _ivf_gather_kernel(y_ptr, w_ptr, ids_ptr, off_ptr, sel_ptr, outv_ptr, outi_ptr, P,
                            K: tl.constexpr, CH: tl.constexpr, BR: tl.constexpr, BK: tl.constexpr,
-                           READ_ONLY: tl.constexpr, PERM: tl.constexpr = False):
+                           READ_ONLY: tl.constexpr, PERM: tl.constexpr = False,
+                           flag_ptr=None, PRED: tl.constexpr = False):
         """Program (r, p, j): rows ``j*BR..`` of query r's p-th selected cluster; writes the
         chunk's (max bf16 logit, lowest vocab id at that max) to slot ``(r*P + p)*CH + j``.
-        READ_ONLY: the same loads with no math (a gather-read ceiling)."""
+        READ_ONLY: the same loads with no math (a gather-read ceiling). PRED: every load
+        masked off when flag[0] != 0 (the rank already fell back this step)."""
         r = tl.program_id(0)
         p = tl.program_id(1)
         j = tl.program_id(2)
-        c = tl.load(sel_ptr + r * P + p)
+        c = tl.load(sel_ptr + r * P + p)  # always a valid cluster (sel starts zeroed)
         start = tl.load(off_ptr + c)
         end = tl.load(off_ptr + c + 1)
+        if PRED:  # an empty cluster: every load below masked off
+            end = tl.where(tl.load(flag_ptr) == 0, end, start)
         rows = start + j * BR + tl.arange(0, BR)
         ok = rows < end
         if PERM:  # read the shard's own rows through the permutation (no sorted copy)
@@ -352,89 +357,12 @@ class Draft:
 
 if triton is not None:
 
-    @triton.jit
-    def _radix_topp_kernel(s_ptr, out_ptr, nxt_ptr, C: tl.constexpr, P: tl.constexpr):
-        """out[r, :P] = indices of the P largest bf16 scores of s[r, :C] (ties to the lower
-        index; in index order); nxt[r] = the best unselected score. A 16-step radix select on
-        the scores' 16-bit order keys, then a compaction by prefix sums; one program per row
-        (plan 47 stage 0c, j237: 12.3 us at 2 rows, exact against a stable sort)."""
-        r = tl.program_id(0)
-        i = tl.arange(0, C)
-        b = tl.load(s_ptr + r * C + i)
-        bi = b.to(tl.int16, bitcast=True).to(tl.int32)
-        key = tl.where(bi >= 0, bi + 32768, ~bi)
-        t = tl.zeros([], dtype=tl.int32)
-        for j in tl.static_range(16):
-            cand = t | (1 << (15 - j))
-            cnt = tl.sum((key >= cand).to(tl.int32), axis=0)
-            t = tl.where(cnt >= P, cand, t)
-        gt = key > t
-        ngt = tl.sum(gt.to(tl.int32), axis=0)
-        eq = key == t
-        ceq = tl.cumsum(eq.to(tl.int32), axis=0)
-        sel = gt | (eq & (ceq <= P - ngt))
-        pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
-        tl.store(out_ptr + r * P + pos, i.to(tl.int64), mask=sel)
-        rest = tl.where(sel, float("-inf"), b.to(tl.float32))
-        tl.store(nxt_ptr + r, tl.max(rest, axis=0))
-
-    @triton.jit(do_not_specialize=["offset"])
-    def _ivf_pack_kernel(outv_ptr, outi_ptr, nxt_ptr, pack_ptr, M, offset, RANK: tl.constexpr,
-                         SOLO: tl.constexpr, BM: tl.constexpr):
-        """pack[r] (6 fp32): this rank's (shortlist max, its lowest vocabulary id + offset) in
-        columns 2 RANK, 2 RANK + 1 and its best unscanned centroid score in 4 + RANK; the
-        peer's three columns 0 (summed by the all-reduce), or -inf / 0 alone (SOLO)."""
-        r = tl.program_id(0)
-        lanes = tl.arange(0, BM)
-        best = tl.full([BM], float("-inf"), tl.float32)
-        bid = tl.full([BM], 2147483647, tl.int32)
-        for m0 in range(0, M, BM):
-            i = m0 + lanes
-            ok = i < M
-            v = tl.load(outv_ptr + r * M + i, mask=ok, other=float("-inf"))
-            d = tl.load(outi_ptr + r * M + i, mask=ok, other=2147483647)
-            upd = (v > best) | ((v == best) & (d < bid))
-            best = tl.where(upd, v, best)
-            bid = tl.where(upd, d, bid)
-        m = tl.max(best, axis=0)
-        idx = tl.min(tl.where(best == m, bid, 2147483647), axis=0)
-        base = pack_ptr + r * 6
-        other = float("-inf") if SOLO else 0.0
-        tl.store(base + 2 * RANK, m)
-        tl.store(base + 2 * RANK + 1, (idx + offset).to(tl.float32))
-        tl.store(base + 4 + RANK, tl.load(nxt_ptr + r))
-        tl.store(base + 2 * (1 - RANK), other)
-        tl.store(base + 2 * (1 - RANK) + 1, 0.0)
-        tl.store(base + 4 + (1 - RANK), other)
-
-    @triton.jit(do_not_specialize=["R", "gap"])
-    def _ivf_decide_kernel(pack_ptr, ids_ptr, fb_ptr, flag_ptr, stats_ptr, R, gap, RB: tl.constexpr):
-        """Per row: the draft over both ranks (larger shortlist max, ties to rank 0) into
-        ids, and whether it falls back (its max minus the best unscanned centroid score on
-        either rank is below ``gap``); flag[0] = any row falls back."""
-        r = tl.arange(0, RB)
-        ok = r < R
-        a0 = tl.load(pack_ptr + r * 6, mask=ok, other=0.0)
-        a1 = tl.load(pack_ptr + r * 6 + 1, mask=ok, other=0.0)
-        a2 = tl.load(pack_ptr + r * 6 + 2, mask=ok, other=0.0)
-        a3 = tl.load(pack_ptr + r * 6 + 3, mask=ok, other=0.0)
-        n0 = tl.load(pack_ptr + r * 6 + 4, mask=ok, other=0.0)
-        n1 = tl.load(pack_ptr + r * 6 + 5, mask=ok, other=0.0)
-        win = a0 >= a2
-        top = tl.where(win, a0, a2)
-        fb = (top - tl.maximum(n0, n1)) < gap
-        tl.store(ids_ptr + r, tl.where(win, a1, a3).to(tl.int64), mask=ok)
-        tl.store(fb_ptr + r, fb.to(tl.int32), mask=ok)
-        nfb = tl.sum((fb & ok).to(tl.int32), axis=0)
-        tl.store(flag_ptr, tl.minimum(nfb, 1))
-        tl.atomic_add(stats_ptr, R.to(tl.int64))  # drafts, and drafts that fell back
-        tl.atomic_add(stats_ptr + 1, nfb.to(tl.int64))
-
     @triton.jit(do_not_specialize=["R", "N"])
     def _pred_gemv_kernel(flag_ptr, x_ptr, w_ptr, out_ptr, R, N, stride_out, K: tl.constexpr,
-                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-        """``mfma._mfma_gemv_kernel`` (no K split) run only when flag[0] != 0."""
-        if tl.load(flag_ptr) != 0:
+                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, INV: tl.constexpr,
+                          DOT_F32: tl.constexpr):
+        """``mfma._mfma_gemv_kernel`` (no K split) run only when flag[0] != 0 (INV: == 0)."""
+        if (tl.load(flag_ptr) != 0) != INV:
             nb = tl.program_id(0)
             rm = tl.arange(0, BM)
             mok = rm < R
@@ -445,15 +373,84 @@ if triton is not None:
                 rk = k0 + tl.arange(0, BK)
                 a = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mok[:, None], other=0.0)
                 b = tl.load(w_ptr + rn[None, :].to(tl.int64) * K + rk[:, None], mask=nok[None, :], other=0.0)
-                acc = tl.dot(a, b, acc)
+                if DOT_F32:  # the interpreter's bf16 dot
+                    acc = tl.dot(a.to(tl.float32), b.to(tl.float32), acc)
+                else:
+                    acc = tl.dot(a, b, acc)
             m = mok[:, None] & nok[None, :]
             tl.store(out_ptr + rm[:, None] * stride_out + rn[None, :], acc.to(tl.bfloat16), mask=m)
+
+    @triton.jit
+    def _radix_topp_kernel(s_ptr, out_ptr, nxt_ptr, flag_ptr, C: tl.constexpr, P: tl.constexpr):
+        """Unless flag[0] != 0: out[r, :P] = indices of the P largest bf16 scores of s[r, :C]
+        (ties to the lower index; in index order), nxt[r] = the best unselected score. A
+        16-step radix select on the scores' 16-bit order keys, then a compaction by prefix
+        sums; one program per row (stage 0c, j237: 12.3 us at 2 rows, exact)."""
+        if tl.load(flag_ptr) == 0:
+            r = tl.program_id(0)
+            i = tl.arange(0, C)
+            b = tl.load(s_ptr + r * C + i)
+            bi = b.to(tl.int16, bitcast=True).to(tl.int32)
+            key = tl.where(bi >= 0, bi + 32768, ~bi)
+            t = tl.zeros([], dtype=tl.int32)
+            for j in tl.static_range(16):
+                cand = t | (1 << (15 - j))
+                cnt = tl.sum((key >= cand).to(tl.int32), axis=0)
+                t = tl.where(cnt >= P, cand, t)
+            gt = key > t
+            ngt = tl.sum(gt.to(tl.int32), axis=0)
+            eq = key == t
+            ceq = tl.cumsum(eq.to(tl.int32), axis=0)
+            sel = gt | (eq & (ceq <= P - ngt))
+            pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
+            tl.store(out_ptr + r * P + pos, i.to(tl.int64), mask=sel)
+            rest = tl.where(sel, float("-inf"), b.to(tl.float32))
+            tl.store(nxt_ptr + r, tl.max(rest, axis=0))
+
+    @triton.jit
+    def _ivf_local_kernel(outv_ptr, outi_ptr, nxt_ptr, loc_ptr, flag_ptr, M, BM: tl.constexpr):
+        """Unless flag[0] != 0: loc[r] = (shortlist max, its lowest shard row, best unscanned
+        centroid score) over query r's M chunk slots."""
+        if tl.load(flag_ptr) == 0:
+            r = tl.program_id(0)
+            lanes = tl.arange(0, BM)
+            best = tl.full([BM], float("-inf"), tl.float32)
+            bid = tl.full([BM], 2147483647, tl.int32)
+            for m0 in range(0, M, BM):
+                i = m0 + lanes
+                ok = i < M
+                v = tl.load(outv_ptr + r * M + i, mask=ok, other=float("-inf"))
+                d = tl.load(outi_ptr + r * M + i, mask=ok, other=2147483647)
+                upd = (v > best) | ((v == best) & (d < bid))
+                best = tl.where(upd, v, best)
+                bid = tl.where(upd, d, bid)
+            m = tl.max(best, axis=0)
+            idx = tl.min(tl.where(best == m, bid, 2147483647), axis=0)
+            tl.store(loc_ptr + r * 3, m)
+            tl.store(loc_ptr + r * 3 + 1, idx.to(tl.float32))
+            tl.store(loc_ptr + r * 3 + 2, tl.load(nxt_ptr + r))
+
+    @triton.jit(do_not_specialize=["R", "gap"])
+    def _ivf_flag_kernel(loc_ptr, flag_ptr, stats_ptr, R, gap, RB: tl.constexpr):
+        """This rank falls back (flag[0] = 1, kept for the rest of the step) when any row's
+        shortlist max is within ``gap`` of the rank's best unscanned centroid score. Counts
+        drafts and drafts on the full pass."""
+        r = tl.arange(0, RB)
+        ok = r < R
+        f = tl.load(flag_ptr)
+        if f == 0:
+            t = tl.load(loc_ptr + r * 3, mask=ok, other=0.0)
+            n = tl.load(loc_ptr + r * 3 + 2, mask=ok, other=0.0)
+            f = tl.max(((t - n < gap) & ok).to(tl.int32), axis=0)
+            tl.store(flag_ptr, f)
+        tl.atomic_add(stats_ptr, R.to(tl.int64))
+        tl.atomic_add(stats_ptr + 1, (R * f).to(tl.int64))
 
     @triton.jit(do_not_specialize=["V", "offset"])
     def _pred_argmax_pack_kernel(flag_ptr, l_ptr, both_ptr, V, stride, offset, RANK: tl.constexpr,
                                  SOLO: tl.constexpr, BLOCK: tl.constexpr):
-        """``tp._argmax_pack_kernel`` run only when flag[0] != 0; the peer's columns -inf / 0
-        when SOLO (no all-reduce follows)."""
+        """When flag[0] != 0: ``tp._argmax_pack_kernel`` (the peer's columns -inf / 0 when
+        SOLO: no all-reduce follows)."""
         if tl.load(flag_ptr) != 0:
             row = tl.program_id(0)
             base = l_ptr + row.to(tl.int64) * stride
@@ -475,20 +472,19 @@ if triton is not None:
                                                       tl.where(k == 2 * (1 - RANK), other, 0.0)))
             tl.store(both_ptr + row * 4 + k, val)
 
-    @triton.jit(do_not_specialize=["R"])
-    def _ivf_final_kernel(flag_ptr, both_ptr, ids_ptr, fb_ptr, R, RB: tl.constexpr):
-        """ids[r] = the full-vocabulary pick (``tp.argmax_pick``'s rule) for rows that fall
-        back, when the full pass ran."""
-        if tl.load(flag_ptr) != 0:
-            r = tl.arange(0, RB)
-            ok = r < R
-            fb = tl.load(fb_ptr + r, mask=ok, other=0) != 0
-            a0 = tl.load(both_ptr + r * 4, mask=ok, other=0.0)
-            a1 = tl.load(both_ptr + r * 4 + 1, mask=ok, other=0.0)
-            a2 = tl.load(both_ptr + r * 4 + 2, mask=ok, other=0.0)
-            a3 = tl.load(both_ptr + r * 4 + 3, mask=ok, other=0.0)
-            full = tl.where(a0 >= a2, a1, a3).to(tl.int64)
-            tl.store(ids_ptr + r, full, mask=ok & fb)
+    @triton.jit(do_not_specialize=["offset"])
+    def _ivf_pack_kernel(flag_ptr, loc_ptr, both_ptr, offset, RANK: tl.constexpr, SOLO: tl.constexpr):
+        """When flag[0] == 0: both[r] = the shortlist's (max, id + offset) in
+        ``tp.argmax_pack``'s layout."""
+        if tl.load(flag_ptr) == 0:
+            row = tl.program_id(0)
+            m = tl.load(loc_ptr + row * 3)
+            i = tl.load(loc_ptr + row * 3 + 1)
+            k = tl.arange(0, 4)
+            other = float("-inf") if SOLO else 0.0
+            val = tl.where(k == 2 * RANK, m, tl.where(k == 2 * RANK + 1, i + offset,
+                                                      tl.where(k == 2 * (1 - RANK), other, 0.0)))
+            tl.store(both_ptr + row * 4 + k, val)
 
 
 class Served:
@@ -501,7 +497,14 @@ class Served:
 
     def __init__(self, w: torch.Tensor, max_rows: int, p: int = P_SERVED, clusters: int = CLUSTERS,
                  gap: float = GAP) -> None:
+        from engine.fast import mfma
+
         self.w, self.p, self.gap = w, p, gap
+        k = w.shape[1]
+        self.tiles_w = mfma.tiles_for(w.shape[0], k)
+        self.tiles_c = mfma.tiles_for(clusters, k)
+        if self.tiles_w[3] != 1 or self.tiles_c[3] != 1:
+            raise ValueError("the predicated GEMV has no K split")
         with torch.cuda.device(w.device):
             self.index = build(w, clusters, CAP, iters=ITERS, spherical=True)
             idx = self.index
@@ -512,91 +515,86 @@ class Served:
             self.m = p * self.ch
             self.max_rows = max_rows
             dev = w.device
-            self.sel = torch.empty((max_rows, p), dtype=torch.int64, device=dev)
+            self.sel = torch.zeros((max_rows, p), dtype=torch.int64, device=dev)
             self.nxt = torch.empty((max_rows,), dtype=torch.float32, device=dev)
             self.outv = torch.empty((max_rows, self.m), dtype=torch.float32, device=dev)
             self.outi = torch.empty((max_rows, self.m), dtype=torch.int32, device=dev)
-            self.fb = torch.empty((max_rows,), dtype=torch.int32, device=dev)
+            self.loc = torch.empty((max_rows, 3), dtype=torch.float32, device=dev)
             self.flag = torch.zeros((1,), dtype=torch.int32, device=dev)
-            self.stats = torch.zeros((2,), dtype=torch.int64, device=dev)
-            self.ws = w.index_select(0, idx.perm).contiguous() if SORTED else w
+            # drafts, drafts on the full pass, audited drafts, audited drafts unlike the full one
+            self.stats = torch.zeros((4,), dtype=torch.int64, device=dev)
             self.rb = max(16, triton.next_power_of_2(max_rows))
             self._warm()
             self.stats.zero_()
             if w.is_cuda:
                 torch.cuda.empty_cache()  # the build's temporaries, before the KV pool is sized
-        print(f"engine: IVF drafts on {w.device}: {clusters} clusters, P {p}, gap {gap}, sorted {SORTED}, "
+        print(f"engine: IVF drafts on {w.device}: {clusters} clusters, P {p}, gap {gap}, "
               f"built in {idx.build_s:.1f}s (sizes {idx.stats['min']}..{idx.stats['max']})", flush=True)
 
-    def _warm(self) -> None:
-        """Compile every kernel variant before any capture (both ranks' and the alone ones)."""
-        from engine.fast import mfma
+    def _gemv(self, y: torch.Tensor, w: torch.Tensor, tiles, inv: bool) -> torch.Tensor:
+        from engine.fast import kernels, mfma
 
-        y = torch.zeros((1, self.w.shape[1]), dtype=self.w.dtype, device=self.w.device)
-        one = torch.ones(1, dtype=torch.int32, device=self.w.device)
-        for rank in (0, 1):
-            for solo in (False, True):
-                self._launch(y, rank, 0, solo, mfma)
-                pack = torch.zeros((1, 6), dtype=torch.float32, device=self.w.device)
-                self._decide(pack, 1)
-                self._full(y, one, rank, 0, solo, mfma)
-        torch.cuda.synchronize(self.w.device)
-
-    def _launch(self, y, rank, offset, solo, mfma) -> torch.Tensor:
-        rows = y.shape[0]
-        s = mfma.gemv(y, self.cent)
-        sel = self.sel[:rows]
-        _radix_topp_kernel[(rows,)](s, sel, self.nxt, C=self.cent.shape[0], P=self.p, num_warps=4)
-        _ivf_gather_kernel[(rows, self.p, self.ch)](
-            y, self.ws, self.ids, self.offsets, sel, self.outv, self.outi, self.p,
-            K=self.w.shape[1], CH=self.ch, BR=self.BR, BK=self.BK, READ_ONLY=False, PERM=not SORTED,
-            num_warps=4)
-        pack = torch.empty((rows, 6), dtype=torch.float32, device=y.device)
-        _ivf_pack_kernel[(rows,)](self.outv, self.outi, self.nxt, pack, self.m, offset, RANK=rank,
-                                  SOLO=solo, BM=min(1024, triton.next_power_of_2(self.m)), num_warps=4)
-        return pack
-
-    def _decide(self, pack, rows) -> torch.Tensor:
-        ids = torch.empty((rows,), dtype=torch.int64, device=pack.device)
-        _ivf_decide_kernel[(1,)](pack, ids, self.fb, self.flag, self.stats, rows, self.gap, RB=self.rb,
-                                 num_warps=1)
-        return ids
-
-    def _full(self, y, flag, rank, offset, solo, mfma) -> torch.Tensor:
-        """The predicated full pass: logits, this rank's argmax pack (rows that do not fall
-        back get it too: the GEMV costs the same for them)."""
         rows, k = y.shape
-        n = self.w.shape[0]
-        bn, bk, warps, ksplit = mfma.tiles_for(n, k)
-        logits = torch.empty((rows, n), dtype=y.dtype, device=y.device)
+        n = w.shape[0]
+        bn, bk, warps, _ = tiles
+        out = torch.empty((rows, n), dtype=y.dtype, device=y.device)
         for r0 in range(0, rows, mfma.BM):
             r1 = min(rows, r0 + mfma.BM)
             _pred_gemv_kernel[(triton.cdiv(n, bn),)](
-                flag, y[r0:r1], self.w, logits[r0:r1], r1 - r0, n, n, K=k, BM=mfma.BM, BN=bn, BK=bk,
-                num_warps=warps)
-        both = torch.empty((rows, 4), dtype=torch.float32, device=y.device)
-        _pred_argmax_pack_kernel[(rows,)](flag, logits, both, n, n, offset, RANK=rank, SOLO=solo,
-                                          BLOCK=self.ARGMAX_BLOCK, num_warps=8)
-        return both
+                self.flag, y[r0:r1], w, out[r0:r1], r1 - r0, n, n, K=k, BM=mfma.BM, BN=bn, BK=bk,
+                INV=inv, DOT_F32=kernels.INTERPRET, num_warps=warps)
+        return out
 
-    def draft(self, y: torch.Tensor, model) -> torch.Tensor:
-        """Each row's draft token (int64 [rows]) from the head's normed output ``y``."""
-        from engine.fast import mfma
+    def _pack(self, y: torch.Tensor, rank: int, offset: int, solo: bool) -> torch.Tensor:
+        """This rank's ``[rows, 4]`` argmax pack: the shortlist's, or (falling back) the full
+        shard pass's. Every launch reads the flag; none waits for the peer."""
+        rows = y.shape[0]
+        s = self._gemv(y, self.cent, self.tiles_c, True)
+        sel = self.sel[:rows]
+        _radix_topp_kernel[(rows,)](s, sel, self.nxt, self.flag, C=self.cent.shape[0], P=self.p,
+                                    num_warps=4)
+        _ivf_gather_kernel[(rows, self.p, self.ch)](
+            y, self.w, self.ids, self.offsets, sel, self.outv, self.outi, self.p,
+            K=self.w.shape[1], CH=self.ch, BR=self.BR, BK=self.BK, READ_ONLY=False, PERM=True,
+            flag_ptr=self.flag, PRED=True, num_warps=4)
+        _ivf_local_kernel[(rows,)](self.outv, self.outi, self.nxt, self.loc, self.flag, self.m,
+                                   BM=min(1024, triton.next_power_of_2(self.m)), num_warps=4)
+        _ivf_flag_kernel[(1,)](self.loc, self.flag, self.stats, rows, self.gap, RB=self.rb, num_warps=1)
+        logits = self._gemv(y, self.w, self.tiles_w, False)
+        pack = torch.empty((rows, 4), dtype=torch.float32, device=y.device)
+        n = self.w.shape[0]
+        _pred_argmax_pack_kernel[(rows,)](self.flag, logits, pack, n, n, offset, RANK=rank, SOLO=solo,
+                                          BLOCK=self.ARGMAX_BLOCK, num_warps=8)
+        _ivf_pack_kernel[(rows,)](self.flag, self.loc, pack, offset, RANK=rank, SOLO=solo, num_warps=1)
+        return pack
+
+    def _warm(self) -> None:
+        """Compile every kernel variant before any capture (both ranks', alone, both flags)."""
+        y = torch.zeros((1, self.w.shape[1]), dtype=self.w.dtype, device=self.w.device)
+        for rank in (0, 1):
+            for solo in (False, True):
+                for f in (0, 1):
+                    self.flag.fill_(f)
+                    self._pack(y, rank, 0, solo)
+        self.flag.zero_()
+        torch.cuda.synchronize(self.w.device)
+
+    def draft(self, y: torch.Tensor, model, first: bool = False) -> torch.Tensor:
+        """Each row's draft token (int64 [rows]) from the head's normed output ``y``.
+        ``first``: the step's first link (clears the rank's fallback flag)."""
+        from engine.fast import tp as tpm
 
         y = y.contiguous()
-        rows = y.shape[0]
         tp, rank, offset = model.tp, model.rank, model.vocab_offset
         solo = tp is None or tp.solo
-        pack = self._launch(y, rank, offset, solo, mfma)
+        if first:
+            self.flag.zero_()
+        pack = self._pack(y, rank, offset, solo)
         if not solo:
             pack = tp.allreduce(rank, pack)
-        ids = self._decide(pack, rows)
-        fb = self.fb[:rows]
-        if y.is_cuda and torch.cuda.is_current_stream_capturing():
-            both = self._full(y, self.flag, rank, offset, solo, mfma)
-            if not solo:
-                both = tp.allreduce_pred(rank, both, self.flag)
-            _ivf_final_kernel[(1,)](self.flag, both, ids, fb, rows, RB=self.rb, num_warps=1)
-            return ids
-        full = model._argmax(model.fused.gemv(y, model.lm_head))  # eager: always (both ranks)
-        return torch.where(fb.bool(), full, ids)
+        ids = tpm.argmax_pick(pack)
+        if AUDIT:
+            full = model._argmax(model.fused.gemv(y, model.lm_head))
+            self.stats[2:4] += torch.stack((torch.full_like(full[0], full.numel()),
+                                            (full != ids).sum()))
+        return ids

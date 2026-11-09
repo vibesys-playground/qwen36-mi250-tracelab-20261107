@@ -35,7 +35,7 @@ gate on 4,5 ENGINE_DRAFT_IVF=1 &
 (
   echo "=== [tests] pytest $(date +%T)"
   HIP_VISIBLE_DEVICES=6 timeout 1800 python -m pytest -q -rf tests/test_draft_ivf.py tests/test_runahead.py \
-    tests/test_spec_chain.py tests/test_fused_gemv.py > $L/tests.log 2>&1
+    tests/test_spec_chain.py tests/test_fused_gemv.py tests/test_chain_glue.py > $L/tests.log 2>&1
   echo "=== [tests] exit $?"
   echo "=== [jit] live_compile_probe $(date +%T)"
   HIP_VISIBLE_DEVICES=6,7 timeout 3000 python tools/live_compile_probe.py > $L/compile.log 2>&1

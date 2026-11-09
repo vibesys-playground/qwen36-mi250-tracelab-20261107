@@ -56,7 +56,7 @@ import torch
 from torch.nn import functional as F
 
 from engine import cpu_place, looptimers
-from engine.fast import kernels, mfma
+from engine.fast import blas_tune, kernels, mfma
 from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
@@ -873,6 +873,7 @@ class TPModel:
         # rank; filled at load by ``capture_prefill``, never while serving.
         self.pg: dict[int, tuple[list, list[torch.Tensor], list[torch.Tensor], list]] = {}
         self.pg_error: str | None = None
+        self.pg_blas = "off"  # plan 61: which BLAS solutions the prefill graphs recorded
         self.pg_replays = 0
 
     # ------------------------------------------------------------ shared attributes
@@ -1113,79 +1114,82 @@ class TPModel:
         streams = {m.embed.device: torch.cuda.Stream(m.embed.device) for m in self.ranks}
         modes = getattr(self, "_capture_modes", None) or ["global", "thread_local", "relaxed"]
         t0 = time.perf_counter()
-        try:
-            # The warm passes' page table: every entry the dummy page.
-            for m in self.ranks:
-                for meta in m.devices.values():
-                    meta.page_table[dummy].fill_(scratch)
-            for size in sorted(PG_BUCKETS, reverse=True):
-                count = max(DECODE_EXPERT_TOKENS + 1, size - 3)
-                host = FastModel.pg_host(size, [(7 * j) % 1000 + 100 for j in range(count)], 0, None,
-                                         dummy, r0._g(dummy))
-                bufs = [m._pg_inputs(size) for m in self.ranks]
-                for buf in bufs:
-                    buf.copy_(host)
+        # Plan 61: the measured BLAS solutions of blas_tune's table for this window only.
+        with blas_tune.prefill_blas() as blas:
+            self.pg_blas = blas
+            try:
+                # The warm passes' page table: every entry the dummy page.
+                for m in self.ranks:
+                    for meta in m.devices.values():
+                        meta.page_table[dummy].fill_(scratch)
+                for size in sorted(PG_BUCKETS, reverse=True):
+                    count = max(DECODE_EXPERT_TOKENS + 1, size - 3)
+                    host = FastModel.pg_host(size, [(7 * j) % 1000 + 100 for j in range(count)], 0, None,
+                                             dummy, r0._g(dummy))
+                    bufs = [m._pg_inputs(size) for m in self.ranks]
+                    for buf in bufs:
+                        buf.copy_(host)
 
-                def warm(m: FastModel, size: int = size, bufs: list = bufs) -> None:
-                    dev = m.embed.device
-                    stream = streams[dev]
-                    stream.wait_stream(torch.cuda.current_stream(dev))
-                    with torch.cuda.stream(stream):
-                        for _ in range(2):
-                            m._pg_body(bufs[m.rank], size)
-                    torch.cuda.current_stream(dev).wait_stream(stream)
+                    def warm(m: FastModel, size: int = size, bufs: list = bufs) -> None:
+                        dev = m.embed.device
+                        stream = streams[dev]
+                        stream.wait_stream(torch.cuda.current_stream(dev))
+                        with torch.cuda.stream(stream):
+                            for _ in range(2):
+                                m._pg_body(bufs[m.rank], size)
+                        torch.cuda.current_stream(dev).wait_stream(stream)
+                        torch.cuda.synchronize(dev)
+
+                    self._both(warm)
+
+                    def cap(m: FastModel, mode: str, size: int = size, bufs: list = bufs):
+                        dev = m.embed.device
+                        graph = torch.cuda.CUDAGraph()
+                        # no_grad, not inference_mode (as the decode graphs): the first capture of
+                        # a process creates torch's generator graph state, and created as inference
+                        # tensors it would fail every later capture outside inference mode.
+                        with torch.cuda.device(dev), torch.no_grad():
+                            with torch.cuda.graph(graph, pool=pools[dev], stream=streams[dev],
+                                                  capture_error_mode=mode):
+                                logits, drafts = m._pg_body(bufs[m.rank], size)
+                        return graph, logits, drafts
+
+                    errors = []
+                    for mode in modes:
+                        try:
+                            got = [cap(r0, mode)]
+                            got.append(self._pool.submit(self._on_rank1, lambda: cap(r1, mode)).result())
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"{mode}: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+                            for dev in self.devices_tp:
+                                try:
+                                    torch.cuda.synchronize(dev)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            continue
+                        self.pg[size] = ([g for g, _, _ in got], bufs, [lg for _, lg, _ in got],
+                                         [d for _, _, d in got])
+                        modes = [mode]
+                        break
+                    else:
+                        raise RuntimeError(f"size {size}: {' | '.join(errors)}")
+            except Exception as exc:  # noqa: BLE001 - prefill stays eager
+                self.pg.clear()
+                self.pg_error = f"{type(exc).__name__}: {exc}"
+                print(f"engine: prefill graph capture failed, prefill stays eager: {self.pg_error}", flush=True)
+            finally:
+                r0._push_table(dummy)
+                for m in self.ranks:
+                    for conv, rec in m.gdn_state.values():
+                        for row in (dummy, dummy + m.gdn_rows):
+                            if row < conv.shape[0]:
+                                conv[row].zero_()
+                                rec[row].zero_()
+                for dev in self.devices_tp:
                     torch.cuda.synchronize(dev)
-
-                self._both(warm)
-
-                def cap(m: FastModel, mode: str, size: int = size, bufs: list = bufs):
-                    dev = m.embed.device
-                    graph = torch.cuda.CUDAGraph()
-                    # no_grad, not inference_mode (as the decode graphs): the first capture of
-                    # a process creates torch's generator graph state, and created as inference
-                    # tensors it would fail every later capture outside inference mode.
-                    with torch.cuda.device(dev), torch.no_grad():
-                        with torch.cuda.graph(graph, pool=pools[dev], stream=streams[dev],
-                                              capture_error_mode=mode):
-                            logits, drafts = m._pg_body(bufs[m.rank], size)
-                    return graph, logits, drafts
-
-                errors = []
-                for mode in modes:
-                    try:
-                        got = [cap(r0, mode)]
-                        got.append(self._pool.submit(self._on_rank1, lambda: cap(r1, mode)).result())
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{mode}: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
-                        for dev in self.devices_tp:
-                            try:
-                                torch.cuda.synchronize(dev)
-                            except Exception:  # noqa: BLE001
-                                pass
-                        continue
-                    self.pg[size] = ([g for g, _, _ in got], bufs, [lg for _, lg, _ in got],
-                                     [d for _, _, d in got])
-                    modes = [mode]
-                    break
-                else:
-                    raise RuntimeError(f"size {size}: {' | '.join(errors)}")
-        except Exception as exc:  # noqa: BLE001 - prefill stays eager
-            self.pg.clear()
-            self.pg_error = f"{type(exc).__name__}: {exc}"
-            print(f"engine: prefill graph capture failed, prefill stays eager: {self.pg_error}", flush=True)
-        finally:
-            r0._push_table(dummy)
-            for m in self.ranks:
-                for conv, rec in m.gdn_state.values():
-                    for row in (dummy, dummy + m.gdn_rows):
-                        if row < conv.shape[0]:
-                            conv[row].zero_()
-                            rec[row].zero_()
-            for dev in self.devices_tp:
-                torch.cuda.synchronize(dev)
         if self.pg:
             print(f"engine: prefill graphs for {len(self.pg)} sizes {min(self.pg)}..{max(self.pg)} "
-                  f"in {time.perf_counter() - t0:.1f}s; reserved "
+                  f"in {time.perf_counter() - t0:.1f}s (BLAS {self.pg_blas}); reserved "
                   f"{[round(torch.cuda.memory_reserved(d) / 2**30, 2) for d in self.devices_tp]} GiB",
                   flush=True)
 

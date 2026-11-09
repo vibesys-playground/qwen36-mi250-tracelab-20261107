@@ -32,6 +32,9 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=96)
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--dump-fla", default=None, help="write fla's autotune picks (JSON) here")
+    parser.add_argument("--eager-prefill", action="store_true",
+                        help="drop the captured prefill graphs after load (plan 61: every pass eager, "
+                             "so only the decode graphs and eager paths are compared)")
     args = parser.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", "0,1")
     os.environ.setdefault("ENGINE_MTP", "0")  # plain decode steps; the head does not change picks
@@ -46,6 +49,10 @@ def main() -> None:
     tok = g.tokenizer
     print(f"RESULT {args.mode} tp={os.environ.get('ENGINE_TP', '1')} graphs={fast.use_graphs} "
           f"graph_error={fast.graph_error} kv_pages={fast.pool.pages}", flush=True)
+    if args.eager_prefill and getattr(fast, "pg", None):
+        fast.pg.clear()
+    print(f"RESULT prefill_blas={getattr(fast, 'pg_blas', None)} eager_prefill={args.eager_prefill} "
+          f"tunableop_enabled_after_load={torch.cuda.tunable.is_enabled()}", flush=True)
     print(f"RESULT fla_pins={getattr(fast, 'fla_pins', None)} "
           f"prefill_fused={os.environ.get('ENGINE_PREFILL_FUSED', '1')}", flush=True)
 
@@ -143,6 +150,9 @@ def main() -> None:
         else:
             print(f"RESULT teacher_forced top1_pct={100.0 * agree / total:.2f} ({agree}/{total}) "
                   f"ref_margin_at_misses={sorted(close_misses)[:20]}", flush=True)
+            same = sum(record["margins"][k] == saved["margins"][k] for k in record["margins"])
+            print(f"RESULT bitwise_margins prompts={same}/{len(record['margins'])} (every step's top-2 "
+                  f"logit gap equal as floats)", flush=True)
             print(f"RESULT identical_greedy_prefix={free_identical} of {args.steps + 1}", flush=True)
             if hasattr(fast, "timeouts"):
                 print(f"RESULT tp_allreduce_timeouts={fast.timeouts()}", flush=True)

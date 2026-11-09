@@ -320,6 +320,32 @@ class FastPrefixCache:
         snap = self._fast.detach(slot, len(key))
         self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=True))
 
+    def tail(self, key: tuple[int, ...], *, keep: bool) -> Any:
+        """The session tail stored at exactly ``key`` (None if there is none), for another
+        replica (plan 49, ``engine.migrate``). With ``keep`` it stays cached and the caller
+        must neither release nor adopt it; otherwise the caller owns it."""
+        entry = self._entries.get(key)
+        if entry is None or not entry.tail:
+            return None
+        if keep:
+            return entry.snap
+        self._remove(key)
+        return entry.snap
+
+    def put_tail(self, key: tuple[int, ...], snap: Any) -> bool:
+        """Keep ``snap``, which covers exactly ``key`` and came from another replica, as a
+        session tail, as ``store_tail`` keeps this replica's own; False if it was not kept
+        (and is released)."""
+        for older in [k for k, e in self._entries.items() if e.tail and key[: len(k)] == k]:
+            self._release(older)
+        if key in self._entries:
+            self._release(key)
+        if not self._admits(key) or snap.length != len(key):
+            self._fast.release(snap)
+            return False
+        self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=True))
+        return key in self._entries
+
     def _admits(self, key: tuple[int, ...]) -> bool:
         return bool(key) and len(key) <= self._max_tokens and self._max_entries > 0
 
@@ -787,6 +813,18 @@ class Generator:
             return
         with torch.inference_mode():
             self._prefix_cache.store_tail(key, slot)
+
+    def export_tail(self, key: tuple[int, ...], *, keep: bool = False) -> Any:
+        """The session tail at ``key`` (``FastPrefixCache.tail``), for ``engine.migrate``."""
+        if self.fast is None:
+            return None
+        return self._prefix_cache.tail(key, keep=keep)
+
+    def import_tail(self, key: tuple[int, ...], snap: Any) -> bool:
+        """Keep another replica's session tail (``FastPrefixCache.put_tail``): the session's
+        next round here reuses it as its own."""
+        with torch.inference_mode():
+            return self._prefix_cache.put_tail(key, snap)
 
     def _start_fast(self, prompt: tuple[int, ...], sampling: Sampling, max_tokens: int) -> Generation:
         self._reclaim()

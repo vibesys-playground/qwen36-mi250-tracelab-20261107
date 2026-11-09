@@ -33,7 +33,7 @@ The all-reduce (``Group.allreduce``):
   per one-wavefront CTA, each CTA with its own epoch. The kernel keeps its epochs in device
   memory, so the graphs need no host input and the ranks rendezvous inside them.
 - Inside a captured prefill graph, for BF16 tensors of at least ``BULK_MIN_WORDS`` words
-  (``ENGINE_TP_BULK_AR``, plan 52): the bulk protocol (``_bulk_ar_kernel``). One CTA per chunk
+  (``ENGINE_TP_BULK_AR=1``, plan 52, off by default): the bulk protocol (``_bulk_ar_kernel``). One CTA per chunk
   of ``BULK_BW`` words stores its data, without epochs, into the peer's receive buffer
   (write-through, parity ``e & 1``), then releases one flag per CTA at system scope; it
   acquires its own flag and sums with the same formula. Half the bytes of LL on the link and
@@ -105,13 +105,15 @@ GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
 # index of it do not depend on the order of the scan.
 GLUE_ARGMAX = os.environ.get("ENGINE_GLUE_ARGMAX", "1") == "1"
 ARGMAX_BLOCK = 8192
-# Plan 52 (ENGINE_TP_BULK_AR=1, default on; prefill graphs only): BF16 all-reduces of at least
+# Plan 52 (ENGINE_TP_BULK_AR=1, default off: j248 cut the 1,650-token captured pass by only 1.6 ms,
+# 132.5 -> 130.9, because LL already runs near the link's store bandwidth and most of its in-pass
+# time is waiting for the peer rank; prefill graphs only): BF16 all-reduces of at least
 # BULK_MIN_WORDS 32-bit words (512 rows of 2,048) in a captured graph use the bulk protocol
 # (``_bulk_ar_kernel``) instead of LL; smaller ones (decode, verify, small prefill buckets) and
 # fp32 stay on LL. BULK_BW words per one-CTA chunk, BULK_WARPS waves per CTA.
-BULK_AR = os.environ.get("ENGINE_TP_BULK_AR", "1") == "1" and PREFILL_GRAPH
+BULK_AR = os.environ.get("ENGINE_TP_BULK_AR", "0") == "1" and PREFILL_GRAPH
 BULK_MIN_WORDS = int(os.environ.get("ENGINE_TP_BULK_MIN_WORDS", str(512 * 1024)))
-BULK_BW = int(os.environ.get("ENGINE_TP_BULK_BW", "8192"))
+BULK_BW = int(os.environ.get("ENGINE_TP_BULK_BW", "16384"))
 BULK_WARPS = int(os.environ.get("ENGINE_TP_BULK_WARPS", "8"))
 BULK_CAP = max(PG_BUCKETS) * 1024  # words per parity buffer: the largest bucket's BF16 rows
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm

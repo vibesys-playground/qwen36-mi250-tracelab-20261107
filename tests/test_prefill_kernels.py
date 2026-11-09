@@ -88,6 +88,56 @@ def test_reduce_rms_matches_eager(has_h, has_peer, has_w):
         assert y is None
 
 
+def _ulp_bf16(got, ref):
+    """Max distance in BF16 units in the last place (same-sign values)."""
+    a = got.view(torch.int16).int()
+    b = ref.view(torch.int16).int()
+    return int((a - b).abs().max()) if a.numel() else 0
+
+
+@pytest.mark.parametrize("heads,kv_heads,dim,rot,merged", [(4, 2, 32, 8, True), (8, 1, 256, 64, True), (8, 1, 256, 64, False)])
+@pytest.mark.parametrize("tokens", [1, 17, 61])
+def test_qk_prologue_matches_eager(heads, kv_heads, dim, rot, merged, tokens):
+    """Plan 56: q, gate, v bitwise; q and k (normed, rotated) at most 1 BF16 ulp apart (the
+    RMS's fp32 sum order); K/V land in the rows' pages; padding rows only touch their page."""
+    dev = _device()
+    g = torch.Generator().manual_seed(tokens * 31 + dim)
+    page_size, pages = 16, 12
+    n_q, n_kv = heads * 2 * dim, kv_heads * dim
+    if merged:  # column views of one projection output, row stride n_q + 2 * n_kv
+        out = torch.randn(tokens, n_q + 2 * n_kv, generator=g).bfloat16().to(dev)
+        qg, k, v = torch.split(out, [n_q, n_kv, n_kv], dim=-1)
+    else:
+        qg = torch.randn(tokens, n_q, generator=g).bfloat16().to(dev)
+        k = torch.randn(tokens, n_kv, generator=g).bfloat16().to(dev)
+        v = torch.randn(tokens, n_kv, generator=g).bfloat16().to(dev)
+    q_w = (torch.randn(dim, generator=g) * 0.2).bfloat16().to(dev)
+    k_w = (torch.randn(dim, generator=g) * 0.2).bfloat16().to(dev)
+    start = 37
+    positions = torch.arange(start, start + tokens, device=dev)
+    inv_freq = 1.0 / (10_000_000 ** (torch.arange(0, rot, 2, dtype=torch.float32) / rot))
+    cos, sin = pk.rope_tables(positions, inv_freq.to(dev), torch.bfloat16)
+    table = torch.randperm(pages - 1, generator=g)[: -(-(start + tokens) // page_size)].to(dev)
+    page = table[positions // page_size]
+    offset = positions % page_size
+    if tokens > 3:  # the last 3 rows are padding: the dummy page (pages - 1)
+        page[-3:] = pages - 1
+        offset[-3:] = torch.arange(3, device=dev)
+    pools = []
+    for _ in range(2):
+        kp = torch.full((pages, kv_heads, page_size, dim), 7.0, dtype=torch.bfloat16, device=dev)
+        pools.append((kp, kp.clone()))
+    rq, rgate = pk.qk_prologue_reference(qg, k, v, heads, q_w, k_w, 1e-6, 1e-6, cos, sin, *pools[0], page, offset)
+    assert pk.qk_supported(qg, k, v, heads, dim, cos, *pools[1])
+    q, gate = pk.qk_prologue(qg, k, v, heads, q_w, k_w, 1e-6, 1e-6, cos, sin, *pools[1], page, offset)
+    assert torch.equal(gate, rgate)
+    assert q.shape == rq.shape and _ulp_bf16(q.cpu(), rq.contiguous().cpu()) <= 1
+    assert torch.equal(pools[0][1], pools[1][1])  # v and every untouched slot
+    assert _ulp_bf16(pools[1][0].cpu(), pools[0][0].cpu()) <= 1
+    same = (pools[1][0] == pools[0][0]).float().mean().item()
+    assert same > 0.97, same  # nearly all bitwise: only a rare RMS rounding differs
+
+
 @pytest.mark.parametrize("experts,k,tokens", [(8, 2, 33), (64, 8, 50)])
 def test_route_matches_softmax_topk(experts, k, tokens):
     dev = _device()
@@ -266,6 +316,26 @@ def fast(tmp_path_factory: pytest.TempPathFactory):
     gen = Generator.load(str(path), None, max_model_len=1024, chunk_tokens=8,
                          prefix_cache_tokens=0, prefix_cache_entries=0)
     return FastModel(gen.model, slots=8, max_len=1024, use_triton=True, use_graphs=False)
+
+
+def test_qk_fused_matches_unfused(fast):
+    """Plan 56: the whole prefill with the fused Q/K prologue against the eager Q/K ops."""
+    assert fast.triton_kernels["qk_fused"]
+    prompt = [(13 * j + 5) % 200 + 1 for j in range(70)]
+    out = {}
+    for flag in (False, True):
+        fast.triton_kernels["qk_fused"] = flag
+        with torch.inference_mode():
+            fast.reset(0)
+            fast.reset(1)
+            a = fast.prefill(0, prompt[:30], 0).float()
+            b = fast.prefill(0, prompt[30:], 30).float()
+            c = fast.prefill_packed([(0, prompt[:5], 70), (1, prompt[5:40], 0)]).float()
+        out[flag] = (a, b, c)
+    fast.triton_kernels["qk_fused"] = True
+    for x, y in zip(out[False], out[True]):
+        assert torch.equal(x.argmax(-1), y.argmax(-1))
+        assert float((x - y).abs().max()) <= 0.02 * float(x.abs().max()) + 1e-3
 
 
 def test_prefill_fused_matches_eager(fast):

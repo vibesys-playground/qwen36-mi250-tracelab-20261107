@@ -16,7 +16,7 @@ TABLE = Path(blas_tune.__file__).with_name("blas_tuned_gfx90a.csv")
 def test_shipped_table_parses():
     validators, rows = blas_tune.read_table(str(TABLE))
     assert validators.get("GCN_ARCH_NAME", "").startswith("gfx90a")
-    assert {"PT_VERSION", "ROCM_VERSION", "HIPBLASLT_VERSION"} <= set(validators)
+    assert {"PT_VERSION", "HIP_VERSION", "HIPBLASLT_VERSION", "ROCBLAS_VERSION"} <= set(validators)
     assert rows and all(r[0].startswith("Gemm") and len(r) >= 4 for r in rows)
     assert len({(r[0], r[1]) for r in rows}) == len(rows)  # one solution per GEMM
 

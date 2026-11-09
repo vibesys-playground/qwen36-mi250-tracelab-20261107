@@ -558,6 +558,12 @@ def main() -> None:
             stats = {}
             for hist in (False, True):
                 iv.topp_hist = hist
+                try:
+                    iv._search_fast(rnd[:1].contiguous(), torch.empty((1,), dtype=torch.int64, device=dev))
+                except Exception:  # noqa: BLE001
+                    out("error", item=f"search_fast topp={'hist' if hist else 'radix'}",
+                        error=traceback.format_exc().replace("\n", " | ")[-1500:])
+                    continue
                 for name, Y in sets.items():
                     for rows in (1, 2, 3, 8, 16):
                         total = bad = 0

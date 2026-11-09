@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import protocol
+from engine import protocol, reqstamps
 
 Key = tuple[Any, ...] | str
 
@@ -461,6 +461,7 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 {"devices": list(r.devices), **s} for r, s in zip(replicas, states, strict=True)
             ]
             body["load"] = self.server.affinity.load()
+            body.update(reqstamps.summary())
             self._send_json(200, body)
             return
         try:
@@ -471,6 +472,7 @@ class _FrontHandler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def do_POST(self) -> None:
+        self._t_recv = reqstamps.now() if reqstamps.ENABLED else 0.0
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         try:
@@ -490,6 +492,11 @@ class _FrontHandler(BaseHTTPRequestHandler):
         try:
             headers = {h: self.headers[h] for h in _FORWARD_HEADERS if self.headers.get(h)}
             headers["Content-Length"] = str(len(raw))
+            stamped = reqstamps.ENABLED
+            if stamped:
+                t_sent = reqstamps.now()
+                reqstamps.record("r_parse", t_sent - self._t_recv)
+                headers["X-Engine-Sent"] = repr(t_sent)
             try:
                 conn.request("POST", self.path, body=raw, headers=headers)
                 response = conn.getresponse()
@@ -514,8 +521,16 @@ class _FrontHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             try:
                 while piece := response.read1(65536):
+                    if stamped:
+                        t_first = reqstamps.now()
                     self.wfile.write(piece)
                     self.wfile.flush()
+                    if stamped:
+                        stamped = False
+                        t_out = reqstamps.now()
+                        reqstamps.record("r_upstream", t_first - t_sent)
+                        reqstamps.record("r_relay", t_out - t_first)
+                        reqstamps.record("r_total", t_out - self._t_recv)
             except OSError:  # the client went away; closing our side cancels the replica's job
                 pass
         finally:

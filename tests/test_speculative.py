@@ -259,3 +259,64 @@ def test_generator_greedy_outputs_equal_with_and_without_mtp(
     assert stats["1"]["mtp_verify_steps"] > 0
     assert stats["1"]["mtp_accepted"] > 0
     assert stats["1"]["prefix_cache_tail_hits"] == stats["0"]["prefix_cache_tail_hits"] == 3
+
+
+def test_parked_session_tails_equal_detached_ones_with_mtp(
+    checkpoint: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan 69: with the MTP head (state rings, banks left wherever the last verify put
+    them), a round resumed in its parked slot gives the same tokens, cached counts and first
+    logits as one resumed from a detached tail."""
+    from engine.protocol import Sampling
+
+    monkeypatch.setenv("ENGINE_FAST", "1")
+    monkeypatch.setenv("ENGINE_WARMUP", "0")
+    monkeypatch.setenv("ENGINE_MTP", "1")
+    runs = {}
+    for park in ("0", "1"):
+        monkeypatch.setenv("ENGINE_SLOT_PARK", park)
+        g = Generator.load(
+            str(checkpoint), None, max_model_len=4096, chunk_tokens=CHUNK,
+            prefix_cache_tokens=100000, prefix_cache_entries=16,
+        )
+        assert (g._prefix_cache.park_max > 0) == (park == "1")
+        prompts = [[(5 * i + j) % 300 + 5 for i in range(n)] for j, n in enumerate([9, 70, 33])]
+        toks_all, cached_all, logits_all = [], [], []
+        for rnd in range(4):
+            sampling = Sampling(max_tokens=7 + 3 * rnd, temperature=0.0, ignore_eos=True)
+            gens = g.start_many([(tuple(p), sampling) for p in prompts])
+            cached_all.append([x.cached_tokens for x in gens])
+            logits_all.append([x.logits.clone() for x in gens])
+            toks = [[] for _ in gens]
+            live = list(range(len(gens)))
+            while live:
+                waiting = []
+                for i in live:
+                    while True:
+                        step = gens[i].next_step()
+                        toks[i].append(step.token_id)
+                        if step.finish is not None:
+                            gens[i].retire()
+                            break
+                        if not gens[i].has_queued():
+                            waiting.append(i)
+                            break
+                live = waiting
+                for i in live:  # force some right drafts (the random head never guesses)
+                    if len(toks[i]) % 2 == 0 and park == "1":
+                        gens[i].draft = runs["0"][0][rnd][i][len(toks[i])]
+                    elif len(toks[i]) % 2 == 0:
+                        gens[i].draft = toks[i][-1]
+                if live:
+                    g.decode([gens[i] for i in live])
+            toks_all.append(toks)
+            prompts = [p + t + [17, 18 + rnd] for p, t in zip(prompts, toks, strict=True)]
+        runs[park] = (toks_all, cached_all, logits_all, g.stats())
+    assert runs["0"][0] == runs["1"][0]
+    assert runs["0"][1] == runs["1"][1]
+    assert all(c > 0 for r in runs["1"][1][1:] for c in r)
+    for la, lb in zip(runs["0"][2], runs["1"][2], strict=True):
+        for x, y in zip(la, lb, strict=True):
+            assert torch.equal(x, y)
+    assert runs["1"][3]["parked_hits"] == 9 and runs["0"][3]["parked_hits"] == 0
+    assert runs["1"][3]["mtp_accepted"] > 0

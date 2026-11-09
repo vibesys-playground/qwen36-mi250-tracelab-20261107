@@ -76,47 +76,57 @@ def _assign_scores(x: torch.Tensor, c: torch.Tensor, spherical: bool, chunk: int
 
 
 def _balanced(score: torch.Tensor, cand: torch.Tensor, clusters: int, cap: int,
-              x: torch.Tensor, c: torch.Tensor, spherical: bool) -> tuple[torch.Tensor, int]:
+              x: torch.Tensor, c: torch.Tensor, spherical: bool, chunk: int) -> tuple[torch.Tensor, int, int]:
     """Assign every row to one of its candidate clusters (best first) so no cluster holds more
     than ``cap`` rows; in each round the rows proposing to a cluster are taken best score
-    first, ties to the lower row. Rows left after the candidates go, one at a time in row
-    order, to the best-scoring cluster with room. Returns (assignment, rows moved off their
-    first choice)."""
+    first, ties to the lower row. Rows left after their candidates get new candidates among
+    the clusters with room, and so on until every row is placed. Returns (assignment, rows
+    moved off their first choice, candidate passes)."""
     n, rounds = cand.shape
     dev = score.device
     out = torch.full((n,), -1, dtype=torch.long, device=dev)
     fill = torch.zeros(clusters, dtype=torch.long, device=dev)
     rows = torch.arange(n, device=dev)
-    for r in range(rounds):
+    first = cand[:, 0].clone()
+    passes = 0
+    todo = rows
+    while todo.numel():
+        passes += 1
+        for r in range(cand.shape[1]):
+            live = out[todo] < 0
+            t = todo[live]
+            if t.numel() == 0:
+                break
+            cl = cand[live, r]
+            sc = score[live, r]
+            ok0 = torch.isfinite(sc)
+            t, cl, sc = t[ok0], cl[ok0], sc[ok0]
+            o1 = torch.argsort(-sc, stable=True)  # best first (ties: lower row, t is sorted)
+            o2 = torch.argsort(cl[o1], stable=True)  # group by cluster, keep that order
+            order = o1[o2]
+            cls = cl[order]
+            counts = torch.bincount(cls, minlength=clusters)
+            starts = torch.cumsum(counts, 0) - counts
+            pos = torch.arange(order.numel(), device=dev) - starts[cls]
+            ok = pos < (cap - fill)[cls]
+            out[t[order[ok]]] = cls[ok]
+            fill += torch.bincount(cls[ok], minlength=clusters)
         todo = rows[out < 0]
-        if todo.numel() == 0:
-            break
-        cl = cand[todo, r]
-        sc = score[todo, r]
-        o1 = torch.argsort(-sc, stable=True)  # best first (ties: lower row, todo is sorted)
-        o2 = torch.argsort(cl[o1], stable=True)  # group by cluster, keep that order
-        order = o1[o2]
-        cls = cl[order]
-        counts = torch.bincount(cls, minlength=clusters)
-        starts = torch.cumsum(counts, 0) - counts
-        pos = torch.arange(order.numel(), device=dev) - starts[cls]
-        ok = pos < (cap - fill)[cls]
-        take = todo[order[ok]]
-        out[take] = cls[ok]
-        fill += torch.bincount(cls[ok], minlength=clusters)
-    left = rows[out < 0].tolist()
-    if left:
-        half = None if spherical else 0.5 * (c * c).sum(1)
-        for i in left:
-            s = x[i] @ c.T
-            if half is not None:
-                s = s - half
-            s = torch.where(fill < cap, s, torch.full_like(s, float("-inf")))
-            j = int(torch.argmax(s))
-            out[i] = j
-            fill[j] += 1
-    moved = int((out != cand[:, 0]).sum())
-    return out, moved
+        if todo.numel():  # new candidates among the clusters with room
+            k = min(rounds, int((fill < cap).sum()))
+            half = None if spherical else 0.5 * (c * c).sum(1)
+            vals, ids = [], []
+            for a, b in _chunks(todo.numel(), chunk):
+                s = x[todo[a:b]] @ c.T
+                if half is not None:
+                    s = s - half
+                s = torch.where(fill < cap, s, torch.full_like(s, float("-inf")))
+                v, i = s.topk(k, dim=1)
+                vals.append(v)
+                ids.append(i)
+            score, cand = torch.cat(vals), torch.cat(ids)
+    moved = int((out != first).sum())
+    return out, moved, passes
 
 
 @torch.no_grad()
@@ -150,7 +160,7 @@ def build(w: torch.Tensor, clusters: int, cap: int, iters: int = 16, spherical: 
             c[torch.nonzero(empty)[:, 0]] = x[far]
     score, cand = _assign_scores(x, c, spherical, chunk, candidates)
     raw_sizes = torch.bincount(cand[:, 0], minlength=clusters)
-    assign, moved = _balanced(score, cand, clusters, cap, x, c, spherical)
+    assign, moved, passes = _balanced(score, cand, clusters, cap, x, c, spherical, chunk)
     sizes = torch.bincount(assign, minlength=clusters)
     perm = torch.argsort(assign, stable=True)
     offsets = torch.zeros(clusters + 1, dtype=torch.int32, device=w.device)
@@ -166,7 +176,8 @@ def build(w: torch.Tensor, clusters: int, cap: int, iters: int = 16, spherical: 
                  raw_min=int(raw_sizes.min()), raw_med=float(raw_sizes.float().median()),
                  raw_max=int(raw_sizes.max()), raw_empty=int((raw_sizes == 0).sum()),
                  min=int(sizes.min()), max=int(sizes.max()), mean=n / clusters,
-                 empty=int((sizes == 0).sum()), moved=moved, moved_frac=moved / n)
+                 empty=int((sizes == 0).sum()), moved=moved, moved_frac=moved / n,
+                 balance_passes=passes)
     return Index(cent.to(torch.bfloat16), offsets, perm, assign, cap, build_s, stats)
 
 

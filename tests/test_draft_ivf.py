@@ -40,6 +40,16 @@ def test_build_deterministic_and_capped() -> None:
         assert torch.equal(a.cluster[a.perm], torch.sort(a.cluster).values)
 
 
+def test_build_skewed_overflow() -> None:
+    """Many identical rows (as untrained vocabulary rows are) overflow their cluster's cap."""
+    w = _weights(20_000, 128)
+    w[:6000] = w[0]
+    idx = draft_ivf.build(w, 256, 100, iters=4)
+    sizes = torch.bincount(idx.cluster, minlength=256)
+    assert int(sizes.max()) <= 100 and int(sizes.sum()) == 20_000
+    assert idx.stats["moved"] >= 6000 - 100
+
+
 def test_all_clusters_is_exact_and_rank_matches_reference() -> None:
     w = _weights()
     idx = draft_ivf.build(w, 512, 160, iters=4)

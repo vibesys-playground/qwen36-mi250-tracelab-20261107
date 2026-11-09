@@ -1,6 +1,6 @@
 """Plan 48 step 0: the chained verify's GDN recurrence split over value columns, vs today.
 
-    python tools/gdn_vsplit_bench.py [--slots 1,2,4] [--groups 4,2] [--replays 50]
+    python tools/gdn_vsplit_bench.py [--configs 2x4,1x4,4x4,2x2] [--replays 50]
 
 One GCD, TP2 rank-0 shard dims of Qwen3.6-35B-A3B (16 v-heads, 8 k-heads, DK = DV = 128,
 conv_dim 4096, projection row 6176), the real per-layer A_log, dt_bias, norm and conv1d
@@ -160,6 +160,13 @@ def run_variant(name, L, proj, states, n, G, bufs):
         gv.vsplit(L, proj, states, obuf, n, G, bv, warps, False)
         gv.norm_qk(L, proj, states, obuf, core, n, G, do_norm=True, exact=not m.group(3))
         return core, (mfma.gemv(core, L.out_w) if m.group(4) else None)
+    m = re.fullmatch(r"W(\d+)w(\d+)(\+out)?", name)
+    if m:  # chunked (WY) form; BV = DV keeps the norm in the kernel
+        bv, warps = int(m.group(1)), int(m.group(2))
+        norm_in = bv == L.head_v_dim
+        gv.wy(L, proj, states, core if norm_in else obuf, n, G, bv, warps, norm_in)
+        gv.norm_qk(L, proj, states, obuf, core, n, G, do_norm=not norm_in, exact=False)
+        return core, (mfma.gemv(core, L.out_w) if m.group(3) else None)
     m = re.fullmatch(r"N2_(\d+)w(\d+)", name)
     if m:
         gv.vsplit(L, proj, states, obuf, n, G, int(m.group(1)), int(m.group(2)), False)
@@ -191,6 +198,15 @@ def ulps(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int]:
     return int((d > 0).sum()), int(d.max())
 
 
+def ulps32(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Max fp32 ulp distance of two fp32 tensors."""
+    ai = a.contiguous().view(torch.int32).to(torch.int64)
+    bi = b.contiguous().view(torch.int32).to(torch.int64)
+    ai = torch.where(ai < 0, -2147483648 - ai, ai)
+    bi = torch.where(bi < 0, -2147483648 - bi, bi)
+    return int((ai - bi).abs().max())
+
+
 def bitwise(names, layers_w, dims, dev, n, G, replays, out_ws):
     gen = torch.Generator().manual_seed(1000 + 10 * n + G)
     states = ring_states(n, G, dev)
@@ -209,7 +225,8 @@ def bitwise(names, layers_w, dims, dev, n, G, replays, out_ws):
     vb = {name: bufs_for(dev, dims) for name in ["A"] + names}
     rows_idx = states
     stats = {name: dict(state_bw=0, conv_bw=0, core_bw=0, out_bw=0, steps=0, state_max=0.0,
-                        state_rel=0.0, core_diff=0, core_ulp=0, out_diff=0, out_ulp=0, finite=True)
+                        state_rel=0.0, core_diff=0, core_ulp=0, out_diff=0, out_ulp=0, finite=True,
+                        state_ulp=0, state_ulp_big=0)
              for name in names}
     for _ in range(replays):
         for li in range(len(base)):
@@ -227,6 +244,10 @@ def bitwise(names, layers_w, dims, dev, n, G, replays, out_ws):
                 dmax = float((ra - rv).abs().max())
                 st["state_max"] = max(st["state_max"], dmax)
                 st["state_rel"] = max(st["state_rel"], dmax / max(float(ra.abs().max()), 1e-30))
+                st["state_ulp"] = max(st["state_ulp"], ulps32(ra, rv))
+                big = ra.abs() >= 1e-3 * float(ra.abs().max())  # ulps away from near-zero entries
+                if bool(big.any()):
+                    st["state_ulp_big"] = max(st["state_ulp_big"], ulps32(ra[big], rv[big]))
                 st["conv_bw"] += int(torch.equal(copies["A"][li].conv[rows_idx], L.conv[rows_idx]))
                 if cv is not None:
                     st["core_bw"] += int(torch.equal(ca, cv))
@@ -243,6 +264,7 @@ def bitwise(names, layers_w, dims, dev, n, G, replays, out_ws):
         log(f"RESULT bitwise n={n} G={G} {name} steps={st['steps']} state_bitwise={st['state_bw']} "
             f"conv_bitwise={st['conv_bw']} core_bitwise={st['core_bw']} out_bitwise={st['out_bw']} "
             f"state_maxabs={st['state_max']:.3e} state_maxrel={st['state_rel']:.3e} "
+            f"state_max_ulp={st['state_ulp']} state_max_ulp_above_1e-3max={st['state_ulp_big']} "
             f"core_max_diff_elems={st['core_diff']} core_max_ulp={st['core_ulp']} "
             f"out_max_diff_elems={st['out_diff']} out_max_ulp={st['out_ulp']} finite={st['finite']}")
     return stats
@@ -303,6 +325,7 @@ def timing(names, layers, dev, n, G, dims):
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--slots", default="2,1,4")
+    p.add_argument("--configs", default="2x4,1x4,4x4,2x2")
     p.add_argument("--groups", default="4,2")
     p.add_argument("--replays", type=int, default=50)
     p.add_argument("--skip-bitwise", action="store_true")
@@ -329,13 +352,14 @@ def main() -> None:
 
     slots = [int(v) for v in args.slots.split(",")]
     groups = [int(v) for v in args.groups.split(",")]
-    cvars = ["C32w4", "C32w2", "C32w8", "C64w4", "C64w8", "C16w2", "C16w4"]
+    cvars = ["C32w4", "C64w4"]
+    wvars = ["W128w8", "W128w4", "W64w4", "W64w8", "W32w4", "W32w2"]
 
     started = time.perf_counter()
     if not args.skip_bitwise:
-        for n, G in ((2, 4), (1, 4)):
+        for n, G in ((2, 4), (1, 4), (4, 4), (2, 2)):
             try:
-                bitwise(["B"] + cvars + ["C32w4x", "N2_32w4"], ws[:3], dims, dev, n, G,
+                bitwise(["C32w4x"] + wvars, ws[:3], dims, dev, n, G,
                         args.replays, out_ws[:3])
             except Exception:  # noqa: BLE001
                 log(f"RESULT bitwise n={n} G={G} error:\n{traceback.format_exc()}")
@@ -343,8 +367,9 @@ def main() -> None:
 
     layers = [make_layer(w, dims, dev, ow) for w, ow in zip(ws, out_ws, strict=True)]
     summary = {}
-    for G in groups:
-        for n in slots:
+    wsum = {}
+    for n, G in ((int(c.split("x")[0]), int(c.split("x")[1])) for c in args.configs.split(",")):
+        if True:
             for L in layers:  # warm states (realistic magnitudes) with today's kernels
                 L.conv.zero_()
                 L.rec.zero_()
@@ -354,9 +379,14 @@ def main() -> None:
             for _ in range(10):
                 for L in layers:
                     gv.today(L, rand_proj(n * G, L.width, gen, dev), st, b["core"][: n * G], n, G)
-            res = timing(["A0", "A", "B"] + cvars + ["C32w4x", "empty", "stream128w8", "stream32w4",
-                                                     "stream32w2", "stream64w4", "stream16w2"],
+            res = timing(["A0", "A"] + cvars + ["C32w4x"] + wvars + ["empty", "stream128w8", "stream64w4",
+                                                                  "stream32w4"],
                          layers, dev, n, G, dims)
+            ws_ = {k: v for k, v in res.items() if k in wvars}
+            if ws_:
+                wbest = min(ws_, key=ws_.get)
+                res.update(timing([wbest + "+out"], layers, dev, n, G, dims))
+                wsum[(n, G)] = (res, wbest)
             cs = {k: v for k, v in res.items() if k in cvars}
             if cs:
                 best = min(cs, key=cs.get)
@@ -368,9 +398,30 @@ def main() -> None:
     log(f"RESULT timing_done s={time.perf_counter() - started:.0f}")
 
     try:
+        report_wy(wsum)
+    except Exception:  # noqa: BLE001
+        log(f"RESULT wy summary error:\n{traceback.format_exc()}")
+    try:
         report(summary)
     except Exception:  # noqa: BLE001
         log(f"RESULT summary error:\n{traceback.format_exc()}")
+
+
+def report_wy(wsum) -> None:
+    for (n, G), (res, wbest) in wsum.items():
+        a0, w = res["A0"], res[wbest]
+        line = (f"RESULT wy n={n} G={G} A0_today_ms={a0:.4f} best_W={wbest} W_ms={w:.4f} "
+                f"save_ms={a0 - w:.4f} ratio={w / a0:.3f} "
+                f"ceiling_stream_today_shape_ms={res.get('stream128w8', float('nan')):.4f} "
+                f"ceiling_stream64_ms={res.get('stream64w4', float('nan')):.4f}")
+        if "A" in res and wbest + "+out" in res:
+            line += f" A_with_out_ms={res['A']:.4f} W_out_ms={res[wbest + '+out']:.4f}"
+        log(line)
+    if (2, 4) in wsum:
+        res, wbest = wsum[(2, 4)]
+        w = res[wbest]
+        log(f"RESULT wy_gate n=2 G=4 best={wbest} ms_per_30={w:.4f} (gate <= 0.6) -> "
+            f"{'PASS' if w <= 0.6 else 'MISS'}")
 
 
 def report(summary) -> None:

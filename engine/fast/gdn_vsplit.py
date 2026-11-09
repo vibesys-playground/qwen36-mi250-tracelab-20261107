@@ -151,6 +151,139 @@ if triton is not None:
                 tl.store(out_ptr + (row * V_HEADS + head) * DV + cc, o)
 
     @triton.jit
+    def _ext_m(conv_ptr, in_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok,
+               OFF: tl.constexpr):
+        """``_ext`` for a padded row range: rows with ``ok`` false read 0."""
+        t = jj[:, None] + OFF + 0 * ch[None, :]
+        okk = ok[:, None] & (ch[None, :] >= 0)
+        st = t < 3
+        sv = tl.load(conv_ptr + first * stride_cslot + ch[None, :] * 4 + (t + 1), mask=st & okk, other=0.0)
+        xv = tl.load(in_ptr + ((t - 3) * N + r) * stride_in + ch[None, :], mask=(t >= 3) & okk, other=0.0)
+        return tl.where(st, sv, xv)
+
+    @triton.jit
+    def _conv_rows_m(conv_ptr, in_ptr, cw_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok,
+                     GP: tl.constexpr, CW: tl.constexpr):
+        """``_conv_rows`` over GP padded rows (rows with ``ok`` false give 0)."""
+        e0 = _ext_m(conv_ptr, in_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok, 0)
+        e1 = _ext_m(conv_ptr, in_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok, 1)
+        e2 = _ext_m(conv_ptr, in_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok, 2)
+        x = _ext_m(conv_ptr, in_ptr, first, stride_cslot, r, N, stride_in, ch, jj, ok, 3)
+        w0 = tl.load(cw_ptr + ch * 4).to(tl.float32)
+        w1 = tl.load(cw_ptr + ch * 4 + 1).to(tl.float32)
+        w2 = tl.load(cw_ptr + ch * 4 + 2).to(tl.float32)
+        w3 = tl.load(cw_ptr + ch * 4 + 3).to(tl.float32)
+        acc = tl.zeros([GP, CW], dtype=tl.float32)
+        acc += e0.to(tl.float32) * w0[None, :]
+        acc += e1.to(tl.float32) * w1[None, :]
+        acc += e2.to(tl.float32) * w2[None, :]
+        acc += x.to(tl.float32) * w3[None, :]
+        y = acc.to(tl.bfloat16).to(tl.float32)
+        y = (y * tl.sigmoid(y)).to(tl.bfloat16)
+        return y, e0, e1, e2, x
+
+    @triton.jit
+    def _wy_kernel(
+        conv_ptr, rec_ptr, slot_ptr, in_ptr, cw_ptr, alog_ptr, dtb_ptr, nw_ptr, out_ptr,
+        N, stride_in, stride_cslot, stride_slot, stride_head, V_HEADS, eps, scale,
+        Z_OFF, B_OFF, A_OFF,
+        RATIO: tl.constexpr, KEY_DIM: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+        BV: tl.constexpr, G: tl.constexpr, NORM_IN: tl.constexpr,
+    ):
+        """The G rows of slot r, v-head ``head``, columns ``vb * BV ...`` in the chunked (WY)
+        form: with cum = cumsum(g) (row t's decay from S_0 is exp(cum_t)),
+          W = beta (V - exp(cum) K S_0),  A[t, i] = beta_t exp(cum_t - cum_i) k_t.k_i (i < t),
+          U = (I + A)^-1 W  (A nilpotent: I - A + A^2 - ...),
+          O = exp(cum) Q S_0 + M U,  M[t, i] = exp(cum_t - cum_i) q_t.k_i (i <= t),
+          S_t = exp(cum_t) S_0 + K^T (c_t U),  c_t[i] = exp(cum_t - cum_i) (i <= t),
+        every product a ``tl.dot`` over 16 padded rows; S_t stored to ring row slots[t N + r].
+        Same math as the row-by-row delta rule (``fused._gdn_step_kernel``) up to rounding."""
+        GP: tl.constexpr = 16
+        r = tl.program_id(0)
+        head = tl.program_id(1)
+        vb = tl.program_id(2)
+        k_head = head // RATIO
+        jj = tl.arange(0, GP)
+        ok = jj < G
+        kk = tl.arange(0, DK)
+        cc = vb * BV + tl.arange(0, BV)
+        first = tl.load(slot_ptr + r).to(tl.int64)
+        dst = tl.load(slot_ptr + jj * N + r, mask=ok, other=0).to(tl.int64)
+        rows = jj * N + r
+        tile = head * stride_head + kk[:, None] * DV + cc[None, :]
+        s0 = tl.load(rec_ptr + first * stride_slot + tile)
+        yq, _q0, _q1, _q2, _q3 = _conv_rows_m(conv_ptr, in_ptr, cw_ptr, first, stride_cslot, r, N,
+                                              stride_in, k_head * DK + kk, jj, ok, GP, DK)
+        yk, _k0, _k1, _k2, _k3 = _conv_rows_m(conv_ptr, in_ptr, cw_ptr, first, stride_cslot, r, N,
+                                              stride_in, KEY_DIM + k_head * DK + kk, jj, ok, GP, DK)
+        vch = 2 * KEY_DIM + head * DV + cc
+        yv, e0, e1, e2, xv = _conv_rows_m(conv_ptr, in_ptr, cw_ptr, first, stride_cslot, r, N,
+                                          stride_in, vch, jj, ok, GP, BV)
+        bb = tl.load(in_ptr + rows * stride_in + B_OFF + head, mask=ok, other=0.0).to(tl.float32)
+        aa = tl.load(in_ptr + rows * stride_in + A_OFF + head, mask=ok, other=0.0).to(tl.float32)
+        alog = tl.load(alog_ptr + head).to(tl.float32)
+        dtb = tl.load(dtb_ptr + head).to(tl.float32)
+        if NORM_IN:
+            zz = tl.load(in_ptr + rows[:, None] * stride_in + Z_OFF + head * DV + cc[None, :],
+                         mask=ok[:, None], other=0.0).to(tl.float32)
+            nw = tl.load(nw_ptr + cc).to(tl.float32)
+        else:
+            zz = tl.zeros([GP, BV], dtype=tl.float32)
+            nw = tl.zeros([BV], dtype=tl.float32)
+        tl.debug_barrier()  # every load of conv state row ``first`` before the ring stores
+        b = conv_ptr + dst[:, None] * stride_cslot + vch[None, :] * 4
+        m2 = ok[:, None] & (vch[None, :] >= 0)
+        tl.store(b, e0, mask=m2)
+        tl.store(b + 1, e1, mask=m2)
+        tl.store(b + 2, e2, mask=m2)
+        tl.store(b + 3, xv, mask=m2)
+
+        q = yq.to(tl.float32)
+        k = yk.to(tl.float32)
+        v = yv.to(tl.float32)
+        q = q * (tl.rsqrt(tl.sum(q * q, axis=1) + 1e-6) * scale)[:, None]
+        k = k * tl.rsqrt(tl.sum(k * k, axis=1) + 1e-6)[:, None]
+        beta = tl.sigmoid(bb).to(tl.bfloat16).to(tl.float32)
+        a = aa + dtb
+        softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        g = tl.where(ok, -tl.exp(alog) * softplus, 0.0)
+        cum = tl.cumsum(g, axis=0)
+        gam = tl.exp(cum)
+        ii = jj[None, :]
+        tt = jj[:, None]
+        dec = tl.exp(tl.minimum(cum[:, None] - cum[None, :], 0.0))
+        kt = tl.trans(k)
+        ks = tl.dot(k, s0, input_precision="ieee")          # row t: S_0^T k_t
+        qs = tl.dot(q, s0, input_precision="ieee")          # row t: S_0^T q_t
+        kkm = tl.dot(k, kt, input_precision="ieee")         # k_t . k_i
+        qkm = tl.dot(q, kt, input_precision="ieee")         # q_t . k_i
+        am = tl.where(ii < tt, beta[:, None] * dec * kkm, 0.0)
+        w = beta[:, None] * (v - gam[:, None] * ks)
+        eye = (ii == tt).to(tl.float32)
+        tm = eye
+        p = eye
+        for _m in tl.static_range(1, G):
+            p = -tl.dot(am, p, input_precision="ieee")
+            tm = tm + p
+        u = tl.dot(tm, w, input_precision="ieee")
+        mm = tl.where(ii <= tt, dec * qkm, 0.0)
+        o = gam[:, None] * qs + tl.dot(mm, u, input_precision="ieee")
+        o = o.to(tl.bfloat16).to(tl.float32)
+        for t in tl.static_range(G):
+            ct = tl.sum(tl.where(jj == t, cum, 0.0), axis=0)
+            c = tl.where(jj <= t, tl.exp(tl.minimum(ct - cum, 0.0)), 0.0)
+            st = tl.exp(ct) * s0 + tl.dot(kt, u * c[:, None], input_precision="ieee")
+            d = tl.sum(tl.where(jj == t, dst, 0), axis=0)
+            tl.store(rec_ptr + d * stride_slot + tile, st)
+        optr = out_ptr + (rows[:, None] * V_HEADS + head) * DV + cc[None, :]
+        if NORM_IN:
+            n = (o * tl.rsqrt(tl.sum(o * o, axis=1) / DV + eps)[:, None]).to(tl.bfloat16).to(tl.float32)
+            y = (nw[None, :] * n).to(tl.bfloat16).to(tl.float32)
+            tl.store(optr, (y * zz * tl.sigmoid(zz)).to(tl.bfloat16), mask=ok[:, None])
+        else:
+            tl.store(optr, o, mask=ok[:, None])
+
+    @triton.jit
     def _qk_ring(conv_ptr, in_ptr, slot_ptr, r, blk, N, stride_in, stride_cslot,
                  G: tl.constexpr, CB: tl.constexpr):
         """Conv ring rows of slot r's G rows for the q|k channels ``blk * CB ...``."""
@@ -287,6 +420,20 @@ def vsplit(L, proj, states, out, n: int, groups: int, bv: int, warps: int, norm_
     heads, dk, dv, z_off, b_off, a_off = _dims(L)
     assert dv % bv == 0 and (not norm_in or bv == dv)
     _vsplit_kernel[(n, heads, dv // bv)](
+        L.conv, L.rec, states, proj, L.conv_w, L.A_log, L.dt_bias, L.norm_w, out,
+        n, proj.stride(0), L.conv.stride(0), L.rec.stride(0), L.rec.stride(1), heads,
+        L.eps, dk ** -0.5, z_off, b_off, a_off,
+        RATIO=heads // L.num_k_heads, KEY_DIM=L.key_dim, DK=dk, DV=dv, BV=bv, G=groups,
+        NORM_IN=norm_in, num_warps=warps,
+    )
+
+
+def wy(L, proj, states, out, n: int, groups: int, bv: int, warps: int, norm_in: bool) -> None:
+    """``_wy_kernel`` (chunked form); ``out`` as in ``vsplit``. The q/k conv ring is left to
+    ``norm_qk``."""
+    heads, dk, dv, z_off, b_off, a_off = _dims(L)
+    assert dv % bv == 0 and (not norm_in or bv == dv) and groups <= 16
+    _wy_kernel[(n, heads, dv // bv)](
         L.conv, L.rec, states, proj, L.conv_w, L.A_log, L.dt_bias, L.norm_w, out,
         n, proj.stride(0), L.conv.stride(0), L.rec.stride(0), L.rec.stride(1), heads,
         L.eps, dk ** -0.5, z_off, b_off, a_off,

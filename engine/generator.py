@@ -521,6 +521,7 @@ class Generator:
         self.verify_steps = 0
         self.mtp_proposed = 0
         self.mtp_accepted = 0
+        self._vocab_size = model.config.vocab_size
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -721,7 +722,8 @@ class Generator:
         """``start``'s checks; the request's max_tokens."""
         if not prompt:
             raise RequestError("prompt must contain at least one token")
-        if any(t >= self.model.config.vocab_size for t in prompt):
+        # Plan 46: one C-level max, not a config attribute lookup per token (~4 ms at 3.6k).
+        if max(prompt) >= self._vocab_size:
             raise RequestError("prompt contains a token id outside the vocabulary")
         budget = self.max_model_len - len(prompt)
         if budget < 1 or (sampling.max_tokens is not None and sampling.max_tokens > budget):

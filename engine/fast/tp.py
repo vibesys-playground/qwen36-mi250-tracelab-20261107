@@ -331,6 +331,10 @@ class _LL:
             rc = hip.hipDeviceEnablePeerAccess(self.devices[b].index, 0)
             if rc not in (0, 704):  # 704: hipErrorPeerAccessAlreadyEnabled
                 raise RuntimeError(f"hipDeviceEnablePeerAccess({a}->{b}) failed: {rc}")
+            if rc:
+                # HIP 7 keeps 704 as the thread's last error, and torch's launch check
+                # (hipGetLastError after a kernel) then raises it at the next launch (j280).
+                hip.hipGetLastError()
         torch.cuda.set_device(self.devices[0])
         self.recv = [self._fine(d, 2 * CAPACITY * 8) for d in self.devices]
         self.loop = [self._fine(d, 2 * CAPACITY * 8) for d in self.devices]  # loopback warm-up

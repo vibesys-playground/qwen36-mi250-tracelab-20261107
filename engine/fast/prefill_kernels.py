@@ -353,6 +353,141 @@ if triton is not None:
         z = tl.load(z_ptr + zoffs, mask=ok, other=0.0).to(tl.float32)
         tl.store(out_ptr + offs, _bf16(y * (z * tl.sigmoid(z)), WIDEN).to(tl.bfloat16), mask=ok)
 
+    # ------------------------------------------------------------------- attention Q/K prologue
+
+    @triton.jit
+    def _norm_rope(src, w_ptr, eps, cos_row, sin_row, dst, D: tl.constexpr, ROT: tl.constexpr,
+                   WIDEN: tl.constexpr):
+        """One head's ``_rope(_rms(x))`` (D values at ``src``) stored at ``dst``: the
+        zero-centered RMSNorm in fp32 rounded once to BF16, then partial RoPE over the first
+        ROT dims with ``_rope``'s BF16 roundings (x * cos, rotate_half(x) * sin, their sum)."""
+        HALF: tl.constexpr = ROT // 2
+        d = tl.arange(0, D)
+        partner = tl.where(d < HALF, d + HALF, tl.where(d < ROT, d - HALF, d))
+        x = tl.load(src + d).to(tl.float32)
+        xp = tl.load(src + partner).to(tl.float32)
+        r = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+        w = tl.load(w_ptr + d).to(tl.float32)
+        wp = tl.load(w_ptr + partner).to(tl.float32)
+        y = _bf16(x * r * (1.0 + w), WIDEN)
+        yp = _bf16(xp * r * (1.0 + wp), WIDEN)  # the same bits as y at the partner index
+        rot = d < ROT
+        c = tl.load(cos_row + d, mask=rot, other=0.0).to(tl.float32)
+        s = tl.load(sin_row + d, mask=rot, other=0.0).to(tl.float32)
+        rh = tl.where(d < HALF, -yp, yp)
+        ro = _bf16(_bf16(y * c, WIDEN) + _bf16(rh * s, WIDEN), WIDEN)
+        tl.store(dst + d, tl.where(rot, ro, y).to(tl.bfloat16))
+
+    @triton.jit(do_not_specialize=["page_ptr", "off_ptr"])
+    def _qk_prologue_kernel(
+        q_ptr, k_ptr, v_ptr, SQ, SK, SV, qw_ptr, kw_ptr, eps_q, eps_k, cos_ptr, sin_ptr,
+        page_ptr, off_ptr, kpool_ptr, vpool_ptr, SP_PAGE, SP_HEAD, SP_TOK, qout_ptr, gate_ptr,
+        QH: tl.constexpr, KH: tl.constexpr, D: tl.constexpr, ROT: tl.constexpr, WIDEN: tl.constexpr,
+    ):
+        """Program (row t, head h). h < QH: query head h of the q|gate row (per head [q, gate],
+        2 * D wide): gate copied to ``gate`` [T, QH * D], norm + RoPE of q to ``qout``
+        [T, QH, D]. h >= QH: KV head h - QH: norm + RoPE of k and the copy of v, both written
+        to the row's page slot (``page[t]``, ``offset[t]``) of the pools."""
+        t = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1)
+        d = tl.arange(0, D)
+        cos_row = cos_ptr + t * ROT
+        sin_row = sin_ptr + t * ROT
+        if h < QH:
+            src = q_ptr + t * SQ + h * (2 * D)
+            tl.store(gate_ptr + t * (QH * D) + h * D + d, tl.load(src + D + d))
+            _norm_rope(src, qw_ptr, eps_q, cos_row, sin_row, qout_ptr + (t * QH + h) * D, D, ROT, WIDEN)
+        else:
+            kh = h - QH
+            page = tl.load(page_ptr + t).to(tl.int64)
+            off = tl.load(off_ptr + t).to(tl.int64)
+            dst = page * SP_PAGE + kh * SP_HEAD + off * SP_TOK
+            tl.store(vpool_ptr + dst + d, tl.load(v_ptr + t * SV + kh * D + d))
+            _norm_rope(k_ptr + t * SK + kh * D, kw_ptr, eps_k, cos_row, sin_row, kpool_ptr + dst, D, ROT, WIDEN)
+
+
+# ======================================================================= attention Q/K prologue
+
+
+def qk_fused_enabled() -> bool:
+    """``ENGINE_PREFILL_QK_FUSED`` (plan 56, default on; 0 for the eager ops): a prefill
+    pass's attention Q/K prologue (q/k RMSNorm, RoPE, the q/gate split and the K/V page
+    write) as one launch per layer (``qk_prologue``), with cos/sin built once per pass."""
+    return os.environ.get("ENGINE_PREFILL_QK_FUSED", "1") != "0"
+
+
+def rope_tables(positions: torch.Tensor, inv_freq: torch.Tensor, dtype: torch.dtype):
+    """``FastModel._qkv``'s cos/sin [T, 2 * len(inv_freq)] for ``positions``: the same ops,
+    so the same bits, built once per pass instead of once per attention layer."""
+    freqs = positions.float()[:, None] * inv_freq[None, :]
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def qk_prologue_reference(qg, k, v, heads, q_w, k_w, eps_q, eps_k, cos, sin, k_pool, v_pool, page, offset):
+    """The eager ops ``qk_prologue`` replaces (``FastModel._qkv`` + the page writes)."""
+    tokens = qg.shape[0]
+    dim = q_w.shape[0]
+
+    def rms(x, w, eps):
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        return (xf * (1.0 + w.float())).to(x.dtype)
+
+    def rope(x):
+        rot = cos.shape[-1]
+        c, s = cos[:, None, :], sin[:, None, :]
+        x_rot, x_pass = x[..., :rot], x[..., rot:]
+        half = rot // 2
+        rh = torch.cat((-x_rot[..., half:], x_rot[..., :half]), dim=-1)
+        return torch.cat((x_rot * c + rh * s, x_pass), dim=-1)
+
+    q, gate = torch.chunk(qg.reshape(tokens, heads, 2 * dim), 2, dim=-1)
+    gate = gate.reshape(tokens, -1)
+    q = rope(rms(q, q_w, eps_q))
+    kk = rope(rms(k.reshape(tokens, -1, dim), k_w, eps_k))
+    k_pool[page, :, offset] = kk
+    v_pool[page, :, offset] = v.reshape(tokens, -1, dim)
+    return q, gate
+
+
+def qk_supported(qg, k, v, heads: int, dim: int, cos, k_pool, v_pool) -> bool:
+    pow2 = lambda n: n > 0 and n & (n - 1) == 0  # noqa: E731
+    rot = cos.shape[-1]
+    return (
+        triton is not None
+        and qg.dtype == k.dtype == v.dtype == k_pool.dtype == v_pool.dtype == torch.bfloat16
+        and cos.dtype == torch.bfloat16 and cos.is_contiguous()
+        and pow2(dim) and dim >= 16 and rot % 2 == 0 and 0 < rot <= dim
+        and qg.shape[-1] == 2 * heads * dim
+        and qg.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+        and k_pool.stride() == v_pool.stride() and k_pool.stride(-1) == 1
+        and k_pool.shape[-1] == dim and k.shape[-1] == k_pool.shape[1] * dim
+    )
+
+
+def qk_prologue(qg, k, v, heads, q_w, k_w, eps_q, eps_k, cos, sin, k_pool, v_pool, page, offset):
+    """``qk_prologue_reference`` in one launch: ``qg`` [T, heads * 2 * dim] (per head q then
+    gate), ``k``/``v`` [T, kv_heads * dim] (row-major rows, any row stride, e.g. column views
+    of one merged projection). Writes k (normed, rotated) and v at ``k_pool``/``v_pool``
+    [pages, kv_heads, page, dim] (``page``, ``offset``) per row; returns (q [T, heads, dim],
+    gate [T, heads * dim]). Bitwise as the eager ops except the RMS's fp32 sum order."""
+    tokens = qg.shape[0]
+    dim = q_w.shape[0]
+    kv_heads = k_pool.shape[1]
+    q = torch.empty((tokens, heads, dim), dtype=qg.dtype, device=qg.device)
+    gate = torch.empty((tokens, heads * dim), dtype=qg.dtype, device=qg.device)
+    if tokens == 0:
+        return q, gate
+    with on_device(qg):
+        _qk_prologue_kernel[(tokens, heads + kv_heads)](
+            qg, k, v, qg.stride(0), k.stride(0), v.stride(0), q_w, k_w, float(eps_q), float(eps_k),
+            cos, sin, page, offset, k_pool, v_pool, k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+            q, gate, QH=heads, KH=kv_heads, D=dim, ROT=cos.shape[-1], WIDEN=_WIDEN,
+            num_warps=2 if dim >= 128 else 1,
+        )
+    return q, gate
+
 
 # ================================================================================ attention
 
@@ -591,9 +726,7 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int, merged: bool = False)
     y = torch.empty_like(x)
     block = min(1024, triton.next_power_of_2(hidden))
     with on_device(x):
-        moe_prefill._tiles_kernel[(triton.cdiv(max_tiles, moe_prefill.TILE_BLOCK),)](
-            counts, starts, cursor, table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=moe_prefill.TILE_BLOCK,
-        )
+        moe_prefill.build_tiles(counts, starts, cursor, table, max_tiles, bm)
         _expert_order_kernel[(triton.cdiv(pairs, 1024),)](top_i, cursor, order, pairs, BLOCK=1024)
         moe_prefill._gate_up_kernel[(max_tiles, triton.cdiv(inter, bn1))](
             x, gate_up, order, table, act_r, gate_up.stride(0), gate_up.stride(1), max_tiles,

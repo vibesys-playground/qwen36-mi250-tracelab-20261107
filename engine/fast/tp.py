@@ -56,7 +56,7 @@ import torch
 from torch.nn import functional as F
 
 from engine import cpu_place, looptimers
-from engine.fast import kernels
+from engine.fast import kernels, mfma
 from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
@@ -98,6 +98,11 @@ GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
 # ops (cast, argmax, gather, zeros, 2 stores, add, all-reduce, where, long): a max and the first
 # index of it do not depend on the order of the scan.
 GLUE_ARGMAX = os.environ.get("ENGINE_GLUE_ARGMAX", "1") == "1"
+# Plan 51 (ENGINE_AR_KSUM=1, default on): in a captured graph, the fp32 K-split sum of the
+# out_proj / o_proj GEMV (``mfma._ksum_kernel``) runs in the prologue of the all-reduce that
+# consumes it (``_ll_allreduce_kernel`` with KSPLIT > 1): the same fp32 additions in part order
+# and the same BF16 rounding, so bitwise the two launches it replaces.
+AR_KSUM = os.environ.get("ENGINE_AR_KSUM", "1") == "1"
 ARGMAX_BLOCK = 8192
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)
@@ -113,17 +118,34 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=["NW"])
     def _ll_allreduce_kernel(
-        x_ptr, res_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr, NW, CAP,
+        x_ptr, res_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr, NW, CAP, part_ptr, N,
         CHUNK: tl.constexpr, BF16: tl.constexpr, RES: tl.constexpr, MAXIT: tl.constexpr,
+        KSPLIT: tl.constexpr, BM: tl.constexpr,
     ):
         """out = [res +] (x_self + x_peer) over 32-bit words of BF16 pairs or fp32 values,
-        rounded as ``bf16(fp32(a) + fp32(b))`` (then ``bf16(res + that)``); see the module doc."""
+        rounded as ``bf16(fp32(a) + fp32(b))`` (then ``bf16(res + that)``); see the module doc.
+        With KSPLIT > 1 (BF16, plan 51) x_self is first built from a K-split GEMV's fp32 parts
+        (``mfma.KParts``: ``part[(p BM + r) N + n]``) as ``mfma._ksum_kernel`` builds it:
+        summed in part order, rounded to BF16."""
         p = tl.program_id(0)
         e = tl.load(epoch_ptr + p) + 1
         buf = (e % 2).to(tl.int64) * CAP
         offs = p * CHUNK + tl.arange(0, CHUNK)
         m = offs < NW
-        xi = tl.load(x_ptr + offs, mask=m, other=0)
+        if KSPLIT > 1:
+            el = offs * 2  # the word's two BF16 values: row r, columns c and c + 1 (N even)
+            r = el // N
+            c = el % N
+            lo_ptr = part_ptr + r * N + c
+            s0 = tl.load(lo_ptr, mask=m, other=0.0)
+            s1 = tl.load(lo_ptr + 1, mask=m, other=0.0)
+            for kp in tl.static_range(1, KSPLIT):
+                s0 += tl.load(lo_ptr + kp * BM * N, mask=m, other=0.0)
+                s1 += tl.load(lo_ptr + kp * BM * N + 1, mask=m, other=0.0)
+            xi = ((s0.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF)
+                  | (s1.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) << 16))
+        else:
+            xi = tl.load(x_ptr + offs, mask=m, other=0)
         word = (e.to(tl.int64) << 32) | (xi.to(tl.int64) & 0xFFFFFFFF)
         tl.store(recv_peer + buf + offs, word, mask=m, cache_modifier=".wt")
         src = recv_local + buf + offs
@@ -335,6 +357,11 @@ class _LL:
             for dtype, residual in ((torch.bfloat16, False), (torch.bfloat16, True), (torch.float32, False)):
                 x = torch.zeros((1, 256), dtype=dtype, device=dev)
                 self._launch(rank, x, x if residual else None, loop=True)
+            if AR_KSUM:  # plan 51: the K-sum prologue for every K split of the GEMV table
+                for ksplit in sorted({mfma.tiles_for(n, k)[3] for n, k in mfma.TILES} - {1}):
+                    x = torch.zeros((1, 256), dtype=torch.bfloat16, device=dev)
+                    part = torch.zeros((ksplit * mfma.BM * 256,), dtype=torch.float32, device=dev)
+                    self._launch(rank, mfma.KParts(part, x, ksplit), None, loop=True)
             torch.cuda.synchronize(dev)
 
     def _fine(self, dev: torch.device, nbytes: int) -> _Raw:
@@ -351,14 +378,26 @@ class _LL:
         torch.cuda.set_device(self.devices[0])
         return _Raw(ptr.value, torch.int64)
 
-    def _launch(self, rank: int, x: torch.Tensor, residual: torch.Tensor | None,
+    def _launch(self, rank: int, x, residual: torch.Tensor | None,
                 loop: bool = False) -> torch.Tensor:
-        x = x.contiguous()
+        """``x`` a tensor, or ``mfma.KParts`` (plan 51: the K-sum in the prologue; the result
+        is written to its ``out``)."""
+        ksplit, part, n = 1, None, 1
+        if isinstance(x, mfma.KParts):
+            ksplit, part, n = x.ksplit, x.part, x.out.shape[-1]
+            x = x.out
+            if x.dtype != torch.bfloat16 or x.dim() != 2 or n % 2 or not x.is_contiguous():
+                raise ValueError(f"K-sum all-reduce of {tuple(x.shape)} {x.dtype} is not supported")
+            out = x
+        else:
+            x = x.contiguous()
+            out = None
         nbytes = x.numel() * x.element_size()
         nw = nbytes // 4
         if nbytes % 4 or nw > CAPACITY or x.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError(f"all-reduce of {tuple(x.shape)} {x.dtype} is not supported in a graph")
-        out = torch.empty_like(x)
+        if out is None:
+            out = torch.empty_like(x)
         res = residual.contiguous() if residual is not None else x
         if residual is not None and (res.dtype != x.dtype or res.shape != x.shape):
             raise ValueError("the residual must match the all-reduced tensor")
@@ -369,8 +408,9 @@ class _LL:
             _ll_allreduce_kernel[(triton.cdiv(nw, CHUNK),)](
                 x.view(-1).view(torch.int32), res.view(-1).view(torch.int32),
                 out.view(-1).view(torch.int32), local, peer, epoch, self.err[rank], nw, CAPACITY,
+                part if part is not None else x, n,
                 CHUNK=CHUNK, BF16=x.dtype == torch.bfloat16, RES=residual is not None,
-                MAXIT=MAXIT, num_warps=1,
+                MAXIT=MAXIT, KSPLIT=ksplit, BM=mfma.BM, num_warps=1,
             )
         return out
 
@@ -469,7 +509,13 @@ class Group:
 
     def allreduce(self, rank: int, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         """``[residual +] (x_rank0 + x_rank1)``, the sum in fp32 rounded to ``x``'s dtype; the
-        same bits on both ranks."""
+        same bits on both ranks. ``x`` may be ``mfma.KParts`` (plan 51): in a captured graph
+        its K-sum runs in the all-reduce's prologue, elsewhere first by ``_ksum_kernel``."""
+        if isinstance(x, mfma.KParts):
+            if (not self.solo and x.is_cuda and torch.cuda.is_current_stream_capturing()
+                    and self.ll is not None):
+                return self.ll._launch(rank, x, residual)
+            x = x.materialize()
         x = x.contiguous()
         if self.solo:
             return x if residual is None else residual + x

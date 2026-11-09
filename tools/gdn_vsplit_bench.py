@@ -23,6 +23,13 @@ as ``FastModel`` allocates it; state row of slot s, ring entry j: ``s + j * 9``.
    shape (read the slice, write G ring rows, no math);  empty: 30 empty launches.
 Prints ``RESULT`` lines and the plan's kill rule at the end. A hint for the plan, not the
 task's metric.
+
+Step 0 (j229, MI210 gfx90a 104 CUs, real weights of 30 layers), ms per 30 layers at 2 slots x
+4 rows: today 1.324; best v-split + N1 1.111 (C64w4; C32w4 with a plain-layout norm 1.024);
+hoist-only BV=128 1.217; state-streaming ceiling 0.245 (split) / 0.317 (today's shape); 30
+empty launches 0.053. 1 slot x 4 rows: 1.286 -> 0.877 (0.800 plain-layout norm). Norm folded
+into out_proj (N2) saved <= 0.08 ms over today's kernels + out_proj. States not bitwise
+(max rel 3e-7, reduction order over DK), conv rings bitwise. Kill (< 0.4 ms at 2 x 4).
 """
 
 from __future__ import annotations

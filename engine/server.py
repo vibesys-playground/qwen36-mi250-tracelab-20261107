@@ -34,8 +34,15 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import cpu_place, experts, looptimers, protocol, router, speculative
-from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
+from engine import cpu_place, experts, looptimers, protocol, reqstamps, router, speculative
+from engine.generator import (
+    CHECKPOINT,
+    REQ_FAST,
+    Generation,
+    Generator,
+    PackedPrefill,
+    Step,
+)
 from engine.protocol import (
     ChatRequest,
     CompletionRequest,
@@ -76,6 +83,8 @@ class Job:
     run: Callable[[], Iterator[dict[str, Any] | AwaitDecode]]
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    # Plan 46: ``engine.reqstamps`` stage stamps, with ENGINE_REQ_STAMPS=1 only.
+    stamps: dict[str, float] | None = None
 
 
 def _internal(exc: Exception) -> RequestError:
@@ -113,6 +122,8 @@ class Worker:
                     break
                 if isinstance(event, (AwaitDecode, Prefill)):
                     return event
+                if job.stamps is not None and "emitted" not in job.stamps:
+                    job.stamps["emitted"] = reqstamps.now()
                 if looptimers.ENABLED:
                     t = looptimers.now()
                     job.events.put(event)
@@ -162,6 +173,7 @@ class Worker:
                 arrivals = 0
                 prefilled = False
             block = not running and not prefilling
+            arrived: list[dict[str, float]] = []
             ready: list[tuple[Job, Iterator[Any], Generation]] = []
             serial: list[tuple[Job, Iterator[Any], Prefill]] = []
             while True:
@@ -172,22 +184,35 @@ class Worker:
                 block = False
                 if timed:
                     arrivals += 1
+                stamps = job.stamps
+                if stamps is not None:
+                    stamps["picked"] = reqstamps.now()
+                    arrived.append(stamps)
                 events = job.run()
                 want = self._advance(job, events)
                 if not isinstance(want, Prefill):
                     if want is not None:  # a job that decodes before its prefill: not ours
                         self._fail(job, events, RuntimeError("job decoded before its prefill"))
                     continue
+                if stamps is not None:
+                    stamps["prefill_req"] = reqstamps.now()
                 if packer is None:
                     serial.append((job, events, want))
                 else:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
+                    if stamps is not None:
+                        stamps["added"] = reqstamps.now()
+                        stamps["lookup"] = reqstamps.last_lookup
             if speculative.pending(g) and (
                 serial or prefilling or ready_pending(packer)
                 or any(job.cancelled.is_set() for job, _ in running)
             ):
                 # Plan 42: the batch is about to change; finish the step launched ahead first.
                 speculative.drain(g)
+            if arrived:
+                t = reqstamps.now()
+                for stamps in arrived:
+                    stamps["drained"] = t
             if timed:
                 t = T.now()
                 T.add("poll", t - t_mark)
@@ -196,8 +221,15 @@ class Worker:
                 for ticket, exc in packer.failed():
                     self._fail(*prefilling.pop(ticket), exc)
                 if packer.busy:
+                    if reqstamps.ENABLED:
+                        t = reqstamps.now()
+                        for job, _ in prefilling.values():
+                            if job.stamps is not None:
+                                job.stamps.setdefault("pass0", t)
                     for ticket, result in packer.step():
                         job, events = prefilling.pop(ticket)
+                        if job.stamps is not None:
+                            job.stamps["pass1"] = reqstamps.now()
                         if isinstance(result, Exception):
                             self._fail(job, events, result)
                         else:
@@ -348,12 +380,21 @@ def _run(
 
 
 def completion_job(
-    generator: Generator, model: str, request: CompletionRequest
+    generator: Generator,
+    model: str,
+    request: CompletionRequest,
+    prompt: tuple[int, ...] | None = None,
 ) -> Iterator[dict[str, Any] | AwaitDecode]:
-    """Events for ``/v1/completions``: chunks when streaming, else one response."""
-    prompt = (
-        generator.encode_text(request.prompt) if isinstance(request.prompt, str) else request.prompt
-    )
+    """Events for ``/v1/completions``: chunks when streaming, else one response.
+
+    ``prompt`` is the request's prompt already tokenized (by the handler thread); else the
+    job tokenizes it here, on the engine thread."""
+    if prompt is None:
+        prompt = (
+            generator.encode_text(request.prompt)
+            if isinstance(request.prompt, str)
+            else request.prompt
+        )
     generation = yield Prefill(prompt, request.sampling)
     env = Envelope(model=model, kind="text_completion")
     usage = Usage(prompt_tokens=len(prompt), cached_tokens=generation.cached_tokens)
@@ -462,7 +503,13 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
             self._send_json(
-                200, {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
+                200,
+                {
+                    "status": "ok",
+                    **self.server.generator.stats(),
+                    **looptimers.summary(),
+                    **reqstamps.summary(),
+                },
             )
         elif self.path == "/v1/models":
             card = {
@@ -484,6 +531,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, protocol.error_body(f"no route {self.path}", 404))
             return
         parse, job_of = routes[self.path]
+        stamps = None
+        if reqstamps.ENABLED:
+            stamps = {"handler": reqstamps.now()}
+            sent = self.headers.get("X-Engine-Sent")
+            if sent:
+                stamps["sent"] = float(sent)
         try:
             length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"null")
@@ -496,7 +549,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(exc.status, protocol.error_body(str(exc), exc.status))
             return
         generator, model = self.server.generator, self.server.model_name
-        job = Job(run=lambda: job_of(generator, model, request))
+        if stamps is not None:
+            stamps["parsed"] = reqstamps.now()
+        if job_of is completion_job and REQ_FAST and isinstance(request.prompt, str):
+            # Plan 46: tokenize here, off the engine thread (incrementally, exactly).
+            try:
+                ids = generator.encode_text(request.prompt)
+            except Exception as exc:  # noqa: BLE001
+                error = _internal(exc)
+                self._send_json(error.status, protocol.error_body(str(error), error.status))
+                return
+            if stamps is not None:
+                stamps["tokenized"] = reqstamps.now()
+            job = Job(run=lambda: completion_job(generator, model, request, ids), stamps=stamps)
+        else:
+            job = Job(run=lambda: job_of(generator, model, request), stamps=stamps)
+        if stamps is not None:
+            stamps["submitted"] = reqstamps.now()
         self.server.worker.submit(job)
         self._respond(job, stream=request.stream)
 
@@ -525,6 +594,9 @@ class _Handler(BaseHTTPRequestHandler):
                     payload = event
                 self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
                 self.wfile.flush()
+                if job.stamps is not None and "written" not in job.stamps:
+                    job.stamps["written"] = reqstamps.now()
+                    reqstamps.record_request(job.stamps)
                 event = job.events.get()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -642,6 +714,11 @@ def main(argv: list[str] | None = None) -> None:
         experts_impl=args.experts_implementation,
     )
     server = _Server((args.host, args.port), generator, args.served_model_name or args.model)
+    switch_us = os.environ.get("ENGINE_SWITCH_INTERVAL_US", "").strip()
+    if switch_us:
+        # Plan 46 probe: a shorter GIL switch interval, so an HTTP handler thread waiting for
+        # the GIL gets it sooner from the engine thread (and the other way round).
+        sys.setswitchinterval(float(switch_us) * 1e-6)
     if gpus:
         per_gpu = ", ".join(
             f"{d}: {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(gpus)

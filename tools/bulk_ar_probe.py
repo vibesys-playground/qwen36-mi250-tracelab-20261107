@@ -338,6 +338,10 @@ def isa_excerpt(k, label: str) -> None:
         lo = max(0, i - 25)
         body = [ln for ln in lines[lo:i + 3] if ln and not ln.startswith(";") and not ln.startswith(".")]
         print(f"RESULT isa {label} before the flag swap: " + " | ".join(body))
+    if idx:
+        first = next((i for i, ln in enumerate(lines) if ln.startswith("global_load")), 0)
+        seg = [ln for ln in lines[first:idx[0]] if ln.startswith(("global_", "buffer_", "s_waitcnt", "s_barrier"))]
+        print(f"RESULT isa {label} memory ops from the first load to the flag swap: " + " | ".join(seg)[:3000])
     stores = sum(1 for ln in lines if ln.startswith("global_store_dwordx4") or ln.startswith("buffer_store_dwordx4"))
     sstore = sum(1 for ln in lines if ln.startswith("global_store_dword ") or ln.startswith("buffer_store_dword "))
     print(f"RESULT isa {label} dwordx4 stores={stores} dword stores={sstore}")
@@ -438,11 +442,10 @@ def child(args) -> int:
                 if rows == 1792 and (best1792 is None or us < best1792[0]):
                     best1792 = (us, bw, warps)
                 del g
-            ref = (xs[0].float() + xs[1].float()).bfloat16()
+            ref0 = (xs[0].float() + xs[1].to(devs[0]).float()).bfloat16()
+            ref = [ref0, ref0.to(devs[1])]
             if residual:
-                ref = [(rs[r].float() + ref.float()).bfloat16() for r in (0, 1)]
-            else:
-                ref = [ref, ref]
+                ref = [(rs[r].float() + ref[r].float()).bfloat16() for r in (0, 1)]
             okref = all(torch.equal(outs["ll"][r].view(torch.int16), ref[r].view(torch.int16)) for r in (0, 1))
             print(f"RESULT ll_vs_torch rows={rows} res={int(residual)} bitwise={okref}", flush=True)
             torch.cuda.empty_cache()

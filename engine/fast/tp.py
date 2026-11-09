@@ -111,8 +111,8 @@ ARGMAX_BLOCK = 8192
 # fp32 stay on LL. BULK_BW words per one-CTA chunk, BULK_WARPS waves per CTA.
 BULK_AR = os.environ.get("ENGINE_TP_BULK_AR", "1") == "1" and PREFILL_GRAPH
 BULK_MIN_WORDS = int(os.environ.get("ENGINE_TP_BULK_MIN_WORDS", str(512 * 1024)))
-BULK_BW = int(os.environ.get("ENGINE_TP_BULK_BW", "4096"))
-BULK_WARPS = int(os.environ.get("ENGINE_TP_BULK_WARPS", "1"))
+BULK_BW = int(os.environ.get("ENGINE_TP_BULK_BW", "8192"))
+BULK_WARPS = int(os.environ.get("ENGINE_TP_BULK_WARPS", "8"))
 BULK_CAP = max(PG_BUCKETS) * 1024  # words per parity buffer: the largest bucket's BF16 rows
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)

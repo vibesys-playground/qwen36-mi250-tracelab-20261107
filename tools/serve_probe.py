@@ -95,7 +95,8 @@ def session(url: str, pool: list[int], index: int, args) -> list[dict]:
     offset = (index * stride) % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
     prompt = fresh[: args.first]
-    if args.text:  # as the replay: text prompts, the next one = prompt + output text + new text
+    text_mode = getattr(args, "text", False)
+    if text_mode:  # as the replay: text prompts, the next one = prompt + output text + new text
         prompt = DECODE(prompt)
     used = args.first
     out = []
@@ -113,7 +114,7 @@ def session(url: str, pool: list[int], index: int, args) -> list[dict]:
         assert len(res["ids"]) == args.max_new, (len(res["ids"]), args.max_new)
         res["key"] = f"s{index}r{r}"
         out.append(res)
-        if args.text:
+        if text_mode:
             prompt = prompt + res["text"] + DECODE(fresh[used : used + args.grow])
         else:
             prompt = prompt + res["ids"] + fresh[used : used + args.grow]

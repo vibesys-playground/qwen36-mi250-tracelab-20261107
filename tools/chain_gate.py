@@ -73,6 +73,7 @@ def main() -> None:
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--chunk", type=int, default=2048)
     parser.add_argument("--today", default=None, help="spec_step_bench RESULT lines, chain off")
+    parser.add_argument("--skip-accept", action="store_true", help="step times only")
     parser.add_argument("--baseline-ms", type=float, default=None,
                         help="a k=1 verify B=2 step time given by the lead (another commit)")
     parser.add_argument("--ks", default="1,3,7", help="drafts per slot to run (<= ENGINE_SPEC_KMAX)")
@@ -168,6 +169,26 @@ def main() -> None:
             logits = fast.prefill(slot, prompt[begin:end], begin, follow)
         return logits
 
+    rank_models = list(fast.ranks) if hasattr(fast, "ranks") else [fast]
+
+    def ivf_stats() -> list[list[int]] | None:
+        """Plan 47's IVF draft counters per rank: (drafts, drafts on the full pass, audited
+        drafts, audited drafts unlike the full pass), or None."""
+        if getattr(r0, "ivf", None) is None:
+            return None
+        sync()
+        return [[int(v) for v in m.ivf.stats.tolist()] for m in rank_models]
+
+    def ivf_delta(before):
+        now = ivf_stats()
+        if before is None or now is None:
+            return None
+        d = [[a - b for a, b in zip(n_, b_, strict=True)] for n_, b_ in zip(now, before, strict=True)]
+        res = {"drafts": d[0][0], "fallback_rate": [round(r[1] / max(1, r[0]), 4) for r in d]}
+        if any(r[2] for r in d):
+            res["audit_unlike"] = [f"{r[3]}/{r[2]}" for r in d]
+        return res
+
     # ------------------------------------------------------------ 2. step time
     step_ms: dict[tuple[int, int], float] = {}
     for nslots in SLOTS:
@@ -186,6 +207,7 @@ def main() -> None:
                 fn = lambda: fast.verify_chain(lasts, drafts, slots, [length] * nslots)  # noqa: E731
                 for _ in range(3):
                     fn()
+                st0 = ivf_stats()
                 times = []
                 for _ in range(args.iters):
                     sync()
@@ -198,7 +220,7 @@ def main() -> None:
                 out("step", k=k, slots=nslots, rows=nslots * (k + 1),
                     verify_chain_ms=round(step_ms[(nslots, k)], 3),
                     p10=round(times[len(times) // 10], 3), p90=round(times[(9 * len(times)) // 10], 3),
-                    n=len(times), graph_error=fast.graph_error)
+                    n=len(times), graph_error=fast.graph_error, ivf=ivf_delta(st0))
             except Exception:  # noqa: BLE001
                 out("error", what=f"step k={k} slots={nslots}",
                     error=traceback.format_exc().replace("\n", " | ")[-1500:])
@@ -213,6 +235,10 @@ def main() -> None:
                     ms_per_extra_draft=round(d / (k - prev), 3))
             if (nslots, k) in step_ms:
                 prev = k
+
+    if args.skip_accept:
+        out("done", seconds=round(time.perf_counter() - started))
+        return
 
     # ------------------------------------------------------------ 3. acceptance and parity
     groups = {
@@ -270,6 +296,7 @@ def main() -> None:
                 same = 0
                 proposed = accepted = 0
                 set_walls: list[tuple[int, int, float]] = []
+                st_set = ivf_stats()
                 key = (nslots, kname, name)
                 for p0 in range(0, 2 * args.pairs, nslots):
                     idx = list(range(p0, min(p0 + nslots, 2 * args.pairs)))
@@ -330,7 +357,7 @@ def main() -> None:
                     p_j=p_j, depth_n=[depth_n.get(key + (j,), 0) for j in range(1, max(KS) + 1) if depth_n.get(key + (j,))],
                     slot_steps=tot_steps, tokens_per_slot_step=round(e, 3),
                     drafts_checked=proposed, drafts_accepted=accepted,
-                    per_draft_rate=round(accepted / max(1, proposed), 4))
+                    per_draft_rate=round(accepted / max(1, proposed), 4), ivf=ivf_delta(st_set))
                 by: dict = {}
                 for kk, rows_, w_ in set_walls:
                     by.setdefault((kk, rows_), []).append(w_)

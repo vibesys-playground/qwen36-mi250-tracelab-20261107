@@ -293,6 +293,9 @@ class HostChannel:
                 hip.check(hip.lib.hipHostRegister(self.host.data_ptr(), nbytes, 1), "hipHostRegister")
                 self.pinned = True
             except RuntimeError as exc:  # still correct, only slower (pageable copies)
+                # HIP 7 keeps a failed call's error as the thread's last error, which torch's
+                # launch check would raise at the next kernel (as tp.py's peer-access 704).
+                hip.lib.hipGetLastError()
                 if not pinned_optional:
                     raise
                 self.pin_error = str(exc)
@@ -461,7 +464,10 @@ class IpcImport:
                 # hipIpcMemLazyEnablePeerAccess, then no flags
                 code = self.hip.lib.hipIpcOpenMemHandle(ctypes.byref(ptr), handle, 1)
                 if code != 0:
+                    self.hip.lib.hipGetLastError()  # not sticky under HIP 7 (see HostChannel)
                     code = self.hip.lib.hipIpcOpenMemHandle(ctypes.byref(ptr), handle, 0)
+                    if code != 0:
+                        self.hip.lib.hipGetLastError()
                 self.hip.check(code, f"hipIpcOpenMemHandle on {dev}")
             self._ptrs.append(ptr.value)
 

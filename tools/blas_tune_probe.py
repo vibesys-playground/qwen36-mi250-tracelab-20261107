@@ -80,7 +80,7 @@ def _untuned(out: Path) -> list[tuple[str, str]]:
 
 INNER = r"""
 import sys, time, torch
-part, res = sys.argv[1], sys.argv[2]
+part, res, budget = sys.argv[1], sys.argv[2], float(sys.argv[3])
 tunable = torch.cuda.tunable
 tunable.set_filename(res, False)
 tunable.write_file_on_exit(False)
@@ -88,11 +88,22 @@ tunable.enable(True)
 tunable.tuning_enable(True)
 tunable.record_untuned_enable(False)
 t = time.perf_counter()
-tunable.tune_gemm_in_file(part)
-tunable.write_file(res)
-print(f"RESULT tune_part {part} solutions={len(tunable.get_results())} s={time.perf_counter() - t:.0f}", flush=True)
+lines = [l for l in open(part).read().splitlines() if l.strip()]
+one = part + ".one"
+done = 0
+for line in lines:
+    if time.perf_counter() - t > budget:
+        print(f"RESULT tune_part {part} budget hit after {done}/{len(lines)}", flush=True)
+        break
+    open(one, "w").write(line + "\n")
+    s = time.perf_counter()
+    tunable.tune_gemm_in_file(one)
+    tunable.write_file(res)  # after every shape: a timeout keeps what was tuned
+    done += 1
+    print(f"tuned {line.split(',')[1]} in {time.perf_counter() - s:.1f}s", flush=True)
+print(f"RESULT tune_part {part} shapes={done}/{len(lines)} solutions={len(tunable.get_results())} "
+      f"s={time.perf_counter() - t:.0f}", flush=True)
 """
-
 
 def tune(args) -> int:
     out = Path(args.dir)
@@ -113,7 +124,8 @@ def tune(args) -> int:
         if rf.exists():
             rf.unlink()
         env = dict(env0, HIP_VISIBLE_DEVICES=g)
-        procs.append((g, rf, subprocess.Popen([sys.executable, "-u", "-c", INNER, str(pf), str(rf)], cwd=ROOT, env=env)))
+        procs.append((g, rf, subprocess.Popen([sys.executable, "-u", "-c", INNER, str(pf), str(rf),
+                                                       str(args.timeout - 120)], cwd=ROOT, env=env)))
     bad = 0
     for g, rf, p in procs:
         try:

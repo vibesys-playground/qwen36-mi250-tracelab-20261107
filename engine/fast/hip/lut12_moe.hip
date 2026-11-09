@@ -123,6 +123,14 @@ __device__ __forceinline__ void ld_x8(const u16* __restrict__ p, f2 x[4]) {
     r.v = *reinterpret_cast<const uint4*>(p);
     cvt(r, x, nullptr, 0);
 }
+// 8 BF16 at any 2-byte alignment (router rows are N3 = 769 elements apart).
+__device__ __forceinline__ void ld_x8_u(const u16* __restrict__ p, f2 x[4]) {
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        x[i].x = __uint_as_float((u32)p[2 * i] << 16);
+        x[i].y = __uint_as_float((u32)p[2 * i + 1] << 16);
+    }
+}
 __device__ __forceinline__ float dot8(const f2 w[4], const f2 x[4]) {
     f2 a = w[0] * x[0];
     a = __builtin_elementwise_fma(w[1], x[1], a);
@@ -185,7 +193,9 @@ __device__ __forceinline__ bool expert_pairs(const int* __restrict__ idx, int P,
 
 // ------------------------------------------------------------------ gate_up
 #define NTILE_UP (I / NT)
+#ifndef UN
 #define UN 2  // n rows loaded ahead
+#endif
 
 template <bool PK>
 __device__ __forceinline__ void moe_up(const u16* __restrict__ h, const int* __restrict__ idx,
@@ -283,8 +293,8 @@ __device__ __forceinline__ void moe_down(
     }
     {
         f2 g[4], u[4];
-        ld_x8(r + (size_t)row * N3 + E + k, g);
-        ld_x8(r + (size_t)row * N3 + E + IS + k, u);
+        ld_x8_u(r + (size_t)row * N3 + E + k, g);
+        ld_x8_u(r + (size_t)row * N3 + E + IS + k, u);
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             sa[i].x = bf16r(bf16r(g[i].x * sigm(g[i].x)) * u[i].x);

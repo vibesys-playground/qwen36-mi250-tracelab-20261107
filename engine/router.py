@@ -40,7 +40,7 @@ still holds the state; the target's copy is then dropped. A replica runs at
 most one move out and one move in at a time. Cached tokens reported for a moved
 session's next round are the imported state the target actually reuses.
 
-Two-holder sessions (plan 70, ``ENGINE_TWO_HOLDER``). Each round's saved state is
+Two-holder sessions (plan 70, ``ENGINE_TWO_HOLDER``, on by default). Each round's saved state is
 also copied, during the tool wait that follows the round, to one buddy replica
 (the session's other previous holder, else the least-loaded other replica), with
 the same export/import as a live move but the source keeps its copy. Every
@@ -705,8 +705,8 @@ def migrate_enabled() -> bool:
 
 
 def two_holder_enabled() -> bool:
-    """``ENGINE_TWO_HOLDER``: keep each session's state on two replicas (plan 70)."""
-    return os.environ.get("ENGINE_TWO_HOLDER", "0").strip() not in ("", "0")
+    """``ENGINE_TWO_HOLDER``: keep each session's state on two replicas (plan 70, default on)."""
+    return os.environ.get("ENGINE_TWO_HOLDER", "1").strip() != "0"
 
 
 def _memfd(name: str) -> int:

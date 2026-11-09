@@ -388,7 +388,7 @@ def test_a_moved_session_continues_token_for_token(tmp_path: Path) -> None:
     to the other replica; outputs and cached tokens match a front that never moves."""
     checkpoint = tmp_path / "tiny"
     write_checkpoint(checkpoint)
-    common = {"ENGINE_FAST": "1", "ENGINE_MIGRATE_WAIT_MS": "20000"}
+    common = {"ENGINE_FAST": "1", "ENGINE_MIGRATE_WAIT_MS": "20000", "ENGINE_TWO_HOLDER": "0"}
     runs = {}
     for name, env in (("off", {"ENGINE_MIGRATE": "0"}),
                       ("on", {"ENGINE_MIGRATE": "1", "ENGINE_MIGRATE_GAP": "0"})):

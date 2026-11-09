@@ -424,9 +424,14 @@ def real(args) -> None:
             for cfg in CONFIGS:
                 for pk in (False, True):
                     m = "hip-pk" if pk else "hip-raw"
-                    u = mdb.time_us([lambda s=s: hip_up(s, pk, cfg) for s in sets])
-                    d = mdb.time_us([lambda s=s: hip_dn(s, pk, cfg) for s in sets])
-                    ud = mdb.time_us([lambda s=s: (hip_up(s, pk, cfg), hip_dn(s, pk, cfg)) for s in sets])
+                    try:
+                        u = mdb.time_us([lambda s=s: hip_up(s, pk, cfg) for s in sets])
+                        d = mdb.time_us([lambda s=s: hip_dn(s, pk, cfg) for s in sets])
+                        ud = mdb.time_us([lambda s=s: (hip_up(s, pk, cfg), hip_dn(s, pk, cfg)) for s in sets])
+                    except Exception as exc:  # noqa: BLE001
+                        out(f"RESULT time R={R} method={m} cfg={cfg} failed: {exc!r}")
+                        summary[(R, m, cfg)] = float("inf")
+                        continue
                     b = pk_bytes if pk else raw_bytes
                     out(f"RESULT time R={R} method={m} cfg={cfg}{CONFIGS[cfg]} up_us={u:.1f} dn_us={d:.1f} "
                         f"updn_us={ud:.1f} x_triton={ud / t_ud:.3f} up_x={u / t_up:.3f} dn_x={d / t_dn:.3f} "
@@ -446,28 +451,31 @@ def real(args) -> None:
             hp.up(True, s.h, idx2, L.pg.planes, L.pg.side, act2, s.R)
             tri_dn(s, act=act2, outt=out2)
 
-        chain()
-        torch.cuda.synchronize()
-        eager = out2.clone()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            chain()
-        for buf in (idx2, act2, out2):
-            buf.zero_()
-        wt2.zero_()
-        torch.cuda.synchronize()
-        graph.replay()
-        torch.cuda.synchronize()
-        cap_ok = torch.equal(out2, eager)
-        nodes = None
         try:
-            nodes = graph.raw_cuda_graph() if hasattr(graph, "raw_cuda_graph") else None
-        except Exception:  # noqa: BLE001
+            chain()
+            torch.cuda.synchronize()
+            eager = out2.clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                chain()
+            for buf in (idx2, act2, out2):
+                buf.zero_()
+            wt2.zero_()
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+            cap_ok = torch.equal(out2, eager)
             nodes = None
-        out(f"RESULT graph_capture mixed(triton topk -> hipRTC up -> triton down) replay_equals_eager={cap_ok} "
-            f"out_nonzero={bool(out2.abs().sum() > 0)} raw_graph={nodes is not None}")
+            try:
+                nodes = graph.raw_cuda_graph() if hasattr(graph, "raw_cuda_graph") else None
+            except Exception:  # noqa: BLE001
+                nodes = None
+            out(f"RESULT graph_capture mixed(triton topk -> hipRTC up -> triton down) replay_equals_eager={cap_ok} "
+                f"out_nonzero={bool(out2.abs().sum() > 0)} raw_graph={nodes is not None}")
+        except Exception as exc:  # noqa: BLE001
+            out(f"RESULT graph_capture failed: {exc!r}")
 
         # ---- verdict
         best = {}

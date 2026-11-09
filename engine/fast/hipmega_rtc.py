@@ -152,6 +152,10 @@ class Function:
         self.handle, self.name, self.device = handle, name, device
 
     def _current(self) -> None:
+        if torch.cuda.current_device() == self.device.index:
+            cur = ctypes.c_int(-1)
+            if hip().hipGetDevice(ctypes.byref(cur)) == 0 and cur.value == self.device.index:
+                return
         torch.cuda.set_device(self.device)
         check(hip().hipSetDevice(self.device.index), "hipSetDevice")
 

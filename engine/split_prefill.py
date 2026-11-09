@@ -24,7 +24,8 @@ last token come from the helper. The helper's slot is a reserved one, reset afte
 Scheduling: each pair's worker thread runs its loop iterations as turns of its ``Gate``. An
 owner borrows the other pair only between that pair's turns: it waits for the helper's current
 turn (a decode step) to end rather than preempting it, and does not split when the helper is in
-a prefill pass. One split runs per process at a time (``Splitter``'s token), so a pair is never
+a prefill pass. A verify step the helper launched ahead (plan 42's run-ahead) is collected
+(``speculative.drain``) before the helper is used. One split runs per process at a time (``Splitter``'s token), so a pair is never
 booked by two owners, and two pairs that want each other at once cannot deadlock: the one that
 does not get the token runs its pass unsplit.
 
@@ -41,6 +42,8 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+
+from engine import speculative
 
 PAGE = 64  # engine.fast.model.PAGE (checked when a Pair is made)
 
@@ -274,6 +277,7 @@ class Pair:
         self.gate = gate
         self.chains = Chains(tp)
         self.slot = tp.slots - 1  # reserved: the slot this pair computes a helper half in
+        self.generator: Any = None  # the pair's Generator (set by engine.pair_host)
         self.splits_owned = 0
         self.splits_helped = 0
         self.split_ms = 0.0
@@ -346,6 +350,11 @@ class Splitter:
             if helper is None or not helper.gate.borrow():
                 return None
             try:
+                # Plan 42: a verify step either pair launched ahead is collected before the
+                # pair is used (the owner's worker has drained already before its prefill).
+                for p in (owner, helper):
+                    if p.generator is not None:
+                        speculative.drain(p.generator)
                 try:
                     helper.tp.ranks[0]._ensure_pages(helper.slot, start + len(ids))
                 except RuntimeError:  # the helper's KV cache is full: unsplit

@@ -97,6 +97,8 @@ def capture_fast(fast: Any, head: Any) -> None:
             for size in sorted(fast.buckets, reverse=True):
                 if groups <= mfma.RING and groups * size <= 64 and fast.graph_error is None:
                     fast.capture(size, False, groups)
+        if hasattr(fast, "warm_chain_next") and fast.graph_error is None:
+            fast.warm_chain_next()  # plan 42's run-ahead input kernel
     print(
         f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
         f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "
@@ -841,9 +843,9 @@ class Generator:
                 self._prefix_cache.store(prompt[:end], slot)
         return logits
 
-    def _decode_fast(self, generations: list[Generation]) -> None:
+    def _decode_fast(self, generations: list[Generation], ahead_ok: bool = False) -> None:
         if self.fast.mtp is not None:
-            speculative.verify_step(self, generations)
+            speculative.verify_step(self, generations, ahead_ok)
             return
         logits = self.fast.decode(
             [g.last_token for g in generations],
@@ -854,8 +856,11 @@ class Generator:
             g.logits = row.clone()
             g.length += 1
 
-    def decode(self, generations: list[Generation]) -> None:
+    def decode(self, generations: list[Generation], ahead_ok: bool = False) -> None:
         """Feed each generation's last token in one forward pass and store its next logits.
+
+        ``ahead_ok``: the caller has no new request or prefill waiting, so the fast path may
+        launch the next verify step before this one's picks are read (plan 42).
 
         One request runs alone on its own cache. Several are stacked into one
         batch: left-padded attention keys and values, a padding mask, and each
@@ -865,7 +870,7 @@ class Generator:
         self.decoded_tokens += len(generations)
         self.largest_batch = max(self.largest_batch, len(generations))
         if self.fast is not None:
-            self._decode_fast(generations)
+            self._decode_fast(generations, ahead_ok)
             return
         with torch.inference_mode():
             if len(generations) == 1:

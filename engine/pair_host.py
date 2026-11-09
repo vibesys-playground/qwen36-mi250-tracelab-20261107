@@ -117,6 +117,7 @@ def load(args: Any, revision: str | None) -> list[Any]:
         fast = split_prefill.SplitFast(splitter, pair)
         g = Generator(lm, tokenizer, eos_ids, fast=fast, **options)
         g._free_slots.remove(pair.slot)  # the pair's helper slot never serves a request
+        pair.generator = g
         stats = g.stats
         g.stats = lambda stats=stats, fast=fast: {**stats(), **fast.split_stats()}
         gdn.ready(g, kernels)

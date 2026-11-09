@@ -31,7 +31,7 @@ S="ENGINE_SPLIT_PREFILL=0,ENGINE_SPLIT_PREFILL=1,ENGINE_SPLIT_PREFILL=0,ENGINE_S
 S="$S,ENGINE_SPLIT_PREFILL=1+ENGINE_SPLIT_MIN_TOKENS=1000000,ENGINE_SPLIT_PREFILL=1+ENGINE_MTP=0"
 timeout 5400 python -u tools/serve_probe.py --sessions 32 --rounds 4 --concurrency 8 \
   --first-spread 800:2600 --grow 250 --max-new 200 --wait 0.5 --corpus synthetic --settings "$S" 2>&1 \
-  | grep -vE "Loading weights|amdgpu.ids|it/s\]" | cut -c1-6000
+  | grep --line-buffered -vE "Loading weights|amdgpu.ids|it/s\]" | cut -c1-6000
 echo "=== server logs (split lines)"; for f in /tmp/serve-probe-*.log; do echo "--- $f"; grep -E "split|pair host|router: starting|Traceback|Error|timeout" $f | head -20; done
 echo "=== tracebacks"; for f in $L/*.log /tmp/serve-probe-*.log; do grep -B2 -A25 Traceback $f | head -60; done
 true

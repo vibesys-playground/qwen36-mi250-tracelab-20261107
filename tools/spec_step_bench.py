@@ -236,7 +236,7 @@ def main() -> None:
                         break
             live = waiting
             if live:
-                g.decode([gens[i] for i in live])
+                g.decode([gens[i] for i in live], ahead_ok=True)  # ENGINE_RUNAHEAD decides
         g._reclaim()
         steps = g.verify_steps - before[0]
         proposed = g.mtp_proposed - before[1]

@@ -61,7 +61,7 @@ def supported(m: torch.nn.Module, conv_state: torch.Tensor) -> bool:
     )
 
 
-WY_DEFAULT = "split:4:4:128:2"
+WY_DEFAULT = "split:2:4:128:2"
 NORM_WARPS = 8  # the fused kernel's (head default) warps: its l2norm row sums' order
 SPLIT_NT = 16  # chunks above which the split form's solve kernel takes its second warp count
 
@@ -81,7 +81,7 @@ def wy_variant() -> tuple[str, int, int, int, int]:
     assert kind in ("mono", "stack", "split", "split1"), s
     if kind in ("mono", "stack"):
         return kind, int(s[1]) if len(s) > 1 else 0, 0, 0, 0
-    d = [4, 4, 128, 0]
+    d = [2, 4, 128, 0]
     f = [int(x) for x in s[1:]] + d[len(s) - 1:]
     return kind, f[0], f[1], f[2], f[3]
 

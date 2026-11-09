@@ -410,7 +410,9 @@ class StreamConfig(NamedTuple):
 # BLOCK_K, so one tile table and the same dots). The fastest per bucket in the step 0 sweep (job
 # j282, GCD 0 of a TP2 pair, real routing of all 41 MoE layers, replay-like text; every config
 # bitwise equal): 61 tokens 0.978x today's down, 561 0.892x, 1,650 0.761x, 2,300 0.752x. The plan's
-# kill rule (<= 0.85x at 561 and <= 0.75x at 1,650) failed, so the flag defaults off.
+# kill rule (<= 0.85x at 561 and <= 0.75x at 1,650) failed for all sizes, so by default the stream
+# kernel runs only on passes above ``STREAM_MIN_TOKENS`` tokens (0.76x there) and today's
+# ``_down_kernel`` below.
 STREAM_BUCKETS: tuple[StreamConfig, ...] = (
     StreamConfig(256, 1, 4, 1, 0, 2),
     StreamConfig(128, 4, 8, 1),
@@ -418,13 +420,27 @@ STREAM_BUCKETS: tuple[StreamConfig, ...] = (
 )
 
 
-def down_stream_enabled() -> bool:
-    """``ENGINE_MOE_DOWN_STREAM`` (plan 60; 0 for ``_down_kernel``): the prefill down
-    projection through ``_down_stream_kernel`` (bitwise the same output)."""
-    return os.environ.get("ENGINE_MOE_DOWN_STREAM", "0") != "0"
+STREAM_MIN_TOKENS = 1024  # the default turns the stream kernel on for passes above this
 
 
-_DOWN_STREAM = down_stream_enabled()
+def down_stream_mode() -> bool | None:
+    """``ENGINE_MOE_DOWN_STREAM`` (plan 60): ``0`` today's ``_down_kernel`` always, ``1`` the
+    prefill down projection through ``_down_stream_kernel`` always (bitwise the same output),
+    unset or ``auto`` (None): the stream kernel only for passes above ``STREAM_MIN_TOKENS``."""
+    v = os.environ.get("ENGINE_MOE_DOWN_STREAM", "auto").strip().lower()
+    if v in ("", "auto"):
+        return None
+    return v != "0"
+
+
+_DOWN_STREAM = down_stream_mode()
+
+
+def use_down_stream(tokens: int) -> bool:
+    """Whether a pass of ``tokens`` tokens runs the down projection through the stream kernel."""
+    if _DOWN_STREAM is None:
+        return tokens > STREAM_MIN_TOKENS
+    return bool(_DOWN_STREAM)
 
 
 def stream_config(pairs: int, experts: int) -> StreamConfig:
@@ -445,15 +461,20 @@ def stream_config(pairs: int, experts: int) -> StreamConfig:
 
 def launch_down(act: torch.Tensor, down: torch.Tensor, order: torch.Tensor, table: torch.Tensor,
                 out: torch.Tensor, max_tiles: int, cfg: Config, pairs: int,
-                stream: bool | None = None) -> None:
+                stream: bool | None = None, tokens: int | None = None) -> None:
     """The down projection of the grouped experts into ``out`` [pairs, hidden] (BF16, at each
-    pair's row): ``_down_stream_kernel`` when enabled and the shapes fit it (inter = BK or
-    2 * BK, hidden a multiple of GROUP * BN), else ``_down_kernel``. Launched on the current
-    device; the same output either way."""
+    pair's row): ``_down_stream_kernel`` when ``stream`` (default: ``use_down_stream(tokens)``,
+    the pass's token count) and the shapes fit it (inter = BK or 2 * BK, hidden a multiple of
+    GROUP * BN), else ``_down_kernel``. Launched on the current device; the same output either
+    way."""
     experts, hidden, inter = down.shape
     bm = cfg.bm
     bk = min(cfg.down.bk, inter)
-    if _DOWN_STREAM if stream is None else stream:
+    if stream is None:
+        if tokens is None:
+            raise ValueError("launch_down needs stream or the pass's tokens")
+        stream = use_down_stream(tokens)
+    if stream:
         s = stream_config(pairs, experts)
         bn = min(s.bn, hidden)
         group = max(1, min(s.group, hidden // bn))
@@ -555,7 +576,7 @@ def moe_prefill(
             H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
             **launch_options(cfg.gate_up),
         )
-        launch_down(act, down, order, table, out, max_tiles, cfg, pairs)
+        launch_down(act, down, order, table, out, max_tiles, cfg, pairs, tokens=tokens)
     # The routing weight in fp32 (exact on two BF16 values), the top_k rows summed in fp32.
     weighted = out.float() * top_k_weights.reshape(-1, 1).float()
     return weighted.view(tokens, top_k, hidden).sum(dim=1).to(x.dtype)

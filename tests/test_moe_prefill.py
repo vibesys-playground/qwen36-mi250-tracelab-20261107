@@ -246,3 +246,21 @@ def test_stream_config_buckets(monkeypatch):
         assert mp.stream_config(t * k, e) == mp.STREAM_BUCKETS[i]
     monkeypatch.setenv("ENGINE_MOE_DOWN_STREAM_CFG", "128,4,8,2")
     assert mp.stream_config(561 * k, e) == mp.StreamConfig(128, 4, 8, 2)
+
+
+def test_down_stream_default_by_tokens(monkeypatch):
+    """``ENGINE_MOE_DOWN_STREAM`` unset or ``auto``: the stream kernel only on passes above
+    ``STREAM_MIN_TOKENS`` (1,024) tokens; ``0`` never, ``1`` always."""
+    for v, expect in ((None, None), ("auto", None), ("0", False), ("1", True)):
+        if v is None:
+            monkeypatch.delenv("ENGINE_MOE_DOWN_STREAM", raising=False)
+        else:
+            monkeypatch.setenv("ENGINE_MOE_DOWN_STREAM", v)
+        assert mp.down_stream_mode() is expect
+    monkeypatch.setattr(mp, "_DOWN_STREAM", None)
+    assert mp.STREAM_MIN_TOKENS == 1024
+    assert [mp.use_down_stream(t) for t in (61, 561, 1024, 1025, 1650, 2300)] == [False] * 3 + [True] * 3
+    monkeypatch.setattr(mp, "_DOWN_STREAM", False)
+    assert not mp.use_down_stream(2300)
+    monkeypatch.setattr(mp, "_DOWN_STREAM", True)
+    assert mp.use_down_stream(61)

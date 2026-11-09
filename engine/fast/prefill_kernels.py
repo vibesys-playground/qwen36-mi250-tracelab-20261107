@@ -732,7 +732,7 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int, merged: bool = False)
             H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
             **moe_prefill.launch_options(cfg.gate_up),
         )
-        moe_prefill.launch_down(act_r, down, order, table, out_r, max_tiles, cfg, pairs)
+        moe_prefill.launch_down(act_r, down, order, table, out_r, max_tiles, cfg, pairs, tokens=tokens)
         _moe_combine_kernel[(tokens, triton.cdiv(hidden, block))](
             out_r, top_w.reshape(-1), sg, shared_out.contiguous(), y, sg.stride(0), H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
         )

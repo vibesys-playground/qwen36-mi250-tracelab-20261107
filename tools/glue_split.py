@@ -90,7 +90,7 @@ def family(name: str) -> str:
         return "gemv"
     if "_moe_" in n:
         return "moe"
-    if "_gdn" in n or "chunk_" in n or "fused_recurrent" in n:
+    if "_gdn" in n or n.startswith("gdn_") or "chunk_" in n or "fused_recurrent" in n:
         return "gdn"
     if "_paged_attn" in n or "_attn_" in n:
         return "attn"

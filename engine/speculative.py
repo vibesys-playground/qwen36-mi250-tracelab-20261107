@@ -41,16 +41,29 @@ predicted tokens per millisecond: per request the expected tokens per step at it
 running per-draft acceptance (an exponentially decayed count of its accepted and rejected
 drafts, starting from a prior), over the step cost of k (``ENGINE_SPEC_COST``, ms per
 2-slot step). Nothing but the request's own measured acceptance feeds the choice.
+
+Run-ahead (plan 42, ``ENGINE_RUNAHEAD=1``, the default; tensor-parallel fast path): the next
+chained step is launched before the host reads the current one's picks, its inputs written on
+the GPU from the current step's outputs (``TPModel.chain_launch_next``), so the GPU does not
+idle while the host builds inputs and handles tokens. Only when that step surely runs for the
+same requests with the same k: every request greedy with ``ignore_eos``, no stop strings, and
+a token still needed after the current step's at most k + 1; no job, prefill or arrival
+waiting (asked again right before the launch). The launch waits until
+``ENGINE_RUNAHEAD_MARGIN_MS`` before the current step's learned end, so a request arriving
+meanwhile is prefilled after the current step. A batch change finishes the step launched
+ahead first (``drain``). The steps, their inputs and kernels are those of the serial order.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from engine import looptimers
 from engine.protocol import Sampling
 
 if TYPE_CHECKING:
@@ -132,19 +145,48 @@ def choose_k(generator: Generator, generations: list[Generation]) -> int:
     return max(allowed, key=gain)
 
 
-def chain_step(generator: Generator, generations: list[Generation]) -> None:
-    """One ``FastModel.verify_chain`` for every running request; queues its next tokens."""
-    fast = generator.fast
-    k = choose_k(generator, generations)
+RUNAHEAD_ENV = "ENGINE_RUNAHEAD"
+
+
+def runahead_enabled() -> bool:
+    """Plan 42 (``ENGINE_RUNAHEAD``, default on): launch the next chained verify step, its
+    inputs built on the GPU, before the host waits for the current one, when that step is
+    certain to run for the same requests (``_ahead_safe``)."""
+    return os.environ.get(RUNAHEAD_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _ahead_safe(g: Generation, k: int) -> bool:
+    """Whether ``g`` surely runs the step after the in-flight one, whatever that step picks:
+    a greedy request that cannot stop on a token (``ignore_eos``, no stop strings) and still
+    needs a token after the in-flight step's at most ``k + 1``."""
+    sampling = g._sampling
+    return (
+        g.speculates and sampling.ignore_eos and not sampling.stop and g.slot is not None
+        and not g.queue and g._count + k + 1 < g._max_tokens
+    )
+
+
+class _Ahead:
+    """A chained verify step launched before the host saw the step before it."""
+
+    def __init__(self, generations: list[Generation], k: int, handle: dict) -> None:
+        self.generations = generations
+        self.k = k
+        self.handle = handle
+
+
+def _drafts(generations: list[Generation], k: int) -> list[list[int]]:
     drafts = []
     for g in generations:
         ds = list(g.drafts) if g.drafts and g.drafts[0] == g.draft else [g.draft]
         ds = (ds + [ds[-1]] * k)[:k]
         drafts.append(ds if g.speculates else [0] * k)
-    logits, picks, acc, nxt = fast.verify_chain(
-        [g.last_token for g in generations], drafts, [g.slot for g in generations],
-        [g.length for g in generations],
-    )
+    return drafts
+
+
+def _book(generator: Generator, generations: list[Generation], k: int, logits, picks, acc, nxt) -> None:
+    """Queue each request's tokens from one chained verify step and advance its state ring."""
+    fast = generator.fast
     generator.verify_steps += 1
     for i, g in enumerate(generations):
         g.flipped = False
@@ -174,10 +216,146 @@ def chain_step(generator: Generator, generations: list[Generation]) -> None:
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
 
 
-def verify_step(generator: Generator, generations: list[Generation]) -> None:
+MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.5")) / 1e3
+EST_ALPHA = 0.2
+
+
+def _allowed(ahead_ok: Any) -> bool:
+    return bool(ahead_ok() if callable(ahead_ok) else ahead_ok)
+
+
+def _wait_late(generator: Generator, handle: dict) -> None:
+    """Hold the run-ahead launch until ``MARGIN_S`` before the in-flight step should end (its
+    start plus the learned step time of its shape), so a request arriving meanwhile is
+    prefilled after this step rather than after the next one; the margin covers the launch's
+    host time, so the GPU still does not idle. Without an estimate yet: launch now."""
+    est = getattr(generator, "_ahead_est", {}).get((handle["size"], handle["groups"]))
+    start = handle.get("t_start")
+    if est is None or start is None:
+        return
+    target = start + est - MARGIN_S
+    while True:
+        dt = target - time.perf_counter()
+        if dt <= 0 or handle["event"].query():
+            return
+        time.sleep(min(dt, 0.001))
+
+
+def _learn(generator: Generator, handle: dict) -> None:
+    """Update the shape's step time from a step that ran right after the previous one."""
+    if not handle.get("b2b") or "t_done" not in handle or handle.get("t_start") is None:
+        return
+    est = generator.__dict__.setdefault("_ahead_est", {})
+    key = (handle["size"], handle["groups"])
+    dur = handle["t_done"] - handle["t_start"]
+    est[key] = dur if key not in est else est[key] + EST_ALPHA * (dur - est[key])
+
+
+def drain(generator: Generator) -> None:
+    """Finish a step launched ahead: wait for it and queue its tokens (before the batch
+    changes: an arrival, a prefill, a request leaving)."""
+    ahead = getattr(generator, "_ahead", None)
+    if ahead is None:
+        return
+    generator._ahead = None
+    _book(generator, ahead.generations, ahead.k, *generator.fast.chain_collect(ahead.handle))
+
+
+def pending(generator: Generator) -> bool:
+    return getattr(generator, "_ahead", None) is not None
+
+
+def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bool = False) -> None:
+    """One chained verify step for every running request; queues its next tokens.
+
+    With ``ENGINE_RUNAHEAD`` (and ``ahead_ok``: the server has no arrival or prefill
+    waiting), the step after this one is launched before this one's picks are read, when it
+    surely runs for the same requests with the same k; the next call then only collects it."""
+    fast = generator.fast
+    timed = looptimers.ENABLED
+    if not runahead_enabled() or not hasattr(fast, "chain_launch"):
+        _chain_step_serial(generator, generations)
+        return
+    ahead = getattr(generator, "_ahead", None)
+    generator._ahead = None
+    if timed:
+        t0 = looptimers.now()
+    if ahead is not None and ahead.generations != generations:
+        # The batch changed under a step launched ahead (a request left): queue its tokens
+        # for the requests still here, then step whoever has none.
+        _book(generator, ahead.generations, ahead.k, *fast.chain_collect(ahead.handle))
+        rest = [g for g in generations if not g.queue]
+        if rest:
+            chain_step(generator, rest, False)
+        return
+    if ahead is not None:
+        k, handle = ahead.k, ahead.handle
+    else:
+        k = choose_k(generator, generations)
+        gather = not all(g.speculates for g in generations)
+        handle = fast.chain_launch(
+            [g.last_token for g in generations], _drafts(generations, k),
+            [g.slot for g in generations], [g.length for g in generations], gather=gather,
+        )
+    nxt_handle = None
+    if (
+        _allowed(ahead_ok)
+        and fast.chain_ready(handle["size"], handle["groups"])
+        and all(_ahead_safe(g, k) for g in generations)
+        and choose_k(generator, generations) == k
+    ):
+        if timed:
+            looptimers.add("choosek", looptimers.now() - t0)
+        _wait_late(generator, handle)
+        if timed:
+            t0 = looptimers.now()
+        if _allowed(ahead_ok):  # still nothing new to start after the wait
+            for g in generations:
+                # Pages for the next step's rows: at most k + 1 tokens on, k + 1 rows, k drafts.
+                fast._ensure_pages(g.slot, g.length + 3 * (k + 1))
+            nxt_handle = fast.chain_launch_next(handle)
+            # Launched while this step still ran: the next one starts when this one ends.
+            nxt_handle["b2b"] = not handle["event"].query()
+    if timed:
+        looptimers.add("choosek", looptimers.now() - t0)
+    result = fast.chain_collect(handle)
+    _learn(generator, handle)
+    if nxt_handle is not None and nxt_handle.get("b2b"):
+        nxt_handle["t_start"] = handle["t_done"]
+    if timed:
+        t0 = looptimers.now()
+    _book(generator, generations, k, *result)
+    if nxt_handle is not None:
+        generator._ahead = _Ahead(list(generations), k, nxt_handle)
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
+
+
+def _chain_step_serial(generator: Generator, generations: list[Generation]) -> None:
+    """One ``FastModel.verify_chain`` for every running request (``ENGINE_RUNAHEAD=0``)."""
+    fast = generator.fast
+    timed = looptimers.ENABLED
+    if timed:
+        t0 = looptimers.now()
+    k = choose_k(generator, generations)
+    drafts = _drafts(generations, k)
+    if timed:
+        looptimers.add("choosek", looptimers.now() - t0)
+    logits, picks, acc, nxt = fast.verify_chain(
+        [g.last_token for g in generations], drafts, [g.slot for g in generations],
+        [g.length for g in generations],
+    )
+    if timed:
+        t0 = looptimers.now()
+    _book(generator, generations, k, logits, picks, acc, nxt)
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
+
+
+def verify_step(generator: Generator, generations: list[Generation], ahead_ok: bool = False) -> None:
     """One ``FastModel.verify`` for every running request; queues each one's next tokens."""
     if chain_enabled(generator):
-        chain_step(generator, generations)
+        chain_step(generator, generations, ahead_ok)
         return
     fast = generator.fast
     logits, g1, g2, d1, d2 = fast.verify(
@@ -187,6 +365,9 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
         [g.length for g in generations],
     )
     generator.verify_steps += 1
+    timed = looptimers.ENABLED
+    if timed:
+        t0 = looptimers.now()
     for i, g in enumerate(generations):
         g.flipped = False
         if not g.speculates:
@@ -208,6 +389,8 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
                 continue
         g.length += 1
         g.draft = d1[i]
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
 
 
 def settle(generator: Generator, g: Generation, slot: int | None) -> None:

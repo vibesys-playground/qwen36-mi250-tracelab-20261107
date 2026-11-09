@@ -35,12 +35,22 @@ running request's last token and k drafts (``FastModel.verify_chain``), the MTP 
 to its own output k times. A request emits the target's picks up to and including the first
 one that differs from the draft fed after it, so every emitted token is again the target's
 own greedy pick, and its slot's state ring advances by the drafts it accepted. k is one per
-step for the whole batch, chosen from {1, 3, 7} up to ``ENGINE_SPEC_KMAX`` (default 3;
+step for the whole batch, chosen from {1, 3, 4, 5, 7} up to ``ENGINE_SPEC_KMAX`` (default 7;
 ``ENGINE_SPEC_K`` fixes it) to maximize the
 predicted tokens per millisecond: per request the expected tokens per step at its own
 running per-draft acceptance (an exponentially decayed count of its accepted and rejected
-drafts, starting from a prior), over the step cost of k (``ENGINE_SPEC_COST``, ms per
-2-slot step). Nothing but the request's own measured acceptance feeds the choice.
+drafts, starting from a prior), over the step cost of k at the step's slot bucket
+(``ENGINE_SPEC_COST``, ms per step by (slots, k), measured on the hardware). Nothing but the
+request's own measured acceptance feeds the choice.
+
+Depth by slot count (plan 58): rows are cheaper per token at 1 slot than at 2, so the table is
+keyed by the slot bucket. Between k = 1 and 3 the choice is plan 31's (one acceptance per
+request). Deeper k (4, 5, 7; only for buckets the table has rows for) is taken over k = 3 only
+when it predicts ``ENGINE_SPEC_DEEP_MARGIN`` (5%) more tokens per ms from each request's own
+acceptance BY DEPTH (decayed counts of drafts checked and accepted at each chain position;
+a position it has not reached yet is assumed no better than its worst observed position past
+the first), with the expected tokens capped by what the request still has to generate. Text
+whose acceptance falls along the chain stays at k <= 3.
 
 Run-ahead (plan 42, ``ENGINE_RUNAHEAD=1``, the default; tensor-parallel fast path): the next
 chained step is launched before the host reads the current one's picks, its inputs written on
@@ -107,16 +117,63 @@ def chain_enabled(generator: Generator) -> bool:
     )
 
 
-KS = (1, 3, 7)
+KS = (1, 3, 4, 5, 7)
+KBASE = 3  # deeper k needs the per-depth case and the margin (plan 58)
 PRIOR = (3.2, 4.0)  # (accepted, checked) pseudo-counts: a per-draft acceptance of 0.8
 DECAY = 0.95
+MARGIN = float(os.environ.get("ENGINE_SPEC_DEEP_MARGIN", "0.05"))
+# Slot buckets that may run k > 3 (default: every bucket with its own cost row).
+DEEP_SIZES = {int(x) for x in os.environ.get("ENGINE_SPEC_DEEP_SIZES", "").split(",") if x.strip()}
+# ms per chained verify step by (slot bucket, k): the captured ``verify_chain`` step under TP2
+# with HIP GDN and IVF drafts on ROCm 7.0, median of 200 (plan 58, j303, the afb6be0 merge;
+# j268's ROCm 6.4 table moved by up to 12.5%). "k:ms" items are size 2.
+COST = ("1:1:7.07,1:3:8.86,1:4:10.29,1:5:11.62,1:7:14.74,"
+        "2:1:8.28,2:3:11.54,2:4:13.42,2:5:15.26,2:7:19.46")
+_COST_CACHE: dict[str, dict[tuple[int, int], float]] = {}
 
 
-def _cost() -> dict[int, float]:
-    """``ENGINE_SPEC_COST`` "1:9.2,3:13.7,7:23.2": ms per step of 2 slots by k (default: the
-    measured ``verify_chain`` step under TP2, plan 31 stage 1, j161)."""
-    spec = os.environ.get("ENGINE_SPEC_COST", "1:9.2,3:13.7,7:23.2")
-    return {int(k): float(v) for k, v in (item.split(":") for item in spec.split(",") if item)}
+def _cost() -> dict[tuple[int, int], float]:
+    """``ENGINE_SPEC_COST`` "size:k:ms,...": ms per step by (slot bucket, k) (default ``COST``);
+    the older "k:ms" items mean size 2."""
+    spec = os.environ.get("ENGINE_SPEC_COST", COST)
+    table = _COST_CACHE.get(spec)
+    if table is None:
+        table = {}
+        for item in spec.split(","):
+            parts = item.split(":") if item else []
+            if len(parts) == 2:
+                table[(2, int(parts[0]))] = float(parts[1])
+            elif len(parts) == 3:
+                table[(int(parts[0]), int(parts[1]))] = float(parts[2])
+        _COST_CACHE[spec] = table
+    return table
+
+
+def _row(size: int) -> int | None:
+    """The table row (slot bucket) whose costs a step of bucket ``size`` uses: its own, else the
+    largest one below it (else the smallest)."""
+    sizes = sorted({s for s, _ in _cost()})
+    if not sizes:
+        return None
+    below = [s for s in sizes if s <= size]
+    return below[-1] if below else sizes[0]
+
+
+def cost(size: int, k: int) -> float:
+    row = _row(size)
+    return _cost().get((row, k), 1.0) if row is not None else 1.0
+
+
+def depths(size: int) -> list[int]:
+    """The k a step of slot bucket ``size`` may run: up to ``ENGINE_SPEC_KMAX``, (k + 1) x size
+    rows within the 64-row cap, and beyond k = 3 only where the table has that bucket's own
+    measured cost. The graphs of exactly these (size, k) are captured at load."""
+    from engine.fast import mfma
+
+    own = {k for s, k in _cost() if s == size}
+    deep_ok = not DEEP_SIZES or size in DEEP_SIZES
+    return [k for k in KS if k <= mfma.KMAX and (k + 1) * size <= 64
+            and (k <= KBASE or (k in own and deep_ok))]
 
 
 def acceptance(g: Generation) -> float:
@@ -124,25 +181,71 @@ def acceptance(g: Generation) -> float:
     return (g.spec_accepted + PRIOR[0]) / (g.spec_checked + PRIOR[1])
 
 
-def choose_k(generator: Generator, generations: list[Generation]) -> int:
-    from engine.fast import mfma
+def _depth_book(g: Generation, k: int, accepted: int) -> None:
+    """Count one step's chain positions: 1 .. min(k, accepted + 1) checked, 1 .. accepted
+    accepted; each position's counts decay when it is checked again."""
+    chk = g.__dict__.setdefault("spec_depth_checked", [0.0] * max(KS))
+    acc = g.__dict__.setdefault("spec_depth_accepted", [0.0] * max(KS))
+    for j in range(min(k, accepted + 1)):
+        chk[j] = chk[j] * DECAY + 1.0
+        acc[j] = acc[j] * DECAY + (1.0 if j < accepted else 0.0)
 
+
+def expected_tokens(g: Generation, k: int) -> float:
+    """Tokens a step of k drafts is expected to emit for ``g`` from its own acceptance by depth:
+    1 + sum over positions i <= k of P(the first i drafts accepted), positions it never reached
+    taken at its worst observed conditional past the first (or the first's, or the prior), and
+    no more positions than tokens it still needs."""
+    chk = g.__dict__.get("spec_depth_checked") or [0.0] * max(KS)
+    acc = g.__dict__.get("spec_depth_accepted") or [0.0] * max(KS)
+    rate = [(acc[j] + PRIOR[0]) / (chk[j] + PRIOR[1]) for j in range(len(chk))]
+    seen = [j for j in range(len(chk)) if chk[j] >= 1.0]
+    deeper = [rate[j] for j in seen if j >= 1]
+    floor = min(deeper) if deeper else (rate[0] if seen else PRIOR[0] / PRIOR[1])
+    need = g._max_tokens - g._count - len(g.queue)
+    total = reach = 1.0
+    for j in range(min(k, max(0, need - 1))):
+        reach *= rate[j] if chk[j] >= 1.0 else floor
+        total += reach
+    return total
+
+
+def choose_k(generator: Generator, generations: list[Generation]) -> int:
     fast = generator.fast
     size = fast.bucket(len(generations)) if fast.use_graphs else len(generations)
-    allowed = [k for k in KS if k <= mfma.KMAX and (k + 1) * size <= min(64, fast._rows)] or [1]
+    allowed = [k for k in depths(size) if (k + 1) * size <= min(64, fast._rows)] or [1]
     fixed = os.environ.get("ENGINE_SPEC_K", "")
     if fixed:
         k = int(fixed)
         return max([a for a in allowed if a <= k] or [allowed[0]])
-    cost = _cost()
-    rates = [acceptance(g) for g in generations if g.speculates]
+    spec = [g for g in generations if g.speculates]
+    rates = [acceptance(g) for g in spec]
     if not rates:
         return allowed[0]
 
     def gain(k: int) -> float:
-        return sum(sum(p ** i for i in range(k + 1)) for p in rates) / cost.get(k, 1.0)
+        return sum(sum(p ** i for i in range(k + 1)) for p in rates) / cost(size, k)
 
-    return max(allowed, key=gain)
+    base = [k for k in allowed if k <= KBASE]
+    k0 = max(base, key=gain) if base else allowed[0]
+    deep = [k for k in allowed if k > KBASE]
+    if k0 != KBASE or not deep:
+        return k0
+
+    def gain_d(k: int) -> float:
+        return sum(expected_tokens(g, k) for g in spec) / cost(size, k)
+
+    # A step of k can only hand the next step k real drafts (the head's chain is k long), so a
+    # deeper k than the batch's last one runs its extra positions on padding once: going up
+    # needs the margin, and a batch already running deep stays at its k unless another deep k
+    # beats it by the margin or k <= 3 beats it outright (going down costs nothing).
+    have = min(len(g.drafts) if g.drafts and g.drafts[0] == g.draft else 1 for g in spec)
+    best = max(deep, key=gain_d)
+    if have in deep:
+        if gain_d(have) < gain_d(KBASE):
+            return k0
+        return best if gain_d(best) >= (1.0 + MARGIN) * gain_d(have) else have
+    return best if gain_d(best) >= (1.0 + MARGIN) * gain_d(KBASE) else k0
 
 
 RUNAHEAD_ENV = "ENGINE_RUNAHEAD"
@@ -179,6 +282,7 @@ def _drafts(generations: list[Generation], k: int) -> list[list[int]]:
     drafts = []
     for g in generations:
         ds = list(g.drafts) if g.drafts and g.drafts[0] == g.draft else [g.draft]
+        g.spec_real = min(k, len(ds))  # drafts past these are padding (plan 58)
         ds = (ds + [ds[-1]] * k)[:k]
         drafts.append(ds if g.speculates else [0] * k)
     return drafts
@@ -188,6 +292,17 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
     """Queue each request's tokens from one chained verify step and advance its state ring."""
     fast = generator.fast
     generator.verify_steps += 1
+    hist = generator.__dict__.setdefault("spec_k_hist", {})
+    key = f"{len(generations)}:{k}"  # requests in the step : drafts per request
+    hist[key] = hist.get(key, 0) + 1
+    # plan 58 counters for /health: tokens emitted by (requests : k), and k changes (a step whose
+    # k differs from the step before for the same requests)
+    emitted = generator.__dict__.setdefault("spec_k_tokens", {})
+    last = generator.__dict__.get("_spec_last")
+    ids = tuple(id(g) for g in generations)
+    if last is not None and last[0] == ids and last[1] != k:
+        generator.spec_k_changes = getattr(generator, "spec_k_changes", 0) + 1
+    generator._spec_last = (ids, k)
     for i, g in enumerate(generations):
         g.flipped = False
         g.advanced = 0
@@ -206,6 +321,7 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             adv += 1
         if adv:
             fast.advance(g.slot, adv)
+        emitted[key] = emitted.get(key, 0) + adv + 1
         g.advanced = adv
         g.length += adv + 1
         if adv == acc[i] and len(g.queue) == adv + 1 and g.continues_after(g.queue[-1], adv):
@@ -214,6 +330,8 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             generator.mtp_accepted += acc[i]
             g.spec_checked = g.spec_checked * DECAY + checked
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
+            # positions past the real drafts held padding: they say nothing about acceptance
+            _depth_book(g, min(k, getattr(g, "spec_real", k)), acc[i])
 
 
 MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.5")) / 1e3
@@ -290,6 +408,8 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
         return
     if ahead is not None:
         k, handle = ahead.k, ahead.handle
+        for g in generations:
+            g.spec_real = k  # built on the GPU from the step before's k drafts: all real
     else:
         k = choose_k(generator, generations)
         gather = not all(g.speculates for g in generations)
@@ -298,12 +418,20 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
             [g.slot for g in generations], [g.length for g in generations], gather=gather,
         )
     nxt_handle = None
+    counts = generator.__dict__.setdefault("spec_ahead", {})
     if (
         _allowed(ahead_ok)
         and fast.chain_ready(handle["size"], handle["groups"])
         and all(_ahead_safe(g, k) for g in generations)
-        and choose_k(generator, generations) == k
     ):
+        same_k = choose_k(generator, generations) == k
+        why = "eligible_same_k" if same_k else "eligible_k_changed"
+    else:
+        same_k, why = False, "not_eligible"
+    counts[why] = counts.get(why, 0) + 1
+    if k > KBASE:
+        counts[f"{why}:deep"] = counts.get(f"{why}:deep", 0) + 1
+    if same_k:
         if timed:
             looptimers.add("choosek", looptimers.now() - t0)
         _wait_late(generator, handle)

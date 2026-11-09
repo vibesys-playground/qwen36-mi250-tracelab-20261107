@@ -40,6 +40,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -707,6 +708,7 @@ class Generator:
                     # Plan 31 / 58: the chained verify's graphs, k + 1 rows per slot for every
                     # (bucket, k) the chooser may run (``speculative.depths``), before /health.
                     plan = {s: speculative.depths(s) for s in fast.buckets}
+                    captured_at = time.perf_counter()
                     for groups in sorted({k + 1 for ks in plan.values() for k in ks}, reverse=True):
                         for size in sorted(fast.buckets, reverse=True):
                             if (groups - 1 in plan[size] and groups <= mfma.RING and groups * size <= 64
@@ -714,6 +716,8 @@ class Generator:
                                 fast.capture(size, False, groups)
                     if hasattr(fast, "warm_chain_next") and fast.graph_error is None:
                         fast.warm_chain_next()  # plan 42's run-ahead input kernel
+                    print(f"engine: chained verify graphs {sorted((s, k) for s in plan for k in plan[s])} "
+                          f"captured in {time.perf_counter() - captured_at:.1f} s", flush=True)
                 print(
                     f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
                     f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "

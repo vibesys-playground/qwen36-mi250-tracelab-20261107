@@ -57,6 +57,10 @@ CONV_BUCKET = 256
 # the output layout) in one launch (``kernels.chain_accept``). Draft-side only: drafts are
 # verified, so served tokens do not change.
 CHAIN_GLUE = os.environ.get("ENGINE_CHAIN_GLUE", "1") == "1"
+# Decode / verify graph buckets in slots (``ENGINE_DECODE_BUCKETS``): a step of B slots replays
+# the smallest bucket >= B, its extra slots run as padding on the dummy slot.
+DECODE_BUCKETS = tuple(sorted({int(b) for b in os.environ.get(
+    "ENGINE_DECODE_BUCKETS", "1,2,4,8,16,32").split(",") if b.strip()}))
 
 
 class FastPathUnavailable(RuntimeError):
@@ -293,7 +297,7 @@ class FastModel:
         kv_tokens: int | None = None,
         use_triton: bool | None = None,
         use_graphs: bool | None = None,
-        buckets: Sequence[int] = (1, 2, 4, 8, 16, 32),
+        buckets: Sequence[int] = DECODE_BUCKETS,
         mtp: torch.nn.Module | None = None,
     ) -> None:
         text = lm.model.language_model if hasattr(lm.model, "language_model") else lm.model

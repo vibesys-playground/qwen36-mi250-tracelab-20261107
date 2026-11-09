@@ -57,7 +57,7 @@ from torch.nn import functional as F
 
 from engine import cpu_place, looptimers
 from engine.fast import blas_tune, kernels, mfma
-from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
+from engine.fast.model import DECODE_BUCKETS, DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
 
@@ -831,7 +831,7 @@ class TPModel:
         kv_tokens: int | None = None,
         use_triton: bool | None = None,
         use_graphs: bool | None = None,
-        buckets: Sequence[int] = (1, 2, 4, 8, 16, 32),
+        buckets: Sequence[int] | None = None,
     ) -> None:
         if devices is None:
             devices = [torch.device("cuda", 0), torch.device("cuda", 1)]
@@ -854,7 +854,7 @@ class TPModel:
             shard.ivf_src = self.ranks[0].ivf if r == 1 else None
             model = FastModel(
                 shard, slots=slots, max_len=max_len, kv_tokens=kv_tokens, use_triton=use_triton,
-                use_graphs=use_graphs, buckets=buckets, mtp=head,
+                use_graphs=use_graphs, buckets=buckets or DECODE_BUCKETS, mtp=head,
             )
             model.tp, model.rank, model.vocab_offset = self.group, r, shard.vocab_offset
             self.ranks.append(model)

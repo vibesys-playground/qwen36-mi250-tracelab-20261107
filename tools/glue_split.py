@@ -39,6 +39,9 @@ drafts per slot, B (k + 1) rows, ``ENGINE_SPEC_CHAIN=1``), and ``--parity`` adds
 k=1, 3 hashes; the flags printed include ``ENGINE_TOPK_EPI``. The router top-k fused into the
 K-sum kernel (``_ksum_router_kernel``) is listed under its own name in ``2_topk``.
 
+Plan 58: ``--drafts corpus`` feeds a chain step the prompt's own continuation as drafts (real
+tokens, so the extra rows route to the experts real drafts would) instead of token 0.
+
 Prints ``RESULT`` lines. A hint for the plan, not the task's metric.
 """
 
@@ -246,6 +249,8 @@ def main() -> None:
     parser.add_argument("--parity", action="store_true",
                         help="plan 29: hashes of captured logits and picks under the ENGINE_GLUE_* flags")
     parser.add_argument("--parity-steps", type=int, default=24)
+    parser.add_argument("--drafts", choices=("zero", "corpus"), default="zero",
+                        help="chain drafts: token 0, or the prompt's continuation (real text)")
     args = parser.parse_args()
     os.environ["HIP_VISIBLE_DEVICES"] = args.devices
     os.environ.setdefault("ENGINE_MTP", "1")
@@ -312,7 +317,11 @@ def main() -> None:
 
     def call(kind: str, b: int, k: int = 0):
         if kind == "chain":
-            return lambda: fast.verify_chain(lasts[:b], [[0] * k] * b, slots[:b], [plen] * b)
+            if args.drafts == "corpus":
+                drafts = [ids[9973 * s + plen + 1 : 9973 * s + plen + 1 + k] for s in slots[:b]]
+            else:
+                drafts = [[0] * k] * b
+            return lambda: fast.verify_chain(lasts[:b], drafts, slots[:b], [plen] * b)
         if kind == "decode":
             return lambda: fast.decode(lasts[:b], slots[:b], [plen] * b)
         return lambda: fast.verify(lasts[:b], [0] * b, slots[:b], [plen] * b)

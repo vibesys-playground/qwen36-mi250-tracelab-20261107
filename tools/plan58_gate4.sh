@@ -10,6 +10,13 @@
 #   GCD 4,5: spec_step_bench defaults (run-ahead on): spec == plain; then unit tests.
 #   GCD 6,7: live_compile_probe defaults: own-kernel compiles after /health.
 # Phase 2: short served A/B off/on/off/on (off = KMAX 3, 32 slots), counters as plan58_gate3.sh.
+#
+# j294 (baf5adc): chain_gate parity 144/144, audit 32/32 (IVF drafts unlike the full draft:
+# 0 on replay-like text up to 7 links, 1-2 per 800-1500 on natural); 1-slot replay tokens/ms
+# k=7 1.239x k=3, 2-slot k=5 1.089x; 0 compiles after /health in the A/B; served A/B off
+# 1822.7 / 1812.2 tok/s vs on 1905.8 / 1910.6, TPOT p50 3.35 / 3.37 vs 3.22 / 3.21 ms.
+# j297 (measure, 3 samples, vs cead343): within_noise, tok/s 1429 vs 1375 (1.039, noise 0.030),
+# TPOT p50 3.01 vs 3.095 ms, TPOT p90 4.844 vs 4.833 ms.
 L=/tmp/p58g4
 mkdir -p $L
 export ENGINE_TP=2 ENGINE_MTP=1 PYTHONUNBUFFERED=1

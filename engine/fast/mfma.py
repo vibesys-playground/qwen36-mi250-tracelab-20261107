@@ -286,10 +286,43 @@ def tiles_for(n: int, k: int) -> tuple[int, int, int, int]:
     return bn, bk, warps, ksplit
 
 
+class KParts:
+    """Plan 51: a K-split GEMV's fp32 parts, not yet summed (``gemv(..., defer=True)``):
+    ``part[p, r, n]`` at ``(p * BM + r) * n``. The consumer sums them in part order and rounds
+    to BF16, as ``_ksum_kernel`` does (``tp._ll_allreduce_kernel``'s KSPLIT prologue);
+    ``materialize`` runs ``_ksum_kernel`` itself."""
+
+    __slots__ = ("part", "out", "ksplit")
+
+    def __init__(self, part: torch.Tensor, out: torch.Tensor, ksplit: int) -> None:
+        self.part, self.out, self.ksplit = part, out, ksplit
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.out.shape
+
+    @property
+    def device(self) -> torch.device:
+        return self.out.device
+
+    @property
+    def is_cuda(self) -> bool:
+        return self.out.is_cuda
+
+    def materialize(self) -> torch.Tensor:
+        rows, n = self.out.shape
+        with kernels.on_device(self.out):
+            _ksum_kernel[(triton.cdiv(rows * n, 1024),)](
+                self.part, self.out, rows, n, self.out.stride(0), KSPLIT=self.ksplit, BM=BM,
+                BLOCK=1024, num_warps=4)
+        return self.out
+
+
 def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None,
-         tiles: tuple[int, int, int, int] | None = None) -> torch.Tensor:
+         tiles: tuple[int, int, int, int] | None = None, defer: bool = False):
     """``out = bf16(x @ w.T)`` in 16-row MFMA launches (see the module doc); the current
-    device must be ``x``'s."""
+    device must be ``x``'s. With ``defer``, a K-split shape of at most ``BM`` rows returns its
+    unsummed ``KParts`` (no ``_ksum_kernel`` launch) for the consumer to sum."""
     rows, k = x.shape
     n = w.shape[0]
     assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
@@ -299,6 +332,12 @@ def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None,
     part = out
     if ksplit > 1:
         part = torch.empty((ksplit * BM * n,), dtype=torch.float32, device=x.device)
+    if defer and ksplit > 1 and 0 < rows <= BM and out.is_contiguous():
+        _mfma_gemv_kernel[(triton.cdiv(n, bn) * ksplit,)](
+            x, w, out, part, rows, n, out.stride(0), K=k, BM=BM, BN=bn, BK=bk, KSPLIT=ksplit,
+            DOT_F32=kernels.INTERPRET, num_warps=warps,
+        )
+        return KParts(part, out, ksplit)
     for r0 in range(0, rows, BM):
         r1 = min(rows, r0 + BM)
         xr, orr = x[r0:r1], out[r0:r1]
@@ -343,7 +382,8 @@ def gemv_topk(x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor, wt: torch.Ten
     return out
 
 
-def gdn_chain(fd, i: int, h: torch.Tensor, states: torch.Tensor, groups: int) -> torch.Tensor:
+def gdn_chain(fd, i: int, h: torch.Tensor, states: torch.Tensor, groups: int,
+              defer: bool = False) -> torch.Tensor:
     """A chained verify step's GDN layer ``i`` (``FusedDecode``'s weights and state): rows
     ``j * n + s`` are slot s's j-th token, ``states`` each row's ring state row."""
     fast = fd.fast
@@ -369,7 +409,7 @@ def gdn_chain(fd, i: int, h: torch.Tensor, states: torch.Tensor, groups: int) ->
         m.norm.variance_epsilon, dk ** -0.5, z_off, b_off, a_off,
         RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, G=groups, num_warps=8,
     )
-    return fd._gemv(core, m.out_proj.weight)
+    return fd._gemv(core, m.out_proj.weight, defer=defer)
 
 
 def groups_of(verify) -> int:

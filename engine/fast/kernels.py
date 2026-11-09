@@ -522,6 +522,55 @@ if triton is not None:
         tl.store(out_ptr + row * N + cols, y.to(tl.bfloat16), mask=ok)
 
     @triton.jit
+    def _mtp_in_kernel(
+        tok_ptr, emb_ptr, hid_ptr, we_ptr, wh_ptr, out_ptr, stride_hid, eps,
+        N: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        """Plan 51: the MTP head's fc input of one row, ``[norm_e(embed[tok]), norm_h(hidden)]``
+        (zero-centered RMSNorms, ``_add_rms_kernel``'s math) into one [2 N] row."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        ok = cols < N
+        tok = tl.load(tok_ptr + row).to(tl.int64)
+        e = tl.load(emb_ptr + tok * N + cols, mask=ok, other=0.0).to(tl.float32)
+        we = tl.load(we_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        ye = e * tl.rsqrt(tl.sum(e * e, axis=0) / N + eps) * (1.0 + we)
+        tl.store(out_ptr + row * (2 * N) + cols, ye.to(tl.bfloat16), mask=ok)
+        h = tl.load(hid_ptr + row * stride_hid + cols, mask=ok, other=0.0).to(tl.float32)
+        wh = tl.load(wh_ptr + cols, mask=ok, other=0.0).to(tl.float32)
+        yh = h * tl.rsqrt(tl.sum(h * h, axis=0) / N + eps) * (1.0 + wh)
+        tl.store(out_ptr + row * (2 * N) + N + cols, yh.to(tl.bfloat16), mask=ok)
+
+    @triton.jit(do_not_specialize=["B"])
+    def _chain_accept_kernel(
+        tok_ptr, pick_ptr, d_ptr, y_ptr, pos_ptr, out_ptr, h_ptr, posn_ptr, B,
+        N: tl.constexpr, BLOCK: tl.constexpr, G: tl.constexpr,
+    ):
+        """Plan 51: a chained verify head's accept step for slot ``b`` (rows ``j B + b``).
+        ``a`` = the leading drafts ``tok[j + 1]`` equal to the pick before them; writes
+        ``out[j B + b] = pick``, ``out[G B + b] = a``, ``out[G B + B + b] = d[a B + b]`` (link
+        1's draft), ``h[b] = y[a B + b]`` and ``posn[j - 1, b] = pos[b] + a + j`` (1 <= j < G - 1)."""
+        b = tl.program_id(0)
+        a = tl.load(pos_ptr + b) * 0  # the positions' integer type
+        run = a + 1
+        for j in tl.static_range(G):
+            pk = tl.load(pick_ptr + j * B + b)
+            tl.store(out_ptr + j * B + b, pk)
+            if j < G - 1:
+                t = tl.load(tok_ptr + (j + 1) * B + b)
+                run = run * (t == pk).to(run.dtype)
+                a += run
+        tl.store(out_ptr + G * B + b, a.to(out_ptr.dtype.element_ty))
+        sel = (a * B + b).to(tl.int64)
+        tl.store(out_ptr + G * B + B + b, tl.load(d_ptr + sel).to(out_ptr.dtype.element_ty))
+        cols = tl.arange(0, BLOCK)
+        ok = cols < N
+        tl.store(h_ptr + b * N + cols, tl.load(y_ptr + sel * N + cols, mask=ok, other=0.0), mask=ok)
+        p0 = tl.load(pos_ptr + b)
+        for j in tl.static_range(1, G - 1):
+            tl.store(posn_ptr + (j - 1) * B + b, (p0 + a + j).to(posn_ptr.dtype.element_ty))
+
+    @triton.jit
     def _gdn_conv_kernel(
         state_ptr, slot_ptr, x_ptr, w_ptr, out_ptr, C, stride_slot, K: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -597,6 +646,36 @@ def add_rms(
             BLOCK=triton.next_power_of_2(n), HAS_H=h is not None,
         )
     return total, out
+
+
+def mtp_in(tokens: torch.Tensor, embed: torch.Tensor, hidden: torch.Tensor, w_e: torch.Tensor,
+           w_h: torch.Tensor, eps: float) -> torch.Tensor:
+    """``cat(rms(embed[tokens], w_e), rms(hidden, w_h))`` ([rows, 2 N]) in one launch."""
+    rows, n = hidden.shape
+    assert hidden.stride(1) == 1 and embed.shape[1] == n and embed.is_contiguous()
+    out = torch.empty((rows, 2 * n), dtype=hidden.dtype, device=hidden.device)
+    with on_device(hidden):
+        _mtp_in_kernel[(rows,)](tokens, embed, hidden, w_e, w_h, out, hidden.stride(0), eps, N=n,
+                                BLOCK=triton.next_power_of_2(n), num_warps=8)
+    return out
+
+
+def chain_accept(tokens: torch.Tensor, picks: torch.Tensor, d: torch.Tensor, y: torch.Tensor,
+                 positions: torch.Tensor, groups: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A chained verify head's accept step (``_chain_accept_kernel``) for ``rows = groups B``
+    rows: ``(out, h, posn)``, ``out`` the step's ``[picks (R), a (B), link-1 drafts (B),
+    further links (groups - 2, B, unwritten)]``, ``h`` [B, N] the accepted rows of ``y``,
+    ``posn`` [groups - 2, B] the further links' positions."""
+    rows, n = y.shape
+    b = rows // groups
+    assert y.is_contiguous() and rows == groups * b
+    out = torch.empty((rows + b * groups,), dtype=picks.dtype, device=y.device)
+    h = torch.empty((b, n), dtype=y.dtype, device=y.device)
+    posn = torch.empty((max(groups - 2, 1), b), dtype=positions.dtype, device=y.device)
+    with on_device(y):
+        _chain_accept_kernel[(b,)](tokens, picks, d, y, positions, out, h, posn, b, N=n,
+                                   BLOCK=triton.next_power_of_2(n), G=groups, num_warps=4)
+    return out, h, posn
 
 
 def gdn_conv_(

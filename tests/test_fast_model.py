@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / ".vibesys" / "shared" / "cpu_check"))
 
+from conftest import load_weights  # noqa: E402
 from tiny_checkpoint import write_checkpoint  # noqa: E402
 
 from engine.fast import kernels  # noqa: E402
@@ -29,15 +30,17 @@ from transformers import DynamicCache  # noqa: E402
 
 CHUNK = 8
 TRITON = kernels.triton is not None and kernels.INTERPRET
+# Where a test that calls a Triton kernel directly puts its tensors: the GPU when there is one
+# (compiled kernels), else the CPU (the interpreter).
+DEV = "cuda" if torch.cuda.is_available() and not kernels.INTERPRET else "cpu"
 
 
 @pytest.fixture(scope="module")
 def generator(tmp_path_factory: pytest.TempPathFactory) -> Generator:
     path = tmp_path_factory.mktemp("tiny")
     write_checkpoint(path)
-    return Generator.load(
+    return load_weights(
         str(path),
-        None,
         max_model_len=4096,
         chunk_tokens=CHUNK,
         prefix_cache_tokens=0,
@@ -152,14 +155,15 @@ def test_attention_reads_the_last_page_of_the_pool() -> None:
     """Page ids near the pool's end address the right memory (int64 offsets)."""
     torch.manual_seed(0)
     pages, heads, page, dim = 40, 2, 16, 32
-    k_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16)
-    v_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16)
+    k_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16).to(DEV)
+    v_pool = torch.randn(pages, heads, page, dim).to(torch.bfloat16).to(DEV)
     table = torch.zeros(2, 4, dtype=torch.int32)
     table[0, :3] = torch.tensor([pages - 1, pages - 2, 0])
     table[1, :1] = torch.tensor([pages - 1])
-    q = torch.randn(2, 8, dim).to(torch.bfloat16)
-    slots = torch.tensor([0, 1])
-    lengths = torch.tensor([40, 16], dtype=torch.int32)
+    table = table.to(DEV)
+    q = torch.randn(2, 8, dim).to(torch.bfloat16).to(DEV)
+    slots = torch.tensor([0, 1]).to(DEV)
+    lengths = torch.tensor([40, 16], dtype=torch.int32).to(DEV)
     ref = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=False)
     got = kernels.paged_decode_attention(q, k_pool, v_pool, table, slots, lengths, 0.2, use_triton=True)
     assert float((ref.float() - got.float()).abs().max()) < 2e-2

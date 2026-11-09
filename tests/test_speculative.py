@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / ".vibesys" / "shared" / "cpu_check"))
 
+from conftest import load_weights, model_device  # noqa: E402
 from tiny_checkpoint import write_checkpoint  # noqa: E402
 
 from engine.fast.model import FastModel  # noqa: E402
@@ -68,9 +69,8 @@ def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="module")
 def generator(checkpoint: Path) -> Generator:
-    return Generator.load(
+    return load_weights(
         str(checkpoint),
-        None,
         max_model_len=4096,
         chunk_tokens=CHUNK,
         prefix_cache_tokens=0,
@@ -81,7 +81,7 @@ def generator(checkpoint: Path) -> Generator:
 @pytest.fixture(scope="module")
 def head(generator: Generator, checkpoint: Path) -> MTPHead:
     config = generator.model.config
-    return MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), "cpu")
+    return MTPHead.load(str(checkpoint), None, getattr(config, "text_config", config), model_device(generator))
 
 
 def _fast(generator: Generator, head: MTPHead | None) -> FastModel:

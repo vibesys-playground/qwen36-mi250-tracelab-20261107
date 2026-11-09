@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 import torch
-from conftest import CHUNK, Server, repeat_reuse
+from conftest import CHUNK, Server, load_weights, repeat_reuse
 from engine.generator import Generation, Generator
 from engine.protocol import Sampling
 
@@ -149,9 +149,8 @@ def _generator(model: Generator, budget: int | None, entries: int = 64) -> Gener
 @pytest.fixture(scope="module")
 def loaded(checkpoint: Path) -> Generator:
     torch.manual_seed(0)
-    return Generator.load(
+    return load_weights(
         str(checkpoint),
-        None,
         max_model_len=4096,
         chunk_tokens=CHUNK,
         prefix_cache_tokens=1 << 20,

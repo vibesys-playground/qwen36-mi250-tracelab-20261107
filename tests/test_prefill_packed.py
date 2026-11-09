@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / ".vibesys" / "shared" / "cpu_check"))
 
+from conftest import load_weights  # noqa: E402
 from tiny_checkpoint import write_checkpoint  # noqa: E402
 
 from engine.fast import kernels  # noqa: E402
@@ -34,9 +35,8 @@ TRITON = kernels.triton is not None and kernels.INTERPRET
 def generator(tmp_path_factory: pytest.TempPathFactory) -> Generator:
     path = tmp_path_factory.mktemp("tiny")
     write_checkpoint(path)
-    return Generator.load(
+    return load_weights(
         str(path),
-        None,
         max_model_len=4096,
         chunk_tokens=CHUNK,
         prefix_cache_tokens=0,

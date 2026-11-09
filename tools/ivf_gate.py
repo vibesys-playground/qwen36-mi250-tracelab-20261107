@@ -49,6 +49,62 @@ if triton is not None:
         tl.store(out_ptr + r * P + i, idx, mask=i < P)
 
 
+    @triton.jit
+    def _radix_topp_kernel(s_ptr, out_ptr, nxt_ptr, C: tl.constexpr, P: tl.constexpr):
+        """out[r, :P] = indices of the P largest bf16 scores of s[r, :C] (ties to the lower
+        index; in index order), nxt[r] = the best unselected score (the gate's (P+1)-th).
+        A 16-step radix select on the scores' 16-bit order keys (bf16 has 16 bits), then a
+        compaction by prefix sums; one program per row."""
+        r = tl.program_id(0)
+        i = tl.arange(0, C)
+        b = tl.load(s_ptr + r * C + i)
+        bi = b.to(tl.int16, bitcast=True).to(tl.int32)
+        key = tl.where(bi >= 0, bi + 32768, ~bi)
+        t = tl.zeros([], dtype=tl.int32)
+        for j in tl.static_range(16):
+            cand = t | (1 << (15 - j))
+            cnt = tl.sum((key >= cand).to(tl.int32), axis=0)
+            t = tl.where(cnt >= P, cand, t)
+        gt = key > t
+        ngt = tl.sum(gt.to(tl.int32), axis=0)
+        eq = key == t
+        ceq = tl.cumsum(eq.to(tl.int32), axis=0)
+        sel = gt | (eq & (ceq <= P - ngt))
+        pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
+        tl.store(out_ptr + r * P + pos, i.to(tl.int64), mask=sel)
+        rest = tl.where(sel, float("-inf"), b.to(tl.float32))
+        tl.store(nxt_ptr + r, tl.max(rest, axis=0))
+
+    @triton.jit
+    def _flag_kernel(flag_ptr, out_ptr):
+        """A predicated launch that is not taken: read a flag, return (served-path extra)."""
+        f = tl.load(flag_ptr)
+        if f != 0:
+            tl.store(out_ptr, f)
+
+
+class RadixSelect:
+    def __init__(self, d: draft_ivf.Draft, max_rows: int, num_warps: int = 4) -> None:
+        self.d, self.warps = d, num_warps
+        self.c = d.cent.shape[0]
+        self.buf = torch.empty((max_rows, d.p), dtype=torch.int64, device=d.ws.device)
+        self.nxt = torch.empty((max_rows,), dtype=torch.float32, device=d.ws.device)
+
+    def select_scores(self, s: torch.Tensor) -> torch.Tensor:
+        rows = s.shape[0]
+        sel = self.buf[:rows]
+        _radix_topp_kernel[(rows,)](s, sel, self.nxt, C=self.c, P=self.d.p, num_warps=self.warps)
+        return sel
+
+    def select(self, y: torch.Tensor) -> torch.Tensor:
+        return self.select_scores(mfma.gemv(y, self.d.cent))
+
+    def pack(self, y: torch.Tensor) -> torch.Tensor:
+        sel = self.select(y)
+        self.d.gather(y, sel)
+        return self.d.pick(y.shape[0])
+
+
 class FusedSelect:
     def __init__(self, d: draft_ivf.Draft, max_rows: int) -> None:
         self.d = d
@@ -139,7 +195,11 @@ def run(samples, W, args, out, time_us) -> None:
     rows_list = (1, 2)
     ysrc = torch.cat([y for y, _ in samples[("natural_cal", 1)]])
     w0 = shards[0].contiguous()
-    t_full, t_search, t_fused = {}, {}, {}
+    t_full, t_search, t_fused, t_radix = {}, {}, {}, {}
+    flag = torch.zeros(1, dtype=torch.int32, device=dev)
+    sink = torch.zeros(1, dtype=torch.int32, device=dev)
+    t_noop = time_us([lambda: _flag_kernel[(1,)](flag, sink)])
+    out("time_noop", predicated_launch_us=round(t_noop, 2))
     for R in rows_list:
         y = ysrc[:R].contiguous()
         t_full[R] = time_us([lambda: tp.argmax_pick(tp.argmax_pack(mfma.gemv(y, w0), 0, 0))])
@@ -154,8 +214,35 @@ def run(samples, W, args, out, time_us) -> None:
             fused_ok = bool(torch.equal(a_, b_))
         except Exception as exc:  # noqa: BLE001
             fused_ok = f"error {exc!r}"[:300]
+        rx_best = None
+        for warps in (4, 8, 16):
+            rx = RadixSelect(d, 8, warps)
+            try:  # exact: the first P of a stable descending sort (ties to the lower index)
+                q = ysrc[:8].contiguous()
+                sc = mfma.gemv(q, d.cent)
+                ref = torch.sort(sc.float(), dim=1, descending=True, stable=True).indices
+                got = torch.sort(rx.select_scores(sc), 1).values
+                exact = bool(torch.equal(got, torch.sort(ref[:, :P], 1).values))
+                nxt_ok = bool(torch.equal(rx.nxt[:8], sc.float().gather(1, ref[:, P:P + 1])[:, 0]))
+                tk = torch.sort(sc.float().gather(1, torch.topk(sc.float(), P, dim=1).indices), 1).values
+                topk_ok = bool(torch.equal(torch.sort(sc.float().gather(1, got), 1).values, tk))
+                y2 = ysrc[:2].contiguous()
+                t_sel = time_us([lambda: rx.select(y2)])
+                out("radix_check", P=P, warps=warps, exact_vs_stable_sort=exact, next_score_ok=nxt_ok,
+                    scores_match_topk=topk_ok, select_us_2rows=round(t_sel, 1))
+                if exact and topk_ok and (rx_best is None or t_sel < rx_best[1]):
+                    rx_best = (rx, t_sel)
+            except Exception as exc:  # noqa: BLE001
+                out("error", what=f"radix P={P} warps={warps}", error=repr(exc)[:400])
         for R in rows_list:
             y = ysrc[:R].contiguous()
+            if rx_best is not None:
+                rx = rx_best[0]
+                t_radix[(P, R)] = time_us([lambda: tp.argmax_pick(rx.pack(y))])
+                out("time_radix", P=P, rows=R, warps=rx.warps, search_us=round(t_radix[(P, R)], 1),
+                    select_us=round(time_us([lambda: rx.select(y)]), 1),
+                    radix_kernel_us=round(time_us([lambda: rx.select_scores(mfma.gemv(y, d.cent))]) -
+                                          time_us([lambda: mfma.gemv(y, d.cent)]), 1))
             t_search[(P, R)] = time_us([lambda: tp.argmax_pick(d.pack(y))])
             if fused_ok is True:
                 t_fused[(P, R)] = time_us([lambda: tp.argmax_pick(fz.pack(y))])
@@ -165,7 +252,7 @@ def run(samples, W, args, out, time_us) -> None:
             out("time", P=P, rows=R, full_us=round(t_full[R], 1), search_us=round(t_search[(P, R)], 1),
                 fused_search_us=round(t_fused[(P, R)], 1) if (P, R) in t_fused else None,
                 fused_select_us=None if t_sel is None else round(t_sel, 1), fused_matches_topk=fused_ok)
-        del d, fz
+        del d, fz, rx_best
         torch.cuda.empty_cache()
 
     # ---------------------------------------------------------------- calibrate
@@ -228,6 +315,9 @@ def run(samples, W, args, out, time_us) -> None:
                     fr = statistics.mean(x["fallback"] for x in r)
                     exp = {R: t_search[(P, R)] + fr * t_full[R] for R in rows_list}
                     expf = {R: t_fused[(P, R)] + fr * t_full[R] for R in rows_list if (P, R) in t_fused}
+                    expr = {R: t_radix[(P, R)] + fr * t_full[R] for R in rows_list if (P, R) in t_radix}
+                    srv = {(R, ar): t_radix[(P, R)] + 3 * t_noop + fr * (t_full[R] + ar)
+                           for R in rows_list for ar in (10, 20) if (P, R) in t_radix}
                     out("gated", P=P, target=target, sig=sig, tau=rule["tau"], kind=kind,
                         cal_fallback=round(rule["cal_fallback"], 4),
                         agree=[round(x["agree"], 5) for x in r],
@@ -235,7 +325,9 @@ def run(samples, W, args, out, time_us) -> None:
                         fallback=[round(x["fallback"], 4) for x in r], n=[x["n"] for x in r],
                         expected_us={R: round(v, 1) for R, v in exp.items()},
                         saving_us={R: round(t_full[R] - v, 1) for R, v in exp.items()},
-                        fused_saving_us={R: round(t_full[R] - v, 1) for R, v in expf.items()})
+                        fused_saving_us={R: round(t_full[R] - v, 1) for R, v in expf.items()},
+                        radix_saving_us={R: round(t_full[R] - v, 1) for R, v in expr.items()},
+                        served_saving_us={f"{R}rows_ar{ar}": round(t_full[R] - v, 1) for (R, ar), v in srv.items()})
             if rules:  # the calibration's own choice: least calibration fallback
                 chosen[(P, target)] = min(rules, key=lambda x: x["cal_fallback"])
 
@@ -249,14 +341,19 @@ def run(samples, W, args, out, time_us) -> None:
                 continue
             ok_agree &= min(x["agree"] for x in r) >= 0.993
             fr = statistics.mean(x["fallback"] for x in r)
+            rad = t_radix.get((P, 2))
             savings[kind] = (round(t_full[2] - (t_search[(P, 2)] + fr * t_full[2]), 1),
-                             round(t_full[2] - (t_fused[(P, 2)] + fr * t_full[2]), 1) if (P, 2) in t_fused else None)
-        ok_save = all(s[0] >= 150 for s in savings.values())
-        ok_save_f = all(s[1] is not None and s[1] >= 150 for s in savings.values())
+                             None if rad is None else round(t_full[2] - (rad + fr * t_full[2]), 1),
+                             None if rad is None else round(t_full[2] - (rad + 3 * t_noop + fr * (t_full[2] + 20)), 1))
+        ok_save = all(s[1] is not None and s[1] >= 150 for s in savings.values())
+        ok_save_f = all(s[2] is not None and s[2] >= 150 for s in savings.values())
         v = dict(P=P, target=target, sig=rule["sig"], tau=rule["tau"], agree_ok=ok_agree,
-                 saving_ok=ok_save, saving_ok_fused=ok_save_f, saving_us_2rows=savings)
+                 saving_ok_radix=ok_save, saving_ok_radix_served_ar20=ok_save_f,
+                 saving_us_2rows_topk_radix_served=savings)
         verdicts.append(v)
         out("gate_choice", **v)
-    out("verdict_gate", go=any(v["agree_ok"] and (v["saving_ok"] or v["saving_ok_fused"]) for v in verdicts),
+    out("verdict_gate", go_radix=any(v["agree_ok"] and v["saving_ok_radix"] for v in verdicts),
+        go_served_ar20=any(v["agree_ok"] and v["saving_ok_radix_served_ar20"] for v in verdicts),
         rule="calibrated on natural_cal; pass iff natural_test and doc agreement >= 99.3% at every depth "
-             "and expected saving >= 150 us per draft at 2 rows on both")
+             "and expected saving >= 150 us per draft at 2 rows on both (radix selection; served adds 3 "
+             "predicated launches per draft and a 20 us rank all-reduce per fallback)")

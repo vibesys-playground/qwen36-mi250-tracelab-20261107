@@ -287,6 +287,9 @@ def real(args) -> None:
         out(f"RESULT pack s={time.perf_counter() - t0:.0f}")
 
         # ---- (b) routing sets and the three methods
+        # The HIP decoder of the last packed tensor left cuda:1 current; Triton launches on the
+        # current device, so make cuda:0 (where the picked layers live) current first (j216).
+        torch.cuda.set_device(dev0)
         fd = fast.fused
         layers = {}
         for i in pick:

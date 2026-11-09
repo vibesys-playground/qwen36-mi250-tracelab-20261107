@@ -124,6 +124,12 @@ def main() -> None:
                             agree += 1
                         else:
                             close_misses.append(round(saved["margins"][k][step + 1], 4))
+                            # plan 50: where, and how the check itself saw the two tokens
+                            print(f"RESULT miss prompt={k} step={step} ref_pick={want} got={lasts[j]} "
+                                  f"ref_margin={saved['margins'][k][step + 1]:.4f} "
+                                  f"check_margin={float(top[j, 0] - top[j, 1]):.4f} "
+                                  f"check_logit_got_minus_ref_pick={float(out[j, lasts[j]] - out[j, want]):.4f}",
+                                  flush=True)
             for k in group:
                 record["inputs"][k] = inputs[k]
                 record["picks"][k] = picks[k]

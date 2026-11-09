@@ -43,9 +43,16 @@ NATURAL = [0.835, 0.717, 0.794, 0.827, 0.713, 0.637, 0.692]  # j268 1-slot k=7, 
 def test_depths_by_bucket():
     assert S.depths(1) == [1, 3, 4, 5, 7]
     assert S.depths(2) == [1, 3, 4, 5, 7]
-    assert S.depths(4) == [1, 3]  # no measured cost row: plan 31's depths only
+    assert S.depths(3) == [1, 3]  # rows for k 1, 3 only (plan 73): plan 31's depths
+    assert S.depths(4) == [1, 3]
+    assert S.depths(6) == [1, 3]
     assert S.depths(16) == [1, 3]
     assert S.depths(32) == [1]
+
+
+def test_row_by_bucket():
+    assert S._row(3) == 3 and S._row(4) == 4 and S._row(6) == 4 and S._row(8) == 4
+    assert S.cost(3, 3) > S.cost(2, 3) and S.cost(5, 1) == S.cost(4, 1)
 
 
 def test_kmax3_is_plan31(monkeypatch):

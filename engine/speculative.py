@@ -126,9 +126,13 @@ MARGIN = float(os.environ.get("ENGINE_SPEC_DEEP_MARGIN", "0.05"))
 DEEP_SIZES = {int(x) for x in os.environ.get("ENGINE_SPEC_DEEP_SIZES", "").split(",") if x.strip()}
 # ms per chained verify step by (slot bucket, k): the captured ``verify_chain`` step under TP2
 # with HIP GDN and IVF drafts on ROCm 7.0, median of 200 (plan 58, j303, the afb6be0 merge;
-# j268's ROCm 6.4 table moved by up to 12.5%). "k:ms" items are size 2.
+# j268's ROCm 6.4 table moved by up to 12.5%). "k:ms" items are size 2. Plan 73: rows 3 and 4
+# (k 1, 3) from j336 (exact 3-slot graph; 4-slot graph, 3:4:1 with 3 real slots), scaled to this
+# table by j336's own 2:3 (12.006 ms -> 11.54); larger buckets use row 4. Before, 3- and 4-slot
+# steps were priced with the 2-slot row (k=3 at 1.39x k=1; it is 1.49x at 3 slots, 1.54x at 4).
 COST = ("1:1:7.07,1:3:8.86,1:4:10.29,1:5:11.62,1:7:14.74,"
-        "2:1:8.28,2:3:11.54,2:4:13.42,2:5:15.26,2:7:19.46")
+        "2:1:8.28,2:3:11.54,2:4:13.42,2:5:15.26,2:7:19.46,"
+        "3:1:8.60,3:3:12.83,4:1:10.27,4:3:15.81")
 _COST_CACHE: dict[str, dict[tuple[int, int], float]] = {}
 
 

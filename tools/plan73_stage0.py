@@ -53,7 +53,9 @@ def main() -> None:
                         help="real:bucket:k items")
     parser.add_argument("--bitwise", default="3:4,5:8,6:8", help="exact:larger bucket pairs (real = exact)")
     parser.add_argument("--bitwise-ks", default="1,3,5")
-    parser.add_argument("--bitwise-steps", type=int, default=50)
+    parser.add_argument("--bitwise-steps", type=int, default=0,
+                        help="direct verify_chain pairs at stale positions (j336: each call moves the slot "
+                        "state, so these differ by state, not by bucket; the per-step check is in the generations)")
     parser.add_argument("--gen-new", type=int, default=192)
     parser.add_argument("--skip-gen", action="store_true")
     args = parser.parse_args()
@@ -90,9 +92,12 @@ def main() -> None:
         depths={s: speculative.depths(s) for s in r0.buckets})
     real_bucket = r0.bucket
 
-    def force(b: int | None) -> None:
+    def force(b: int | None, only: int | None = None) -> None:
+        """Steps of ``batch <= b`` (or only of ``batch == only``) replay bucket ``b``."""
         if b is None:
             r0.__dict__.pop("bucket", None)
+        elif only is not None:
+            r0.bucket = lambda batch, _b=b: _b if batch == only else real_bucket(batch)
         else:
             r0.bucket = lambda batch, _b=b: _b if batch <= _b else real_bucket(batch)
 
@@ -256,7 +261,19 @@ def main() -> None:
             g._reclaim()
             return seqs, g.verify_steps - before
 
-        gen_total = gen_same = 0
+        gen_total = gen_same = step_total = step_same = 0
+        rec: list = []
+        real_vc = fast.verify_chain
+
+        def logged(tokens, drafts, slots_, positions):
+            res = real_vc(tokens, drafts, slots_, positions)
+            lg = res[0]
+            # real rows' outputs: logits after the last tokens (bytes hash), picks, accepted, next drafts
+            h = hash(lg.float().cpu().numpy().tobytes())
+            rec.append((len(tokens), len(drafts[0]), h, res[1], res[2], res[3]))
+            return res
+
+        fast.verify_chain = logged
         for pair in [p_ for p_ in args.bitwise.split(",") if p_]:
             exact, larger = (int(x) for x in pair.split(":"))
             if exact not in r0.buckets:
@@ -266,22 +283,37 @@ def main() -> None:
                 for name, group in sets.items():
                     group = group[:exact]
                     try:
-                        force(larger)
+                        force(larger, only=exact)
+                        rec.clear()
                         want, st_l = run(group)
+                        rec_l = list(rec)
+                        rec.clear()
                         force(None)
                         got, st_e = run(group)
+                        rec_e = list(rec)
                     except Exception:  # noqa: BLE001
                         force(None)
                         out("error", what=f"gen {exact} {kname} {name}",
                             error=traceback.format_exc().replace("\n", " | ")[-1500:])
                         continue
                     same = sum(a == b for a, b in zip(got, want, strict=True))
+                    # every verify step's outputs (ENGINE_RUNAHEAD=0: steps go through verify_chain)
+                    steps_same = sum(a == b for a, b in zip(rec_e, rec_l))
+                    step_total += max(len(rec_e), len(rec_l))
+                    step_same += steps_same
+                    out("gen_steps", exact=exact, k=kname or "adaptive", set=name,
+                        identical=f"{steps_same}/{max(len(rec_e), len(rec_l))}",
+                        steps_at_exact=sum(1 for r in rec_e if r[0] == exact),
+                        first_diff=next((i for i, (a, b) in enumerate(zip(rec_e, rec_l)) if a != b), None))
                     gen_total += len(group)
                     gen_same += same
                     out("gen", exact=exact, larger=larger, k=kname or "adaptive", set=name,
                         identical=f"{same}/{len(group)}", steps_exact=st_e, steps_padded=st_l)
         os.environ["ENGINE_SPEC_K"] = ""
-        out("gen_summary", identical=f"{gen_same}/{gen_total}", verdict="PASS" if gen_same == gen_total else "FAIL")
+        fast.verify_chain = real_vc
+        out("gen_summary", identical=f"{gen_same}/{gen_total}", verdict="PASS" if gen_same == gen_total else "FAIL",
+            verify_steps_identical=f"{step_same}/{step_total}",
+            step_verdict="PASS" if step_same == step_total else "FAIL")
     if hasattr(fast, "timeouts"):
         out("tp_allreduce_timeouts", n=fast.timeouts())
     out("done", seconds=round(time.perf_counter() - started))

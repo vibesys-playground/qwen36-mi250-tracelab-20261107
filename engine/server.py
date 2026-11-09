@@ -23,11 +23,13 @@ or ``--replicas 1``, it serves in-process as described above.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import queue
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -78,6 +80,18 @@ class Job:
     cancelled: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass
+class Control:
+    """A step-boundary operation for the worker (a live move's export, import or drop, plan
+    63): the worker starts ``op`` between steps and polls it until it is done; the submitter
+    waits on ``done`` and reads ``result`` or ``error``."""
+
+    op: Any
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, Any] | None = None
+    error: Exception | None = None
+
+
 def _internal(exc: Exception) -> RequestError:
     return RequestError(f"internal error: {type(exc).__name__}: {exc}", 500)
 
@@ -92,13 +106,47 @@ class Worker:
     prefilled alone (``Generator.start``) before the decode step, as before.
     """
 
-    def __init__(self, generator: Generator) -> None:
+    def __init__(self, generator: Generator, mover: Any = None) -> None:
         self._generator = generator
-        self._jobs: queue.Queue[Job] = queue.Queue()
+        self._mover = mover
+        self._controls: list[Control] = []  # started, not done
+        self._jobs: queue.Queue[Job | Control] = queue.Queue()
         threading.Thread(target=self._loop, name="engine-worker", daemon=True).start()
 
-    def submit(self, job: Job) -> None:
+    def submit(self, job: Job | Control) -> None:
         self._jobs.put(job)
+
+    def _step_control(self, control: Control, start: bool) -> None:
+        """Start (or poll) ``control`` on this thread; it leaves ``_controls`` once done."""
+        op = control.op
+        t = time.perf_counter()
+        try:
+            if start:
+                op.start()
+            finished = op.poll()
+        except Exception as exc:  # noqa: BLE001 - reported to the submitter
+            op.inline += time.perf_counter() - t
+            control.error = exc
+            if self._mover is not None:
+                self._mover.finished(op, ok=False)
+            if not start:
+                self._controls.remove(control)
+            control.done.set()
+            return
+        op.inline += time.perf_counter() - t
+        if finished:
+            control.result = op.result
+            if self._mover is not None:
+                self._mover.finished(op, ok=True)
+            if not start:
+                self._controls.remove(control)
+            control.done.set()
+        elif start:
+            self._controls.append(control)
+
+    def _poll_controls(self) -> None:
+        for control in list(self._controls):
+            self._step_control(control, start=False)
 
     @staticmethod
     def _advance(
@@ -155,7 +203,10 @@ class Worker:
         timed = looptimers.ENABLED
         T = looptimers
         prev_batch: int | None = None
+        mover = self._mover
         while True:
+            t_iter = time.perf_counter()
+            moving = bool(self._controls)
             if timed:
                 T.begin()
                 t_mark = T.now()
@@ -166,10 +217,17 @@ class Worker:
             serial: list[tuple[Job, Iterator[Any], Prefill]] = []
             while True:
                 try:
-                    job = self._jobs.get(block=block)
+                    if block and self._controls:  # idle, but a move's copy is in flight
+                        job = self._jobs.get(timeout=0.0005)
+                    else:
+                        job = self._jobs.get(block=block)
                 except queue.Empty:
                     break
                 block = False
+                if isinstance(job, Control):
+                    self._step_control(job, start=True)
+                    moving = moving or bool(self._controls)
+                    continue
                 if timed:
                     arrivals += 1
                 events = job.run()
@@ -182,6 +240,8 @@ class Worker:
                     serial.append((job, events, want))
                 else:
                     prefilling[packer.add(want.prompt, want.sampling)] = (job, events)
+            if self._controls:
+                self._poll_controls()
             if speculative.pending(g) and (
                 serial or prefilling or ready_pending(packer)
                 or any(job.cancelled.is_set() for job, _ in running)
@@ -192,10 +252,12 @@ class Worker:
                 t = T.now()
                 T.add("poll", t - t_mark)
                 t_mark = t
+            stepped = False
             if packer is not None:
                 for ticket, exc in packer.failed():
                     self._fail(*prefilling.pop(ticket), exc)
                 if packer.busy:
+                    stepped = True
                     for ticket, result in packer.step():
                         job, events = prefilling.pop(ticket)
                         if isinstance(result, Exception):
@@ -256,6 +318,8 @@ class Worker:
                     prev_batch = len(batch)
                 else:
                     g.decode([generation for _, _, generation in waiting], ahead_ok)
+                if mover is not None and not stepped and not serial:
+                    mover.loop(len(waiting), time.perf_counter() - t_iter, moving)
             except Exception as exc:  # the step failed for every request in it
                 g._ahead = None
                 for job, _, _ in waiting:
@@ -348,7 +412,10 @@ def _run(
 
 
 def completion_job(
-    generator: Generator, model: str, request: CompletionRequest
+    generator: Generator,
+    model: str,
+    request: CompletionRequest,
+    on_tail: Callable[[tuple[int, ...]], None] | None = None,
 ) -> Iterator[dict[str, Any] | AwaitDecode]:
     """Events for ``/v1/completions``: chunks when streaming, else one response."""
     prompt = (
@@ -379,6 +446,8 @@ def completion_job(
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
+    if on_tail is not None and generation.tail_key is not None:
+        on_tail(generation.tail_key)  # the router may move this session's state (plan 63)
     if request.stream:
         if request.include_usage:
             yield protocol.usage_chunk(env, usage)
@@ -389,7 +458,10 @@ def completion_job(
 
 
 def chat_job(
-    generator: Generator, model: str, request: ChatRequest
+    generator: Generator,
+    model: str,
+    request: ChatRequest,
+    on_tail: Callable[[tuple[int, ...]], None] | None = None,
 ) -> Iterator[dict[str, Any] | AwaitDecode]:
     """Events for ``/v1/chat/completions``; reasoning streams as ``reasoning_content``."""
     prompt = generator.encode_chat(request)
@@ -428,6 +500,8 @@ def chat_job(
         finish = finish_now or finish
         if finish_now is None:
             yield AwaitDecode(generation)
+    if on_tail is not None and generation.tail_key is not None:
+        on_tail(generation.tail_key)  # the router may move this session's state (plan 63)
     if request.stream:
         if request.include_usage:
             yield protocol.usage_chunk(env, usage)
@@ -461,9 +535,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._send_json(
-                200, {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
-            )
+            body = {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
+            if self.server.mover is not None:
+                body["migrate"] = self.server.mover.stats()
+            self._send_json(200, body)
         elif self.path == "/v1/models":
             card = {
                 "id": self.server.model_name,
@@ -476,6 +551,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, protocol.error_body(f"no route {self.path}", 404))
 
     def do_POST(self) -> None:
+        if self.path.startswith("/internal/"):
+            self._internal_op()
+            return
         routes = {
             "/v1/completions": (protocol.parse_completion, completion_job),
             "/v1/chat/completions": (protocol.parse_chat, chat_job),
@@ -496,9 +574,48 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(exc.status, protocol.error_body(str(exc), exc.status))
             return
         generator, model = self.server.generator, self.server.model_name
-        job = Job(run=lambda: job_of(generator, model, request))
+        on_tail = None
+        mover = self.server.mover
+        ticket = self.headers.get("X-Engine-Ticket")
+        if mover is not None and ticket is not None and ticket.isdigit():
+            on_tail = functools.partial(mover.remember, int(ticket))  # runs on the worker
+        job = Job(run=lambda: job_of(generator, model, request, on_tail))
         self.server.worker.submit(job)
         self._respond(job, stream=request.stream)
+
+    def _internal_op(self) -> None:
+        """``/internal/export|import|drop`` (plan 63), from the router only: a live move of a
+        session's state, run by the worker between steps."""
+        mover = self.server.mover
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"null")
+            if mover is None:
+                raise RequestError("live moves are off on this replica", 404)
+            if self.path == "/internal/export":
+                op = mover.export(int(body["ticket"]))
+            elif self.path == "/internal/import":
+                op = mover.import_(int(body["source"]), body["key"])
+            elif self.path == "/internal/drop":
+                op = mover.drop(body["key"])
+            else:
+                raise RequestError(f"no route {self.path}", 404)
+        except RequestError as exc:
+            self._send_json(exc.status, protocol.error_body(str(exc), exc.status))
+            return
+        except (ValueError, KeyError, TypeError) as exc:
+            self._send_json(400, protocol.error_body(f"bad internal request: {exc}", 400))
+            return
+        control = Control(op)
+        self.server.worker.submit(control)
+        if not control.done.wait(timeout=60):
+            self._send_json(504, protocol.error_body("the worker did not finish the move", 504))
+            return
+        if control.error is not None:
+            message = f"{type(control.error).__name__}: {control.error}"
+            self._send_json(409, protocol.error_body(message, 409))
+            return
+        self._send_json(200, control.result or {})
 
     def _respond(self, job: Job, *, stream: bool) -> None:
         first = job.events.get()
@@ -541,11 +658,32 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], generator: Generator, model_name: str) -> None:
+    def __init__(
+        self, address: tuple[str, int], generator: Generator, model_name: str, mover: Any = None
+    ) -> None:
         super().__init__(address, _Handler)
         self.generator = generator
         self.model_name = model_name
-        self.worker = Worker(generator)
+        self.mover = mover
+        self.worker = Worker(generator, mover)
+
+
+def _mover(generator: Generator) -> Any:
+    """This replica's side of live session moves (plan 63) when the router handed it the
+    move channels (``ENGINE_MIGRATE_CHANNELS``); None otherwise."""
+    fds = os.environ.get("ENGINE_MIGRATE_CHANNELS", "").strip()
+    index = os.environ.get("ENGINE_REPLICA_INDEX", "").strip()
+    if not fds or not index or generator.fast is None:
+        return None
+    from engine import migrate
+
+    try:
+        mover = migrate.Mover(generator, int(index), [int(f) for f in fds.split(",")])
+    except Exception as exc:  # noqa: BLE001 - serve without moves; the router's moves fail
+        print(f"engine: live moves off ({type(exc).__name__}: {exc})", flush=True)
+        return None
+    print(f"engine: live moves on, {len(mover.channels)} channels", flush=True)
+    return mover
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -641,7 +779,9 @@ def main(argv: list[str] | None = None) -> None:
         prefix_cache_bytes=int(args.prefix_cache_gib * 2**30),
         experts_impl=args.experts_implementation,
     )
-    server = _Server((args.host, args.port), generator, args.served_model_name or args.model)
+    server = _Server(
+        (args.host, args.port), generator, args.served_model_name or args.model, _mover(generator)
+    )
     if gpus:
         per_gpu = ", ".join(
             f"{d}: {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(gpus)

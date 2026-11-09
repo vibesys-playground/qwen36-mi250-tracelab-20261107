@@ -1,23 +1,29 @@
 """Fused Gated DeltaNet prefill chain (plan 40 part B, ``ENGINE_GDN_CHUNK``).
 
 One sequence of T rows of one layer on one tensor-parallel rank (HV value heads, H key heads,
-HV % H == 0, key and value head dims K = V = 128 here), from the convolved projection
-``mixed`` [T, 2*H*K + HV*V] (q | k | v, a column block per head) and the raw gate inputs
-``a``, ``b`` [T, HV] to the core output [T, HV, V] and the slot's new recurrent state, in two
-launches instead of fla's chain behind ``torch_chunk_gated_delta_rule`` (q/k head repeat,
-two l2norms, the decay cumsum, kkt + solve, w/u, the state pass, the output pass, plus the
-gate, padding and state-row gather/scatter ops around it):
+HV % H == 0, key and value head dims K = V = 128 here), from the raw projection ``qkv``
+[T, 2*H*K + HV*V] (q | k | v, a column block per head; rows may be strided), the slot's conv
+state and the raw gate inputs ``a``, ``b`` [T, HV] to the core output [T, HV, V] and the slot's
+new conv and recurrent states, in three launches instead of the depthwise conv kernel and fla's
+chain behind ``torch_chunk_gated_delta_rule`` (q/k head repeat, two l2norms, the decay cumsum,
+kkt + solve, w/u, the state pass, the output pass, plus the gate, padding and state-row
+gather/scatter ops around it):
 
-- ``gdn_chunk_wy_kernel`` (grid: chunks x HV, all independent): per 64-row chunk and value head, the
-  decay ``g = -exp(A_log) * softplus(a + dt_bias)`` (fp32, as ``gdn_gates``) and its in-chunk
-  cumulative sum (in log2 units, fla's ``RCP_LN2`` scale), ``beta = sigmoid(b)`` rounded to
-  BF16, the l2-normalized q and k rows (fp32, rounded to BF16, eps 1e-6, as fla's l2norm),
-  then fla's fused kkt + solve on 16-row sub-blocks ((I + A)^-1 with A = beta * k k^T *
-  exp(g_i - g_j), strictly lower) and fla's ``recompute_w_u``: w = Ai (k * beta * exp(g)),
-  u = Ai (v * beta), with Ai rounded to BF16 as fla stores it.
-- ``gdn_chunk_state_kernel`` (grid: V / BV x HV, sequential over chunks): fla's ``chunk_fwd_h`` and
-  ``chunk_fwd_o`` in one pass that keeps the fp32 state in registers: per chunk,
-  v_new = u - w h, o = scale * (q h * exp(g) + tril(q k^T * exp(g_i - g_j)) v_new), then
+- ``gdn_chunk_wy_kernel`` (grid: chunks x HV, all independent): per 64-row chunk and value
+  head, the causal depthwise conv + silu of the q, k and v channels it reads (the same
+  arithmetic and roundings as ``prefill_kernels.gdn_conv_``: fp32 taps in order, BF16 conv
+  output, BF16 silu), the decay ``g = -exp(A_log) * softplus(a + dt_bias)`` (fp32, as
+  ``gdn_gates``) and its in-chunk cumulative sum (log2 units, fla's ``RCP_LN2``), ``beta =
+  sigmoid(b)`` rounded to BF16, the l2-normalized q and k rows (fp32, eps 1e-6, rounded to
+  BF16, as fla's l2norm), fla's fused kkt + solve on 16-row sub-blocks ((I + A)^-1 with A =
+  beta * k k^T * exp(g_i - g_j), strictly lower; stored in BF16 as fla does) and fla's
+  ``recompute_w_u``: w = Ai (k * beta * exp(g)), u = Ai (v * beta); and the chunk's causal
+  score block q k^T * exp(g_i - g_j) (fla's ``chunk_fwd_o``'s A, rounded to BF16 as it is).
+- ``prefill_kernels._gdn_conv_state_kernel``: the conv state after the real rows (after the
+  conv above read the old one).
+- ``gdn_chunk_state_kernel`` (grid: V / BV x HV, sequential over chunks): fla's
+  ``chunk_fwd_h`` and ``chunk_fwd_o`` in one pass that keeps the fp32 state in registers:
+  per chunk, v_new = u - w h, o = scale * (q h * exp(g) + A_qk v_new), then
   h = h * exp(g_last) + k^T (v_new * exp(g_last - g)). The state row is read from and
   written back to the layer's state tensor in place (the row index may live on the device).
 
@@ -36,37 +42,37 @@ import torch
 from engine.fast.kernels import INTERPRET, on_device, tl, triton
 
 _WIDEN = INTERPRET  # the interpreter's BF16 dots: fp32 operands holding BF16 values
-
 RCP_LN2 = 1.4426950408889634
 BT = 64  # chunk rows (fla's chunk_size)
 BC = 16  # sub-block rows of the solve
 
 
 def enabled() -> bool:
-    """``ENGINE_GDN_CHUNK`` (default on; 0 restores fla's chunk chain)."""
+    """``ENGINE_GDN_CHUNK`` (default on; 0 restores the conv kernel and fla's chunk chain)."""
     return os.environ.get("ENGINE_GDN_CHUNK", "1") != "0"
 
 
-def supported(m: torch.nn.Module) -> bool:
+def supported(m: torch.nn.Module, conv_state: torch.Tensor) -> bool:
+    kc = conv_state.shape[-1]
     return (
         triton is not None
         and m.head_k_dim == 128
         and m.head_v_dim == 128
         and m.num_v_heads % m.num_k_heads == 0
+        and conv_state.dtype == torch.bfloat16
+        and kc & (kc - 1) == 0
     )
 
 
-def _bv() -> int:
-    return int(os.environ.get("ENGINE_GDN_CHUNK_BV", "32"))
-
-
-def _warps() -> tuple[int, int]:
-    w = os.environ.get("ENGINE_GDN_CHUNK_WARPS", "4,4").split(",")
-    return int(w[0]), int(w[1])
+def _opts() -> tuple[int, int, int, int]:
+    """(BV, wy warps, state warps, state stages); ENGINE_GDN_CHUNK_OPTS="bv,w1,w2,stages"."""
+    o = [int(x) for x in os.environ.get("ENGINE_GDN_CHUNK_OPTS", "16,4,4,1").split(",")]
+    return o[0], o[1], o[2], o[3]
 
 
 if triton is not None:
     from engine.fast.moe_prefill import _bf16
+    from engine.fast.prefill_kernels import _gdn_conv_state_kernel
 
     @triton.jit
     def _rb(x, WIDEN: tl.constexpr):
@@ -85,13 +91,28 @@ if triton is not None:
             return x
 
     @triton.jit
-    def _load_norm(ptr, rows, ok, SM, D: tl.constexpr, WIDEN: tl.constexpr):
-        """Rows ``rows`` (``ok``) of a D-wide column block at ``ptr`` (row stride SM),
-        l2-normalized in fp32 and rounded to BF16 (0 where not ok)."""
-        d = tl.arange(0, D)
-        x = tl.load(ptr + rows.to(tl.int64)[:, None] * SM + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
-        y = x * (1.0 / tl.sqrt(tl.sum(x * x, axis=1) + 1e-6))[:, None]
-        return _rb(y, WIDEN)
+    def _conv(qkv, cstate, cw, rows, col0, T, SX, D: tl.constexpr, KC: tl.constexpr, WIDEN: tl.constexpr):
+        """silu(causal depthwise conv) of channels col0..col0+D at ``rows`` (< T), fp32 holding
+        BF16 values, as ``_gdn_conv_kernel``: row t reads inputs t-KC+1..t, those before row 0
+        from the conv state [C, KC]."""
+        c = col0 + tl.arange(0, D)
+        ok = (rows < T)[:, None]
+        acc = tl.zeros([rows.shape[0], D], dtype=tl.float32)
+        for j in tl.static_range(KC):
+            src = rows + 1 + j - KC
+            from_x = (src >= 0)[:, None]
+            xv = tl.load(qkv + src.to(tl.int64)[:, None] * SX + c[None, :], mask=ok & from_x, other=0.0)
+            sv = tl.load(cstate + c[None, :] * KC + (src + KC)[:, None], mask=ok & (~from_x), other=0.0)
+            wj = tl.load(cw + c * KC + j).to(tl.float32)
+            acc += tl.where(from_x, xv, sv).to(tl.float32) * wj[None, :]
+        y = _bf16(acc, WIDEN)
+        return _bf16(y * tl.sigmoid(y), WIDEN)
+
+    @triton.jit
+    def _norm(x, ok, WIDEN: tl.constexpr):
+        """Rows of ``x`` l2-normalized (fp32, eps 1e-6) and rounded to BF16; 0 where not ok."""
+        x = tl.where(ok[:, None], x, 0.0)
+        return _rb(x * (1.0 / tl.sqrt(tl.sum(x * x, axis=1) + 1e-6))[:, None], WIDEN)
 
     @triton.jit
     def _gates(a_ptr, b_ptr, alog, dtb, rows, ok, SA, SB, i_h, WIDEN: tl.constexpr):
@@ -114,11 +135,21 @@ if triton is not None:
             Ai = tl.where((o_i == i)[:, None], a, Ai)
         return Ai + (o_i[:, None] == o_i[None, :]).to(tl.float32)
 
+    @triton.jit
+    def _kkt(ka, kb, ca, cb, ba):
+        """beta_a * ka kb^T * exp2(c_a - c_b) (an off-diagonal block, a below b)."""
+        return tl.dot(ka, tl.trans(kb)) * tl.exp2(ca[:, None] - cb[None, :]) * ba[:, None]
+
+    @triton.jit
+    def _qk(qa, kb, ca, cb):
+        """qa kb^T * exp2(c_a - c_b) (an off-diagonal causal score block, a below b)."""
+        return tl.dot(qa, tl.trans(kb)) * tl.exp2(ca[:, None] - cb[None, :])
+
     @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_wy_kernel(
-        mixed, a_ptr, b_ptr, alog_ptr, dtb_ptr, meta_ptr, qn, kn, w, u, gc, T, SM, SA, SB,
+        qkv, cstate, cw, a_ptr, b_ptr, alog_ptr, dtb_ptr, meta_ptr, qn, kn, w, u, gc, aqk, T, SX, SA, SB,
         H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BC: tl.constexpr,
-        HAS_META: tl.constexpr, WIDEN: tl.constexpr,
+        KC: tl.constexpr, HAS_META: tl.constexpr, WIDEN: tl.constexpr,
     ):
         i_t = tl.program_id(0)
         i_h = tl.program_id(1)
@@ -136,6 +167,10 @@ if triton is not None:
         m1 = r1 < n
         m2 = r2 < n
         m3 = r3 < n
+        t0 = r0 < T
+        t1 = r1 < T
+        t2 = r2 < T
+        t3 = r3 < T
         alog = tl.load(alog_ptr + i_h).to(tl.float32)
         dtb = tl.load(dtb_ptr + i_h).to(tl.float32)
         g0, b0 = _gates(a_ptr, b_ptr, alog, dtb, r0, m0, SA, SB, i_h, WIDEN)
@@ -143,55 +178,83 @@ if triton is not None:
         g2, b2 = _gates(a_ptr, b_ptr, alog, dtb, r2, m2, SA, SB, i_h, WIDEN)
         g3, b3 = _gates(a_ptr, b_ptr, alog, dtb, r3, m3, SA, SB, i_h, WIDEN)
         # In-chunk cumulative decay in log2 units.
-        c0 = tl.cumsum(g0, axis=0)
-        c1 = tl.cumsum(g1, axis=0) + tl.sum(g0, axis=0)
-        c2 = tl.cumsum(g2, axis=0) + tl.sum(g0, axis=0) + tl.sum(g1, axis=0)
-        c3 = tl.cumsum(g3, axis=0) + tl.sum(g0, axis=0) + tl.sum(g1, axis=0) + tl.sum(g2, axis=0)
-        c0 = c0 * 1.4426950408889634
-        c1 = c1 * 1.4426950408889634
-        c2 = c2 * 1.4426950408889634
-        c3 = c3 * 1.4426950408889634
-        t0 = r0 < T
-        t1 = r1 < T
-        t2 = r2 < T
-        t3 = r3 < T
+        s0 = tl.sum(g0, axis=0)
+        s1 = s0 + tl.sum(g1, axis=0)
+        s2 = s1 + tl.sum(g2, axis=0)
+        c0 = tl.cumsum(g0, axis=0) * 1.4426950408889634
+        c1 = (tl.cumsum(g1, axis=0) + s0) * 1.4426950408889634
+        c2 = (tl.cumsum(g2, axis=0) + s1) * 1.4426950408889634
+        c3 = (tl.cumsum(g3, axis=0) + s2) * 1.4426950408889634
         tl.store(gc + r0.to(tl.int64) * HV + i_h, c0, mask=t0)
         tl.store(gc + r1.to(tl.int64) * HV + i_h, c1, mask=t1)
         tl.store(gc + r2.to(tl.int64) * HV + i_h, c2, mask=t2)
         tl.store(gc + r3.to(tl.int64) * HV + i_h, c3, mask=t3)
 
+        # conv + silu + l2norm of the chunk's k rows (zero past the real count) and q rows.
+        kc0 = H * K + i_kh * K
+        k0 = _norm(_conv(qkv, cstate, cw, r0, kc0, T, SX, K, KC, WIDEN), m0, WIDEN)
+        k1 = _norm(_conv(qkv, cstate, cw, r1, kc0, T, SX, K, KC, WIDEN), m1, WIDEN)
+        k2 = _norm(_conv(qkv, cstate, cw, r2, kc0, T, SX, K, KC, WIDEN), m2, WIDEN)
+        k3 = _norm(_conv(qkv, cstate, cw, r3, kc0, T, SX, K, KC, WIDEN), m3, WIDEN)
+        qc0 = i_kh * K
+        q0 = _norm(_conv(qkv, cstate, cw, r0, qc0, T, SX, K, KC, WIDEN), t0, WIDEN)
+        q1 = _norm(_conv(qkv, cstate, cw, r1, qc0, T, SX, K, KC, WIDEN), t1, WIDEN)
+        q2 = _norm(_conv(qkv, cstate, cw, r2, qc0, T, SX, K, KC, WIDEN), t2, WIDEN)
+        q3 = _norm(_conv(qkv, cstate, cw, r3, qc0, T, SX, K, KC, WIDEN), t3, WIDEN)
         d = tl.arange(0, K)
-        kcol = mixed + H * K + i_kh * K
-        k0 = _load_norm(kcol, r0, m0, SM, K, WIDEN)
-        k1 = _load_norm(kcol, r1, m1, SM, K, WIDEN)
-        k2 = _load_norm(kcol, r2, m2, SM, K, WIDEN)
-        k3 = _load_norm(kcol, r3, m3, SM, K, WIDEN)
         if i_h % (HV // H) == 0:
-            qcol = mixed + i_kh * K
             pk = kn + i_kh * K + d[None, :]
             pq = qn + i_kh * K + d[None, :]
             tl.store(pk + r0.to(tl.int64)[:, None] * (H * K), k0.to(tl.bfloat16), mask=t0[:, None])
             tl.store(pk + r1.to(tl.int64)[:, None] * (H * K), k1.to(tl.bfloat16), mask=t1[:, None])
             tl.store(pk + r2.to(tl.int64)[:, None] * (H * K), k2.to(tl.bfloat16), mask=t2[:, None])
             tl.store(pk + r3.to(tl.int64)[:, None] * (H * K), k3.to(tl.bfloat16), mask=t3[:, None])
-            tl.store(pq + r0.to(tl.int64)[:, None] * (H * K), _load_norm(qcol, r0, t0, SM, K, WIDEN).to(tl.bfloat16), mask=t0[:, None])
-            tl.store(pq + r1.to(tl.int64)[:, None] * (H * K), _load_norm(qcol, r1, t1, SM, K, WIDEN).to(tl.bfloat16), mask=t1[:, None])
-            tl.store(pq + r2.to(tl.int64)[:, None] * (H * K), _load_norm(qcol, r2, t2, SM, K, WIDEN).to(tl.bfloat16), mask=t2[:, None])
-            tl.store(pq + r3.to(tl.int64)[:, None] * (H * K), _load_norm(qcol, r3, t3, SM, K, WIDEN).to(tl.bfloat16), mask=t3[:, None])
+            tl.store(pq + r0.to(tl.int64)[:, None] * (H * K), q0.to(tl.bfloat16), mask=t0[:, None])
+            tl.store(pq + r1.to(tl.int64)[:, None] * (H * K), q1.to(tl.bfloat16), mask=t1[:, None])
+            tl.store(pq + r2.to(tl.int64)[:, None] * (H * K), q2.to(tl.bfloat16), mask=t2[:, None])
+            tl.store(pq + r3.to(tl.int64)[:, None] * (H * K), q3.to(tl.bfloat16), mask=t3[:, None])
 
-        # beta * k k^T * exp2(c_i - c_j), strictly lower, as 10 [BC, BC] blocks.
+        # The causal score block q k^T * exp2(c_i - c_j) (i >= j), BF16 as fla's chunk_fwd_o.
+        m_c = o_i[:, None] >= o_i[None, :]
+        pa = aqk + i_h * (4 * BC) + o_i[None, :]
+        z = tl.zeros([BC, BC], dtype=tl.float32)
+        Q00 = tl.where(m_c, tl.dot(q0, tl.trans(k0)) * tl.exp2(c0[:, None] - c0[None, :]), 0.0)
+        Q11 = tl.where(m_c, tl.dot(q1, tl.trans(k1)) * tl.exp2(c1[:, None] - c1[None, :]), 0.0)
+        Q22 = tl.where(m_c, tl.dot(q2, tl.trans(k2)) * tl.exp2(c2[:, None] - c2[None, :]), 0.0)
+        Q33 = tl.where(m_c, tl.dot(q3, tl.trans(k3)) * tl.exp2(c3[:, None] - c3[None, :]), 0.0)
+        R0 = pa + r0.to(tl.int64)[:, None] * (HV * 4 * BC)
+        R1 = pa + r1.to(tl.int64)[:, None] * (HV * 4 * BC)
+        R2 = pa + r2.to(tl.int64)[:, None] * (HV * 4 * BC)
+        R3 = pa + r3.to(tl.int64)[:, None] * (HV * 4 * BC)
+        tl.store(R0, Q00.to(tl.bfloat16), mask=t0[:, None])
+        tl.store(R0 + BC, z.to(tl.bfloat16), mask=t0[:, None])
+        tl.store(R0 + 2 * BC, z.to(tl.bfloat16), mask=t0[:, None])
+        tl.store(R0 + 3 * BC, z.to(tl.bfloat16), mask=t0[:, None])
+        tl.store(R1, _qk(q1, k0, c1, c0).to(tl.bfloat16), mask=t1[:, None])
+        tl.store(R1 + BC, Q11.to(tl.bfloat16), mask=t1[:, None])
+        tl.store(R1 + 2 * BC, z.to(tl.bfloat16), mask=t1[:, None])
+        tl.store(R1 + 3 * BC, z.to(tl.bfloat16), mask=t1[:, None])
+        tl.store(R2, _qk(q2, k0, c2, c0).to(tl.bfloat16), mask=t2[:, None])
+        tl.store(R2 + BC, _qk(q2, k1, c2, c1).to(tl.bfloat16), mask=t2[:, None])
+        tl.store(R2 + 2 * BC, Q22.to(tl.bfloat16), mask=t2[:, None])
+        tl.store(R2 + 3 * BC, z.to(tl.bfloat16), mask=t2[:, None])
+        tl.store(R3, _qk(q3, k0, c3, c0).to(tl.bfloat16), mask=t3[:, None])
+        tl.store(R3 + BC, _qk(q3, k1, c3, c1).to(tl.bfloat16), mask=t3[:, None])
+        tl.store(R3 + 2 * BC, _qk(q3, k2, c3, c2).to(tl.bfloat16), mask=t3[:, None])
+        tl.store(R3 + 3 * BC, Q33.to(tl.bfloat16), mask=t3[:, None])
+
+        # beta * k k^T * exp2(c_i - c_j), strictly lower, as 10 [BC, BC] blocks; (I + A)^-1.
         m_d = o_i[:, None] > o_i[None, :]
         A00 = tl.where(m_d, tl.dot(k0, tl.trans(k0)) * tl.exp2(c0[:, None] - c0[None, :]), 0.0) * b0[:, None]
         A11 = tl.where(m_d, tl.dot(k1, tl.trans(k1)) * tl.exp2(c1[:, None] - c1[None, :]), 0.0) * b1[:, None]
         A22 = tl.where(m_d, tl.dot(k2, tl.trans(k2)) * tl.exp2(c2[:, None] - c2[None, :]), 0.0) * b2[:, None]
         A33 = tl.where(m_d, tl.dot(k3, tl.trans(k3)) * tl.exp2(c3[:, None] - c3[None, :]), 0.0) * b3[:, None]
-        A10 = tl.dot(k1, tl.trans(k0)) * tl.exp2(c1[:, None] - c0[None, :]) * b1[:, None]
-        A20 = tl.dot(k2, tl.trans(k0)) * tl.exp2(c2[:, None] - c0[None, :]) * b2[:, None]
-        A21 = tl.dot(k2, tl.trans(k1)) * tl.exp2(c2[:, None] - c1[None, :]) * b2[:, None]
-        A30 = tl.dot(k3, tl.trans(k0)) * tl.exp2(c3[:, None] - c0[None, :]) * b3[:, None]
-        A31 = tl.dot(k3, tl.trans(k1)) * tl.exp2(c3[:, None] - c1[None, :]) * b3[:, None]
-        A32 = tl.dot(k3, tl.trans(k2)) * tl.exp2(c3[:, None] - c2[None, :]) * b3[:, None]
-
+        A10 = _kkt(k1, k0, c1, c0, b1)
+        A20 = _kkt(k2, k0, c2, c0, b2)
+        A21 = _kkt(k2, k1, c2, c1, b2)
+        A30 = _kkt(k3, k0, c3, c0, b3)
+        A31 = _kkt(k3, k1, c3, c1, b3)
+        A32 = _kkt(k3, k2, c3, c2, b3)
         I00 = _subst(A00, o_i, BC)
         I11 = _subst(A11, o_i, BC)
         I22 = _subst(A22, o_i, BC)
@@ -237,16 +300,12 @@ if triton is not None:
                  mask=t3[:, None])
 
         # u = Ai (v * beta) [64, V]
+        vc0 = 2 * H * K + i_h * V
+        v0 = _rb(_conv(qkv, cstate, cw, r0, vc0, T, SX, V, KC, WIDEN) * b0[:, None], WIDEN)
+        v1 = _rb(_conv(qkv, cstate, cw, r1, vc0, T, SX, V, KC, WIDEN) * b1[:, None], WIDEN)
+        v2 = _rb(_conv(qkv, cstate, cw, r2, vc0, T, SX, V, KC, WIDEN) * b2[:, None], WIDEN)
+        v3 = _rb(_conv(qkv, cstate, cw, r3, vc0, T, SX, V, KC, WIDEN) * b3[:, None], WIDEN)
         dv = tl.arange(0, V)
-        vcol = mixed + 2 * H * K + i_h * V + dv[None, :]
-        v0 = _rb((tl.load(vcol + r0.to(tl.int64)[:, None] * SM, mask=m0[:, None], other=0.0).to(tl.float32)
-              * b0[:, None]), WIDEN)
-        v1 = _rb((tl.load(vcol + r1.to(tl.int64)[:, None] * SM, mask=m1[:, None], other=0.0).to(tl.float32)
-              * b1[:, None]), WIDEN)
-        v2 = _rb((tl.load(vcol + r2.to(tl.int64)[:, None] * SM, mask=m2[:, None], other=0.0).to(tl.float32)
-              * b2[:, None]), WIDEN)
-        v3 = _rb((tl.load(vcol + r3.to(tl.int64)[:, None] * SM, mask=m3[:, None], other=0.0).to(tl.float32)
-              * b3[:, None]), WIDEN)
         pu = u + i_h * V + dv[None, :]
         tl.store(pu + r0.to(tl.int64)[:, None] * (HV * V), tl.dot(I00, v0).to(tl.bfloat16), mask=t0[:, None])
         tl.store(pu + r1.to(tl.int64)[:, None] * (HV * V),
@@ -259,9 +318,10 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_state_kernel(
-        qn, kn, w, u, gc, o, state, row_ptr, meta_ptr, T, scale,
+        qn, kn, w, u, gc, aqk, o, state, row_ptr, meta_ptr, T, scale,
         H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BT: tl.constexpr,
-        BV: tl.constexpr, HAS_ROW: tl.constexpr, HAS_META: tl.constexpr, WIDEN: tl.constexpr,
+        BV: tl.constexpr, HAS_ROW: tl.constexpr, HAS_META: tl.constexpr, STAGES: tl.constexpr,
+        WIDEN: tl.constexpr,
     ):
         i_v = tl.program_id(0)
         i_h = tl.program_id(1)
@@ -279,38 +339,40 @@ if triton is not None:
         h = tl.load(p_s)  # [K, BV] fp32
         o_t0 = tl.arange(0, BT)
         causal = o_t0[:, None] >= o_t0[None, :]
-        zero = tl.zeros([BT, BV], dtype=tl.bfloat16)
-        for i_t in range(0, (T + BT - 1) // BT):
+        nt = tl.cdiv(n, BT)
+        for i_t in tl.range(0, nt, num_stages=STAGES):
             o_t = i_t * BT + o_t0
             m_t = o_t < T
             rt = o_t.to(tl.int64)
-            p_o = o + rt[:, None] * (HV * V) + i_h * V + o_v[None, :]
-            if i_t * BT < n:
-                q = _op(tl.load(qn + rt[:, None] * (H * K) + i_kh * K + dk[None, :], mask=m_t[:, None], other=0.0), WIDEN)
-                kt = _op(tl.load(kn + rt[None, :] * (H * K) + i_kh * K + dk[:, None], mask=m_t[None, :], other=0.0), WIDEN)
-                ww = _op(tl.load(w + rt[:, None] * (HV * K) + i_h * K + dk[None, :], mask=m_t[:, None], other=0.0), WIDEN)
-                uu = tl.load(u + rt[:, None] * (HV * V) + i_h * V + o_v[None, :], mask=m_t[:, None], other=0.0)
-                g = tl.load(gc + rt * HV + i_h, mask=m_t, other=0.0)
-                last = tl.minimum((i_t + 1) * BT, T) - 1
-                g_last = tl.load(gc + last.to(tl.int64) * HV + i_h)
-                hb = _rb(h, WIDEN)
-                vn = uu.to(tl.float32) - tl.dot(ww, hb)
-                vnb = _rb(vn, WIDEN)
-                oo = tl.dot(q, hb) * tl.exp2(g)[:, None]
-                aq = tl.dot(q, kt) * tl.exp2(g[:, None] - g[None, :])
-                aq = tl.where(causal & m_t[:, None] & m_t[None, :], aq, 0.0)
-                oo = oo * scale + tl.dot(_rb(aq, WIDEN), vnb) * scale
-                oo = tl.where((o_t < n)[:, None], oo, 0.0)  # padding rows: 0
-                tl.store(p_o, oo.to(tl.bfloat16), mask=m_t[:, None])
-                vg = _rb(vn * tl.where(m_t, tl.exp2(g_last - g), 0.0)[:, None], WIDEN)
-                h = h * tl.exp2(g_last) + tl.dot(kt, vg)
-            else:  # a chunk of padding rows only
-                tl.store(p_o, zero, mask=m_t[:, None])
+            q = _op(tl.load(qn + rt[:, None] * (H * K) + i_kh * K + dk[None, :], mask=m_t[:, None], other=0.0), WIDEN)
+            kt = _op(tl.load(kn + rt[None, :] * (H * K) + i_kh * K + dk[:, None], mask=m_t[None, :], other=0.0), WIDEN)
+            ww = _op(tl.load(w + rt[:, None] * (HV * K) + i_h * K + dk[None, :], mask=m_t[:, None], other=0.0), WIDEN)
+            uu = tl.load(u + rt[:, None] * (HV * V) + i_h * V + o_v[None, :], mask=m_t[:, None], other=0.0)
+            aq = tl.load(aqk + rt[:, None] * (HV * BT) + i_h * BT + o_t0[None, :], mask=m_t[:, None], other=0.0)
+            aq = _op(tl.where(causal, aq, 0.0), WIDEN)
+            g = tl.load(gc + rt * HV + i_h, mask=m_t, other=0.0)
+            last = tl.minimum((i_t + 1) * BT, T) - 1
+            g_last = tl.load(gc + last.to(tl.int64) * HV + i_h)
+            hb = _rb(h, WIDEN)
+            vn = uu.to(tl.float32) - tl.dot(ww, hb)
+            oo = tl.dot(q, hb) * tl.exp2(g)[:, None] * scale + tl.dot(aq, _rb(vn, WIDEN)) * scale
+            oo = tl.where((o_t < n)[:, None], oo, 0.0)  # padding rows: 0
+            tl.store(o + rt[:, None] * (HV * V) + i_h * V + o_v[None, :], oo.to(tl.bfloat16), mask=m_t[:, None])
+            vg = _rb(vn * tl.where(m_t, tl.exp2(g_last - g), 0.0)[:, None], WIDEN)
+            h = h * tl.exp2(g_last) + tl.dot(kt, vg)
         tl.store(p_s, h)
+        # Chunks of padding rows only: zeros.
+        zero = tl.zeros([BT, BV], dtype=tl.bfloat16)
+        for i_t in range(nt, tl.cdiv(T, BT)):
+            o_t = i_t * BT + o_t0
+            rt = o_t.to(tl.int64)
+            tl.store(o + rt[:, None] * (HV * V) + i_h * V + o_v[None, :], zero, mask=(o_t < T)[:, None])
 
 
 def chunk(
-    mixed: torch.Tensor,
+    qkv: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     a_log: torch.Tensor,
@@ -321,51 +383,65 @@ def chunk(
     meta: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """Core output [T, HV, V] (BF16) of the gated delta rule over ``mixed`` [T, 2*H*K + HV*V]
-    (rows may be strided; columns dense), with in-kernel q/k l2norm, decay and beta from
-    ``a``, ``b`` [T, HV] (strided rows). ``state``: [HV, K, V] fp32 (one row, updated in
-    place) or, with ``row`` (int64 device scalar tensor), the [R, HV, K, V] state tensor and
-    the row to read and update. ``meta``: int64 device tensor whose first entry is the real
-    row count (rows past it are padding); None: all T rows are real."""
-    tokens, width = mixed.shape
+    """Core output [T, HV, V] (BF16) of the short conv + gated delta rule over the raw
+    projection ``qkv`` [T, 2*H*K + HV*V] (rows may be strided; columns dense), after the
+    slot's conv state ``conv_state`` [C, KC] (BF16, updated in place to its last KC real
+    inputs; weight [C, 1, KC]), with in-kernel q/k l2norm, decay and beta from ``a``, ``b``
+    [T, HV] (strided rows). ``state``: [HV, K, V] fp32 (one row, updated in place) or, with
+    ``row`` (int64 device tensor), the [R, HV, K, V] state tensor and the row to read and
+    update. ``meta``: int64 device tensor whose first entry is the real row count (rows past
+    it are padding); None: all T rows are real."""
+    tokens, width = qkv.shape
     hv = a.shape[-1]
     kd = vd = 128
-    assert width == 2 * heads * kd + hv * vd and mixed.stride(-1) == 1
+    kc = conv_state.shape[-1]
+    assert width == 2 * heads * kd + hv * vd and qkv.stride(-1) == 1
+    assert conv_state.is_contiguous() and conv_state.shape[0] == width
     assert a.stride(-1) == 1 and b.stride(-1) == 1 and state.dtype == torch.float32 and state.is_contiguous()
     scale = kd ** -0.5 if scale is None else scale
-    dev = mixed.device
+    dev = qkv.device
+    weight = conv_weight.contiguous()
     qn = torch.empty((tokens, heads, kd), dtype=torch.bfloat16, device=dev)
     kn = torch.empty_like(qn)
     w = torch.empty((tokens, hv, kd), dtype=torch.bfloat16, device=dev)
     u = torch.empty((tokens, hv, vd), dtype=torch.bfloat16, device=dev)
     gc = torch.empty((tokens, hv), dtype=torch.float32, device=dev)
+    aqk = torch.empty((tokens, hv, BT), dtype=torch.bfloat16, device=dev)
     o = torch.empty((tokens, hv, vd), dtype=torch.bfloat16, device=dev)
-    bv = _bv()
-    w1, w2 = _warps()
-    with on_device(mixed):
+    bv, w1, w2, stages = _opts()
+    with on_device(qkv):
         gdn_chunk_wy_kernel[(triton.cdiv(tokens, BT), hv)](
-            mixed, a, b, a_log, dt_bias, meta if meta is not None else gc, qn, kn, w, u, gc, tokens,
-            mixed.stride(0), a.stride(0), b.stride(0), H=heads, HV=hv, K=kd, V=vd, BC=BC,
+            qkv, conv_state, weight, a, b, a_log, dt_bias, meta if meta is not None else gc, qn, kn, w, u, gc, aqk,
+            tokens, qkv.stride(0), a.stride(0), b.stride(0), H=heads, HV=hv, K=kd, V=vd, BC=BC, KC=kc,
             HAS_META=meta is not None, WIDEN=_WIDEN, num_warps=w1,
         )
+        _gdn_conv_state_kernel[(triton.cdiv(width, 256),)](
+            qkv, conv_state, tokens, width, qkv.stride(0), meta if meta is not None else conv_state, K=kc,
+            BLOCK_C=256, HAS_META=meta is not None,
+        )
         gdn_chunk_state_kernel[(vd // bv, hv)](
-            qn, kn, w, u, gc, o, state, row if row is not None else gc, meta if meta is not None else gc,
+            qn, kn, w, u, gc, aqk, o, state, row if row is not None else gc, meta if meta is not None else gc,
             tokens, scale, H=heads, HV=hv, K=kd, V=vd, BT=BT, BV=bv, HAS_ROW=row is not None,
-            HAS_META=meta is not None, WIDEN=_WIDEN, num_warps=w2,
+            HAS_META=meta is not None, STAGES=stages, WIDEN=_WIDEN, num_warps=w2,
         )
     return o
 
 
-def reference(mixed, a, b, a_log, dt_bias, state, heads, count=None, scale=None):
-    """The token-by-token gated delta rule in fp32 (the math ``chunk`` computes): (core
-    [T, HV, V] fp32, final state [HV, K, V] fp32); rows at or past ``count`` are padding."""
+def reference(qkv, conv_state, conv_weight, a, b, a_log, dt_bias, state, heads, count=None, scale=None):
+    """The conv (``prefill_kernels.gdn_conv_reference``) then the token-by-token gated delta
+    rule in fp32 (the math ``chunk`` computes): (core [T, HV, V] fp32, final state [HV, K, V]
+    fp32, new conv state); rows at or past ``count`` are padding."""
     import torch.nn.functional as F
 
-    tokens = mixed.shape[0]
+    from engine.fast.prefill_kernels import gdn_conv_reference
+
+    tokens = qkv.shape[0]
     hv = a.shape[-1]
     kd = vd = 128
     count = tokens if count is None else count
     scale = kd ** -0.5 if scale is None else scale
+    mixed, _ = gdn_conv_reference(qkv, conv_state, conv_weight)
+    _, new_conv = gdn_conv_reference(qkv[:count], conv_state, conv_weight)
     x = mixed.float()
     q = x[:, : heads * kd].reshape(tokens, heads, kd)
     k = x[:, heads * kd : 2 * heads * kd].reshape(tokens, heads, kd)
@@ -385,4 +461,4 @@ def reference(mixed, a, b, a_log, dt_bias, state, heads, count=None, scale=None)
         delta = (v[t] - mem) * beta[t][:, None]
         s = s + torch.einsum("hk,hv->hkv", k[t], delta)
         out[t] = torch.einsum("hk,hkv->hv", q[t] * scale, s)
-    return out, s
+    return out, s, new_conv

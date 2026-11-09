@@ -41,16 +41,17 @@ if kernels.INTERPRET and kernels.triton is not None:
 pytestmark = pytest.mark.skipif(_device() is None, reason="needs Triton (GPU or TRITON_INTERPRET=1)")
 
 
-def _inputs(tokens, heads, hv, seed, stride_pad=0):
+def _inputs(tokens, heads, hv, seed):
     g = torch.Generator().manual_seed(seed)
     width = 2 * heads * 128 + hv * 128
-    big = torch.randn(tokens, width + stride_pad + 2 * hv, generator=g)
-    mixed = big[:, :width].bfloat16()
+    qkv = torch.randn(tokens, width, generator=g).bfloat16()
     ab = torch.randn(tokens, 2 * hv, generator=g).bfloat16()
     a_log = torch.randn(hv, generator=g) * 0.5
     dt_bias = torch.randn(hv, generator=g)
     state = torch.randn(hv, 128, 128, generator=g) * 0.1
-    return mixed, ab[:, :hv], ab[:, hv:], a_log, dt_bias, state
+    conv = torch.randn(width, 4, generator=g).bfloat16()
+    weight = (torch.randn(width, 1, 4, generator=g) * 0.5).bfloat16()
+    return qkv, conv, weight, ab[:, :hv], ab[:, hv:], a_log, dt_bias, state
 
 
 def _err(got, ref):
@@ -61,56 +62,65 @@ def _err(got, ref):
 @pytest.mark.parametrize("tokens,heads,hv", [(2, 1, 2), (37, 2, 4), (64, 1, 2), (130, 2, 4)])
 def test_chunk_matches_recurrence(tokens, heads, hv):
     dev = _device()
-    mixed, a, b, a_log, dt_bias, state = _inputs(tokens, heads, hv, tokens)
-    ref_o, ref_s = gdn_chunk.reference(mixed, a, b, a_log, dt_bias, state, heads)
+    qkv, conv, weight, a, b, a_log, dt_bias, state = _inputs(tokens, heads, hv, tokens)
+    ref_o, ref_s, ref_conv = gdn_chunk.reference(qkv, conv.clone(), weight, a, b, a_log, dt_bias, state, heads)
     st = state.clone().to(dev)
-    got = gdn_chunk.chunk(mixed.to(dev), a.to(dev), b.to(dev), a_log.to(dev), dt_bias.to(dev), st, heads)
+    cv = conv.clone().to(dev)
+    got = gdn_chunk.chunk(qkv.to(dev), cv, weight.to(dev), a.to(dev), b.to(dev), a_log.to(dev), dt_bias.to(dev),
+                          st, heads)
     assert got.shape == (tokens, hv, 128)
     assert _err(got.cpu(), ref_o) < 3e-2, _err(got.cpu(), ref_o)
     assert _err(st.cpu(), ref_s) < 3e-2, _err(st.cpu(), ref_s)
+    assert torch.equal(cv.cpu(), ref_conv)
 
 
 @pytest.mark.parametrize("count,size", [(5, 64), (61, 128), (100, 192)])
 def test_chunk_padding_rows_and_device_row(count, size):
-    """Rows past the device count leave the state as ``count`` real rows do; outputs 0; the
+    """Rows past the device count leave the states as ``count`` real rows do; outputs 0; the
     state row comes from the device and other rows are untouched."""
     dev = _device()
     heads, hv = 1, 2
-    mixed, a, b, a_log, dt_bias, state = _inputs(size, heads, hv, count + size)
-    ref_o, ref_s = gdn_chunk.reference(mixed, a, b, a_log, dt_bias, state, heads, count=count)
+    qkv, conv, weight, a, b, a_log, dt_bias, state = _inputs(size, heads, hv, count + size)
+    ref_o, ref_s, ref_conv = gdn_chunk.reference(qkv, conv.clone(), weight, a, b, a_log, dt_bias, state, heads,
+                                                 count=count)
     states = torch.randn(3, hv, 128, 128)
     states[2] = state
     before = states.clone()
     states = states.to(dev)
+    cv = conv.clone().to(dev)
     meta = torch.tensor([count, 999], dtype=torch.long, device=dev)
     row = torch.tensor([2], dtype=torch.long, device=dev)
-    got = gdn_chunk.chunk(mixed.to(dev), a.to(dev), b.to(dev), a_log.to(dev), dt_bias.to(dev), states, heads,
-                          row=row, meta=meta)
+    got = gdn_chunk.chunk(qkv.to(dev), cv, weight.to(dev), a.to(dev), b.to(dev), a_log.to(dev), dt_bias.to(dev),
+                          states, heads, row=row, meta=meta)
     got = got.cpu()
     assert _err(got[:count], ref_o[:count]) < 3e-2
     assert torch.equal(got[count:].float(), torch.zeros_like(got[count:].float()))
     s = states.cpu()
     assert _err(s[2], ref_s) < 3e-2
     assert torch.equal(s[0], before[0]) and torch.equal(s[1], before[1])
+    assert torch.equal(cv.cpu(), ref_conv)
 
 
 def test_chunk_strided_inputs():
-    """``mixed`` and a/b as column slices of a wider projection output."""
+    """``qkv`` and a/b as column slices of a wider (merged) projection output."""
     dev = _device()
     tokens, heads, hv = 70, 1, 2
     g = torch.Generator().manual_seed(3)
     width = 2 * heads * 128 + hv * 128
     big = torch.randn(tokens, width + 64 + 2 * hv, generator=g).bfloat16()
-    mixed = big[:, :width]
+    qkv = big[:, :width]
     a = big[:, width + 64 : width + 64 + hv]
     b = big[:, width + 64 + hv :]
     a_log = torch.randn(hv, generator=g) * 0.5
     dt_bias = torch.randn(hv, generator=g)
     state = torch.randn(hv, 128, 128, generator=g) * 0.1
-    ref_o, ref_s = gdn_chunk.reference(mixed, a, b, a_log, dt_bias, state, heads)
+    conv = torch.randn(width, 4, generator=g).bfloat16()
+    weight = (torch.randn(width, 1, 4, generator=g) * 0.5).bfloat16()
+    ref_o, ref_s, _ = gdn_chunk.reference(qkv, conv.clone(), weight, a, b, a_log, dt_bias, state, heads)
     st = state.clone().to(dev)
     bigd = big.to(dev)
-    got = gdn_chunk.chunk(bigd[:, :width], bigd[:, width + 64 : width + 64 + hv], bigd[:, width + 64 + hv :],
-                          a_log.to(dev), dt_bias.to(dev), st, heads)
+    got = gdn_chunk.chunk(bigd[:, :width], conv.clone().to(dev), weight.to(dev), bigd[:, width + 64 : width + 64 + hv],
+                          bigd[:, width + 64 + hv :], a_log.to(dev), dt_bias.to(dev), st, heads)
     assert _err(got.cpu(), ref_o) < 3e-2
     assert _err(st.cpu(), ref_s) < 3e-2
+

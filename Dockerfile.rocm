@@ -3,11 +3,11 @@
 # candidate's commit, with the project root as the context (.dockerignore keeps only
 # requirements-agentx.txt), and runs `python -m engine.server --host ... --port ...` in it from
 # the checkout's root, with the node's AMD GPUs. The engine's code comes from the checkout; this
-# image holds only its dependencies, installed as README.md says for Linux x86-64 with
-# Python 3.12 and ROCm 6.4: torch 2.9.1+rocm6.4, then requirements-agentx.txt. It is part of the
-# candidate, as the engine is.
+# image holds only its dependencies: Python 3.12, torch 2.10.0+rocm7.0 (with its triton-rocm
+# 3.6.0), then requirements-agentx.txt. It is part of the candidate, as the engine is. Plan 59
+# moved it from the seed's ROCm 6.4 stack (torch 2.9.1+rocm6.4, pytorch-triton-rocm 3.5.1).
 #
-# Ubuntu 24.04's Python is 3.12. The ROCm 6.4 user-space runtime (hsa-rocr) and rocminfo come
+# Ubuntu 24.04's Python is 3.12. The ROCm 7.0 user-space runtime (hsa-rocr) and rocminfo come
 # from AMD's apt repository: vibesys-cli checks with rocminfo that the container sees a GPU before
 # the server starts, and Apptainer's --rocm binds the node's rocminfo, which needs the HSA
 # runtime in the image. torch's wheel carries its own ROCm libraries.
@@ -16,7 +16,7 @@
 # "hf" (the task's [environment] needs), and the engine reads it offline.
 FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
-ARG ROCM_VERSION=6.4.1
+ARG ROCM_VERSION=7.0.2
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3.12 python3-pip python-is-python3 gcc python3-dev \
  && mkdir -p /etc/apt/keyrings \
@@ -35,7 +35,7 @@ RUN apt-get update \
 # `python` names on any PATH.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 COPY requirements-agentx.txt /tmp/requirements-agentx.txt
-RUN pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://download.pytorch.org/whl/rocm6.4 \
+RUN pip install --no-cache-dir 'torch==2.10.0+rocm7.0' 'triton-rocm==3.6.0' --index-url https://download.pytorch.org/whl/rocm7.0 \
  && pip install --no-cache-dir -r /tmp/requirements-agentx.txt \
  && rm /tmp/requirements-agentx.txt \
  && python -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('torch', torch.__version__, 'hip', torch.version.hip)"
@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir 'torch==2.9.1+rocm6.4' --index-url https://downlo
 # flash-linear-attention's Triton kernels (package `fla`) for the 30 Gated DeltaNet layers:
 # Transformers uses its chunk and fused-recurrent gated delta rule when `fla` imports, and
 # engine/gdn.py its fused gated RMSNorm. --no-deps so pip cannot swap torch's ROCm Triton
-# (pytorch-triton-rocm) for the CUDA `triton` wheel; fla-core's only other dependency is einops.
+# (triton-rocm) for the CUDA `triton` wheel; fla-core's only other dependency is einops.
 RUN pip install --no-cache-dir --no-deps 'fla-core==0.5.2' 'einops==0.8.1' \
  && python -c "import importlib.metadata as m, importlib.util as u, torch, triton; assert torch.version.hip and u.find_spec('fla'); print('torch', torch.__version__, 'triton', triton.__version__, 'fla-core', m.version('fla-core'))"
 

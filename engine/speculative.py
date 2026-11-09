@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -204,6 +205,41 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
 
 
+MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.2")) / 1e3
+EST_ALPHA = 0.2
+
+
+def _allowed(ahead_ok: Any) -> bool:
+    return bool(ahead_ok() if callable(ahead_ok) else ahead_ok)
+
+
+def _wait_late(generator: Generator, handle: dict) -> None:
+    """Hold the run-ahead launch until ``MARGIN_S`` before the in-flight step should end (its
+    start plus the learned step time of its shape), so a request arriving meanwhile is
+    prefilled after this step rather than after the next one; the margin covers the launch's
+    host time, so the GPU still does not idle. Without an estimate yet: launch now."""
+    est = getattr(generator, "_ahead_est", {}).get((handle["size"], handle["groups"]))
+    start = handle.get("t_start")
+    if est is None or start is None:
+        return
+    target = start + est - MARGIN_S
+    while True:
+        dt = target - time.perf_counter()
+        if dt <= 0 or handle["event"].query():
+            return
+        time.sleep(min(dt, 0.001))
+
+
+def _learn(generator: Generator, handle: dict) -> None:
+    """Update the shape's step time from a step that ran right after the previous one."""
+    if not handle.get("b2b") or "t_done" not in handle or handle.get("t_start") is None:
+        return
+    est = generator.__dict__.setdefault("_ahead_est", {})
+    key = (handle["size"], handle["groups"])
+    dur = handle["t_done"] - handle["t_start"]
+    est[key] = dur if key not in est else est[key] + EST_ALPHA * (dur - est[key])
+
+
 def drain(generator: Generator) -> None:
     """Finish a step launched ahead: wait for it and queue its tokens (before the batch
     changes: an arrival, a prefill, a request leaving)."""
@@ -252,18 +288,29 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
         )
     nxt_handle = None
     if (
-        ahead_ok
+        _allowed(ahead_ok)
         and fast.chain_ready(handle["size"], handle["groups"])
         and all(_ahead_safe(g, k) for g in generations)
         and choose_k(generator, generations) == k
     ):
-        for g in generations:
-            # Pages for the next step's rows: at most k + 1 tokens on, k + 1 rows, k drafts.
-            fast._ensure_pages(g.slot, g.length + 3 * (k + 1))
-        nxt_handle = fast.chain_launch_next(handle)
+        if timed:
+            looptimers.add("choosek", looptimers.now() - t0)
+        _wait_late(generator, handle)
+        if timed:
+            t0 = looptimers.now()
+        if _allowed(ahead_ok):  # still nothing new to start after the wait
+            for g in generations:
+                # Pages for the next step's rows: at most k + 1 tokens on, k + 1 rows, k drafts.
+                fast._ensure_pages(g.slot, g.length + 3 * (k + 1))
+            nxt_handle = fast.chain_launch_next(handle)
+            # Launched while this step still ran: the next one starts when this one ends.
+            nxt_handle["b2b"] = not handle["event"].query()
     if timed:
         looptimers.add("choosek", looptimers.now() - t0)
     result = fast.chain_collect(handle)
+    _learn(generator, handle)
+    if nxt_handle is not None and nxt_handle.get("b2b"):
+        nxt_handle["t_start"] = handle["t_done"]
     if timed:
         t0 = looptimers.now()
     _book(generator, generations, k, *result)

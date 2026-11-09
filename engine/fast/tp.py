@@ -1453,7 +1453,7 @@ class TPModel:
         batch = len(tokens)
         groups = len(drafts[0]) + 1
         size = r0.bucket(batch) if r0.use_graphs else batch
-        handle: dict = {"batch": batch, "size": size, "groups": groups}
+        handle: dict = {"batch": batch, "size": size, "groups": groups, "t_start": time.perf_counter()}
         timed = looptimers.ENABLED
         if timed:
             t0 = looptimers.now()
@@ -1516,6 +1516,7 @@ class TPModel:
         if timed:
             t0 = looptimers.now()
         handle["event"].synchronize()
+        handle["t_done"] = time.perf_counter()
         if timed:
             t1 = looptimers.now()
             looptimers.add("wait", t1 - t0)

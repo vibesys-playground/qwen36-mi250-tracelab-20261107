@@ -61,7 +61,8 @@ CHAIN_GLUE = os.environ.get("ENGINE_CHAIN_GLUE", "1") == "1"
 # the smallest bucket >= B, its extra slots run as padding on the dummy slot. Plan 73: exact 3, 5
 # and 6 (the padding slot's rows route their own experts and run attention, GDN and the MTP chain;
 # j336 TP2 chained verify k=3: 3 real slots 16.11 ms on the 4-slot graph, 13.35 ms on the 3-slot
-# one; 5 real 27.90 -> 21.17 ms, 6 real 28.27 -> 23.36 ms; real rows' outputs unchanged).
+# one; 5 real 27.90 -> 21.17 ms, 6 real 28.27 -> 23.36 ms; emitted tokens unchanged. Served
+# j339: pure B=3 k=3 gpu_step 17.1-17.5 -> 13.8-14.2 ms; capture +1.4 s, ~40 MB, KV pages same).
 # "1,2,4,8,16,32" restores the old list.
 DECODE_BUCKETS = tuple(sorted({int(b) for b in os.environ.get(
     "ENGINE_DECODE_BUCKETS", "1,2,3,4,5,6,8,16,32").split(",") if b.strip()}))

@@ -13,6 +13,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -271,3 +272,148 @@ def test_errors_and_non_streaming_pass_through(front: str) -> None:
     assert whole["usage"]["completion_tokens"] == 5
     assert httpx.get(f"{front}/nowhere").status_code == 404
     _ = router  # imported for the module under test
+
+
+# ----------------------------------------------------------------------------- live moves (plan 63)
+
+
+def _finish_all(affinity: Affinity, routed: list[tuple[int, int]], now: float) -> list:
+    return [affinity.finish(t, r, now=now) for r, t in routed]
+
+
+def test_a_round_ending_on_a_crowded_replica_moves_its_session() -> None:
+    affinity = Affinity(2, min_tokens=16, idle_seconds=0, migrate=True, gap=2)
+    a, b, c, d, e = (_session(s, 100) for s in range(1, 6))
+    routed = {name: affinity.route(p, now=0.0) for name, p in zip("abcde", (a, b, c, d, e))}
+    assert [routed[n][0] for n in "abcde"] == [0, 1, 0, 1, 0]
+    # b and d end on replica 1 (the less loaded side: nothing moves) and send nothing more.
+    assert affinity.finish(routed["b"][1], 1, now=0.1) is None
+    assert affinity.finish(routed["d"][1], 1, now=0.1) is None
+    # Their resting window (3 s) lapses; a's round ends on 0 while c and e still run there.
+    move = affinity.finish(routed["a"][1], 0, now=5.0)
+    assert move is not None and (move.src, move.dst) == (0, 1)
+    assert affinity._load(5.0, 3.0) == [2, 1]  # a counts on its target while it moves
+    # One move out of a replica at a time.
+    assert affinity.finish(routed["c"][1], 0, now=5.1) is None
+    assert affinity.commit(move, 1.0, 2.0)
+    affinity.release(move)
+    r, t = affinity.route(a + _session(9, 10), now=5.2)
+    assert r == 1 and affinity.moved(t)
+    stats = affinity.stats(now=5.2)["moves"]
+    assert stats["committed"] == 1 and stats["moved_rounds"] == 1 and stats["started"] == 1
+
+
+def test_no_move_without_the_gap_or_when_off() -> None:
+    for migrate in (False, True):
+        affinity = Affinity(2, min_tokens=16, migrate=migrate, gap=2)
+        r1 = affinity.route(_session(1, 100), now=0.0)
+        r2 = affinity.route(_session(2, 100), now=0.0)
+        assert _finish_all(affinity, [r1, r2], now=1.0) == [None, None]
+    # Short prompts (probes) never move.
+    affinity = Affinity(2, min_tokens=16, migrate=True, gap=0)
+    r, t = affinity.route(_session(1, 4), now=0.0)
+    assert affinity.finish(t, r, now=1.0) is None
+
+
+def test_a_round_arriving_mid_move_waits_or_goes_to_the_source() -> None:
+    affinity = Affinity(2, min_tokens=16, migrate=True, gap=0, move_wait_seconds=0.05)
+    a = _session(1, 100)
+    r, t = affinity.route(a)
+    move = affinity.finish(t, r)
+    assert move is not None and move.src == r
+    # The copy does not finish in time: the round goes to the source, which has the state,
+    # and the late commit is refused (the caller then drops the target's copy).
+    r2, t2 = affinity.route(a + _session(2, 10))
+    assert r2 == r and not affinity.moved(t2)
+    assert not affinity.commit(move, 1.0, 1.0)
+    affinity.release(move)
+    assert affinity.stats()["moves"]["abandoned"] == 1
+    # A move that finishes while the round waits: the round follows the state.
+    move = affinity.finish(t2, r2)
+    assert move is not None
+    timer = threading.Timer(0.01, lambda: affinity.commit(move, 1.0, 1.0))
+    affinity.move_wait_seconds = 5.0
+    timer.start()
+    r3, t3 = affinity.route(a + _session(2, 10) + _session(3, 10))
+    timer.join()
+    assert r3 == move.dst and affinity.moved(t3)
+    affinity.release(move)
+    # A failed move leaves the session where it was.
+    move = affinity.finish(t3, r3)
+    affinity.fail(move, "test")
+    affinity.release(move)
+    r4, _ = affinity.route(a + _session(2, 10) + _session(3, 10) + _session(4, 10))
+    assert r4 == r3
+
+
+def _front(checkpoint: Path, log: Path, env: dict[str, str]) -> tuple[subprocess.Popen, str]:
+    port = _free_port()
+    with log.open("w") as sink:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "engine.server", "--model", str(checkpoint), "--port",
+             str(port), "--prefill-chunk-tokens", str(CHUNK), "--replicas", "2"],
+            cwd=ROOT, stdout=sink, stderr=subprocess.STDOUT,
+            env={**os.environ, "HF_HUB_OFFLINE": "1", "ENGINE_AFFINITY_MIN_TOKENS": "16", **env},
+        )
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 300
+    while True:
+        if process.poll() is not None:
+            pytest.fail(f"front exited with {process.returncode}:\n{log.read_text()}")
+        try:
+            if httpx.get(f"{url}/health", timeout=5).status_code == 200:
+                return process, url
+        except httpx.TransportError:
+            pass
+        if time.monotonic() > deadline:
+            process.terminate()
+            pytest.fail(f"front did not become healthy:\n{log.read_text()}")
+        time.sleep(0.2)
+
+
+def _moved_completion(url: str, prompt: list[int], n: int) -> tuple[list[int], dict, dict]:
+    body = {"prompt": prompt, "max_tokens": n, "temperature": 0, "ignore_eos": True,
+            "return_token_ids": True, "stream": True, "stream_options": {"include_usage": True}}
+    with httpx.stream("POST", f"{url}/v1/completions", json=body, timeout=TIMEOUT) as response:
+        response.raise_for_status()
+        headers = dict(response.headers)
+        lines = [x for x in response.iter_lines() if x.startswith("data: ")]
+    *chunks, last = [json.loads(x.removeprefix("data: ")) for x in lines[:-1]]
+    return [t for c in chunks for t in c["choices"][0]["token_ids"]], last["usage"], headers
+
+
+def test_a_moved_session_continues_token_for_token(tmp_path: Path) -> None:
+    """Two CPU replicas on the engine's own forward: with a zero gap every round's state moves
+    to the other replica; outputs and cached tokens match a front that never moves."""
+    checkpoint = tmp_path / "tiny"
+    write_checkpoint(checkpoint)
+    common = {"ENGINE_FAST": "1", "ENGINE_MIGRATE_WAIT_MS": "20000"}
+    runs = {}
+    for name, env in (("off", {"ENGINE_MIGRATE": "0"}),
+                      ("on", {"ENGINE_MIGRATE": "1", "ENGINE_MIGRATE_GAP": "0"})):
+        process, url = _front(checkpoint, tmp_path / f"{name}.log", {**common, **env})
+        try:
+            prompt = [5 + (i * 13) % 300 for i in range(3 * CHUNK + 3)]
+            rounds = []
+            for turn in range(4):
+                out, usage, headers = _moved_completion(url, prompt, 7)
+                rounds.append((out, usage["prompt_tokens_details"]["cached_tokens"],
+                               headers.get("x-engine-replica"), headers.get("x-engine-moved")))
+                prompt = prompt + out + [9 + (turn * 7 + i) % 300 for i in range(4)]
+                time.sleep(0.2)
+            health = httpx.get(f"{url}/health", timeout=30).json()
+        finally:
+            process.terminate()
+            process.wait(timeout=60)
+        runs[name] = (rounds, health)
+    off, on = runs["off"][0], runs["on"][0]
+    assert [r[0] for r in on] == [r[0] for r in off]  # token-identical continuations
+    assert [r[1] for r in on] == [r[1] for r in off]  # the same real reuse of the moved state
+    assert all(r[1] > 0 for r in on[1:])
+    assert len({r[2] for r in off}) == 1 and all(r[3] is None for r in off)
+    replicas = [r[2] for r in on]
+    assert all(x != y for x, y in zip(replicas, replicas[1:], strict=False))  # it moved each round
+    assert all(r[3] == "1" for r in on[1:])
+    moves = runs["on"][1]["router"]["moves"]
+    assert moves["committed"] >= 3 and moves["failed"] == 0, moves
+    assert sum(r["migrate"]["import"] for r in runs["on"][1]["replicas"]) >= 3

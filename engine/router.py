@@ -22,6 +22,24 @@ ids, as text, or for chat as the sequence of its messages, so a chat session's
 growing history matches message by message. The replica holding a session holds
 its prefix-cache snapshots, so affinity is also what makes cached tokens real.
 
+Live moves (plan 63, ``ENGINE_MIGRATE``, on by default). Pinning a session to
+its first replica lets load drift apart as sessions end at uneven times: one
+replica carries three live sessions while another idles. So when a round ends
+on a replica that carries ``ENGINE_MIGRATE_GAP`` (2) or more load units than
+the least-loaded other replica (load: requests in flight plus sessions that
+ended a round within ``ENGINE_MIGRATE_IDLE_SECONDS``, 3 s, counted from the
+front's own request accounting only), the session's whole saved state (the
+session tail: its attention KV pages and every Gated DeltaNet layer's
+recurrent and convolution state) moves to that replica during the session's
+tool wait: the source exports it into a shared memory channel, the target
+imports it, and only then does the session's home change and the source drop
+its copy. The next round is served by exactly one replica, from complete
+state: if it arrives while the copy is in flight it waits for the copy (at most
+``ENGINE_MIGRATE_WAIT_MS``, 100 ms) and otherwise goes to the source, which
+still holds the state; the target's copy is then dropped. A replica runs at
+most one move out and one move in at a time. Cached tokens reported for a moved
+session's next round are the imported state the target actually reuses.
+
 The front opens its port only after every replica answers ``/health``, and
 exits (stopping the others) if any replica exits.
 """
@@ -181,13 +199,32 @@ def _extends(key: Key, earlier: Key) -> bool:
 
 
 @dataclass
+class Move:
+    """A session's state on its way from ``src`` to ``dst`` (``Affinity.finish``)."""
+
+    ticket: int
+    src: int
+    dst: int
+    started: float
+    done: threading.Event = field(default_factory=threading.Event)
+    abandoned: bool = False
+
+
+@dataclass
 class Entry:
-    """One routed prompt: the replica that served it and when its request ended."""
+    """One routed prompt: the replica that served it and when its request ended.
+
+    ``move`` is set while the session's state moves away after this round; ``arrived`` once
+    it has (the next round then runs on the new ``replica``). ``moved`` marks a round served
+    from state that had moved."""
 
     key: Key
     replica: int
     ended_at: float | None = None
     continued: bool = False
+    move: Move | None = None
+    arrived: bool = False
+    moved: bool = False
 
 
 @dataclass
@@ -198,21 +235,79 @@ class Affinity:
     unrelated sessions onto its replica: a remembered prompt shorter than that
     attracts only an identical prompt. ``idle_seconds`` is how long a session
     that just finished a round still counts as load on its replica.
+
+    With ``migrate``, ``finish`` may start a live move (module docstring): ``gap``,
+    ``move_idle_seconds`` and ``move_wait_seconds`` are its rule's parameters. The caller
+    runs the move and reports it with ``commit`` or ``fail``, then ``release``.
+
+    It also keeps, per replica, the seconds spent with each number of requests in flight
+    (plan 62's histogram) and the moves' counts and times: ``stats()`` reports them.
     """
 
     replicas: int
     max_entries: int = 4096
     min_tokens: int = 64
     idle_seconds: float = 10.0
+    migrate: bool = False
+    gap: int = 2
+    move_idle_seconds: float = 3.0
+    move_wait_seconds: float = 0.1
     _entries: OrderedDict[int, Entry] = field(default_factory=OrderedDict)
     _inflight: list[int] = field(default_factory=list)
     _new_sessions: list[int] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _next_id: int = 0
+    _seconds_at: list[list[float]] = field(default_factory=list)
+    _clock: float | None = None
+    _sending: set[int] = field(default_factory=set)
+    _receiving: set[int] = field(default_factory=set)
+    _moves: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._inflight = [0] * self.replicas
         self._new_sessions = [0] * self.replicas
+        self._seconds_at = [[] for _ in range(self.replicas)]
+        self._moves = {
+            "started": 0, "committed": 0, "failed": 0, "abandoned": 0, "waited": 0,
+            "moved_rounds": 0, "move_ms": [], "export_ms": [], "import_ms": [], "wait_ms": [],
+            "errors": [],
+        }
+
+    def _advance(self, now: float) -> None:
+        """Add the time since the last change to each replica's current in-flight level."""
+        if self._clock is not None:
+            dt = max(now - self._clock, 0.0)
+            for r, level in enumerate(self._inflight):
+                hist = self._seconds_at[r]
+                if len(hist) <= level:
+                    hist.extend([0.0] * (level + 1 - len(hist)))
+                hist[level] += dt
+        self._clock = now
+
+    def stats(self, now: float | None = None) -> dict[str, Any]:
+        """Per replica, seconds at each in-flight count; the share of time above two; moves."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._clock is not None:
+                self._advance(now)
+            hist = [[round(t, 3) for t in h] for h in self._seconds_at]
+            total = sum(sum(h) for h in self._seconds_at)
+            busy = sum(sum(h[1:]) for h in self._seconds_at)
+            over = sum(sum(h[3:]) for h in self._seconds_at)
+            moves = {
+                k: ([round(x, 2) for x in v] if k.endswith("_ms") else list(v[-8:]))
+                if isinstance(v, list) else v
+                for k, v in self._moves.items()
+            }
+            return {
+                "inflight_seconds": hist,
+                "share_over_2": round(over / total, 4) if total else 0.0,
+                "share_over_2_of_busy": round(over / busy, 4) if busy else 0.0,
+                "max_inflight": [len(h) - 1 if h else 0 for h in self._seconds_at],
+                "idle_seconds": self.idle_seconds,
+                "migrate": self.migrate,
+                "moves": moves,
+            }
 
     def _match(self, key: Key) -> Entry | None:
         best: Entry | None = None
@@ -231,25 +326,54 @@ class Affinity:
         with self._lock:
             return self._load(now)
 
-    def _load(self, now: float) -> list[int]:
+    def _load(self, now: float, window: float | None = None) -> list[int]:
+        """In-flight requests plus sessions resting within ``window`` (default
+        ``idle_seconds``); a session whose state is moving counts on its target."""
+        window = self.idle_seconds if window is None else window
         load = list(self._inflight)
         for entry in self._entries.values():
             if (
                 not entry.continued
                 and entry.ended_at is not None
-                and now - entry.ended_at < self.idle_seconds
+                and now - entry.ended_at < window
             ):
-                load[entry.replica] += 1
+                load[entry.move.dst if entry.move is not None else entry.replica] += 1
         return load
 
-    def route(self, key: Key | None) -> tuple[int, int]:
-        """(replica, ticket) for a request; pass the ticket to ``finish`` when it ends."""
+    def route(self, key: Key | None, now: float | None = None) -> tuple[int, int]:
+        """(replica, ticket) for a request; pass the ticket to ``finish`` when it ends.
+
+        A request continuing a session whose state is moving waits for the move, at most
+        ``move_wait_seconds``; a move not finished by then is abandoned and the request goes
+        to the source, which still holds the state."""
+        waited = None
+        if key is not None and self.migrate:
+            with self._lock:
+                match = self._match(key)
+                move = match.move if match is not None else None
+            if move is not None:
+                t0 = time.monotonic()
+                move.done.wait(self.move_wait_seconds)
+                waited = time.monotonic() - t0
+                with self._lock:
+                    if match.move is move:  # still in flight: serve at the source
+                        move.abandoned = True
+                        match.move = None
+                        self._moves["abandoned"] += 1
         with self._lock:
-            now = time.monotonic()
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             match = self._match(key) if key is not None else None
+            moved = False
+            if waited is not None:
+                self._moves["waited"] += 1
+                self._moves["wait_ms"].append(waited * 1e3)
             if match is not None:
                 replica = match.replica
                 match.continued = True
+                moved = match.arrived
+                if moved:
+                    self._moves["moved_rounds"] += 1
             else:
                 load = self._load(now)
                 replica = min(
@@ -260,17 +384,85 @@ class Affinity:
             ticket = self._next_id
             self._next_id += 1
             if key is not None:
-                self._entries[ticket] = Entry(key, replica)
+                self._entries[ticket] = Entry(key, replica, moved=moved)
                 while len(self._entries) > self.max_entries:
                     self._entries.popitem(last=False)
             return replica, ticket
 
-    def finish(self, ticket: int, replica: int) -> None:
+    def moved(self, ticket: int) -> bool:
+        """Whether ``ticket``'s round runs on state that moved to its replica."""
         with self._lock:
+            entry = self._entries.get(ticket)
+            return entry is not None and entry.moved
+
+    def finish(self, ticket: int, replica: int, now: float | None = None) -> Move | None:
+        """``ticket``'s request has ended. Returns a move of its session's state to start
+        now (the caller runs it), when ``migrate`` is on and the rule holds: the session's
+        replica carries at least ``gap`` more load than the least-loaded other replica, not
+        counting this session, and neither replica has a move in its direction running."""
+        with self._lock:
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             self._inflight[replica] -= 1
             entry = self._entries.get(ticket)
-            if entry is not None:
-                entry.ended_at = time.monotonic()
+            if entry is None:
+                return None
+            entry.ended_at = now
+            if (
+                not self.migrate
+                or entry.continued
+                or entry.replica != replica
+                or _units(entry.key) < self.min_tokens
+                or replica in self._sending
+            ):
+                return None
+            load = self._load(now, self.move_idle_seconds)
+            load[replica] -= 1  # this session, resting here: it is what would move
+            others = [r for r in range(self.replicas) if r != replica and r not in self._receiving]
+            if not others:
+                return None
+            target = min(others, key=lambda r: (load[r], self._inflight[r], r))
+            if load[replica] - load[target] < self.gap:
+                return None
+            move = Move(ticket, replica, target, now)
+            entry.move = move
+            self._sending.add(replica)
+            self._receiving.add(target)
+            self._moves["started"] += 1
+            return move
+
+    def commit(self, move: Move, export_ms: float, import_ms: float) -> bool:
+        """The target holds the state: the session's home is now ``move.dst``. False if the
+        move was abandoned (its next round went to the source) or forgotten."""
+        with self._lock:
+            entry = self._entries.get(move.ticket)
+            ok = not move.abandoned and entry is not None and entry.move is move
+            if ok:
+                entry.replica = move.dst
+                entry.move = None
+                entry.arrived = True
+                self._moves["committed"] += 1
+                self._moves["move_ms"].append((time.monotonic() - move.started) * 1e3)
+                self._moves["export_ms"].append(export_ms)
+                self._moves["import_ms"].append(import_ms)
+            move.done.set()
+            return ok
+
+    def fail(self, move: Move, error: str) -> None:
+        """The move did not happen; the session stays where it was."""
+        with self._lock:
+            entry = self._entries.get(move.ticket)
+            if entry is not None and entry.move is move:
+                entry.move = None
+            self._moves["failed"] += 1
+            self._moves["errors"].append(error[:200])
+            move.done.set()
+
+    def release(self, move: Move) -> None:
+        """The move's replicas may take part in another move."""
+        with self._lock:
+            self._sending.discard(move.src)
+            self._receiving.discard(move.dst)
 
 
 # ----------------------------------------------------------------------------- replicas
@@ -314,12 +506,45 @@ class Replica:
         finally:
             conn.close()
 
+    def post_json(self, path: str, body: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        conn = self.connection(timeout)
+        try:
+            payload = json.dumps(body).encode()
+            conn.request("POST", path, body=payload, headers={"Content-Type": "application/json",
+                                                              "Content-Length": str(len(payload))})
+            response = conn.getresponse()
+            data = response.read()
+            if response.status != 200:
+                raise OSError(f"replica {self.index} {path}: HTTP {response.status} {data[:300]!r}")
+            return json.loads(data)
+        finally:
+            conn.close()
+
+
+def migrate_enabled() -> bool:
+    """``ENGINE_MIGRATE``: live moves of a session's state between replicas (default on)."""
+    return os.environ.get("ENGINE_MIGRATE", "1").strip() != "0"
+
+
+def move_channels(count: int) -> list[int]:
+    """One shared memory file per replica for its outgoing moves (``engine.migrate.HostChannel``),
+    ``ENGINE_MIGRATE_CHANNEL_MIB`` each (512: a tail of about 16k tokens on a TP2 replica; a
+    longer one does not move); the replicas inherit the descriptors."""
+    nbytes = int(float(os.environ.get("ENGINE_MIGRATE_CHANNEL_MIB") or 512) * (1 << 20))
+    fds = []
+    for index in range(count):
+        fd = os.memfd_create(f"engine-move-{index}", 0)
+        os.ftruncate(fd, nbytes)
+        fds.append(fd)
+    return fds
+
 
 def start_replicas(
-    argv: Sequence[str], layout: list[tuple[int, ...]], hip: bool
+    argv: Sequence[str], layout: list[tuple[int, ...]], hip: bool, channels: Sequence[int] = ()
 ) -> list[Replica]:
     """Launch one ``engine.server`` process per device group, all loading at once, each on its
-    own slice of host cores (``engine.cpu_place``) when the topology allows."""
+    own slice of host cores (``engine.cpu_place``) when the topology allows. ``channels`` are
+    the live-move channels' descriptors, passed to every replica."""
     from engine import cpu_place
 
     placed = cpu_place.replica_slices(layout) if layout and any(layout) else None
@@ -342,6 +567,9 @@ def start_replicas(
         ]
         env = device_env(dict(os.environ), devices, hip)
         env["ENGINE_REPLICA_INDEX"] = str(index)
+        env.pop("ENGINE_MIGRATE_CHANNELS", None)
+        if channels:
+            env["ENGINE_MIGRATE_CHANNELS"] = ",".join(map(str, channels))
         preexec = _die_with_parent
         if placed is not None:
             piece = placed[0][index]
@@ -352,7 +580,9 @@ def start_replicas(
             env.pop("ENGINE_RANK_CPUS", None)
         where = ",".join(map(str, devices)) or "cpu"
         print(f"router: starting replica {index} on devices {where}, port {port}", flush=True)
-        process = subprocess.Popen(command, env=env, preexec_fn=preexec)  # noqa: PLW1509
+        process = subprocess.Popen(  # noqa: PLW1509
+            command, env=env, preexec_fn=preexec, pass_fds=tuple(channels)
+        )
         replicas.append(Replica(index, devices, port, process))
     if placed is not None:
         cpu_place.pin_router(placed[1])
@@ -461,6 +691,7 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 {"devices": list(r.devices), **s} for r, s in zip(replicas, states, strict=True)
             ]
             body["load"] = self.server.affinity.load()
+            body["router"] = self.server.affinity.stats()
             self._send_json(200, body)
             return
         try:
@@ -478,18 +709,26 @@ class _FrontHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = None  # the replica answers with its own error
         key = affinity_key(self.path, body)
-        replica_index, ticket = self.server.affinity.route(key)
+        affinity = self.server.affinity
+        replica_index, ticket = affinity.route(key)
         try:
-            self._relay(self.server.replicas[replica_index], raw)
+            self._relay(self.server.replicas[replica_index], raw, ticket, affinity.moved(ticket))
         finally:
-            self.server.affinity.finish(ticket, replica_index)
+            move = affinity.finish(ticket, replica_index)
+            if move is not None:
+                threading.Thread(
+                    target=run_move, args=(affinity, self.server.replicas, move),
+                    name="session-move", daemon=True,
+                ).start()
 
-    def _relay(self, replica: Replica, raw: bytes) -> None:
+    def _relay(self, replica: Replica, raw: bytes, ticket: int = -1, moved: bool = False) -> None:
         """Send the request to ``replica`` and copy its response back as it arrives."""
         conn = replica.connection()
         try:
             headers = {h: self.headers[h] for h in _FORWARD_HEADERS if self.headers.get(h)}
             headers["Content-Length"] = str(len(raw))
+            if ticket >= 0:
+                headers["X-Engine-Ticket"] = str(ticket)  # names the session tail it keeps
             try:
                 conn.request("POST", self.path, body=raw, headers=headers)
                 response = conn.getresponse()
@@ -502,6 +741,9 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 value = response.getheader(name)
                 if value is not None:
                     self.send_header(name, value)
+            self.send_header("X-Engine-Replica", str(replica.index))
+            if moved:
+                self.send_header("X-Engine-Moved", "1")
             size = response.getheader("Content-Length")
             if size is not None:
                 self.send_header("Content-Length", size)
@@ -522,6 +764,42 @@ class _FrontHandler(BaseHTTPRequestHandler):
             conn.close()
 
 
+def run_move(affinity: Affinity, replicas: list[Replica], move: Move) -> None:
+    """Move a resting session's state from ``move.src`` to ``move.dst`` (on its own thread):
+    export into the source's channel, import on the target, then switch the session's home
+    and drop the source's copy; if the session's next round went to the source meanwhile,
+    drop the target's copy instead. On any error the session stays at the source."""
+    src, dst = replicas[move.src], replicas[move.dst]
+    key = None
+    committed = None
+    try:
+        t0 = time.monotonic()
+        exported = src.post_json("/internal/export", {"ticket": move.ticket})
+        key = exported["key"]
+        t1 = time.monotonic()
+        if move.abandoned:
+            raise RuntimeError("abandoned before the import")
+        result = dst.post_json("/internal/import", {"source": move.src, "key": key})
+        if not result.get("kept"):
+            raise RuntimeError("the target did not keep the state")
+        t2 = time.monotonic()
+        committed = affinity.commit(move, (t1 - t0) * 1e3, (t2 - t1) * 1e3)
+        if committed:
+            src.post_json("/internal/drop", {"key": key})
+        else:
+            dst.post_json("/internal/drop", {"key": key})
+    except Exception as exc:  # noqa: BLE001 - the session keeps its replica
+        if committed is None:
+            affinity.fail(move, f"{type(exc).__name__}: {exc}")
+            if key is not None:
+                try:  # an import that failed late may still have landed; the source has it all
+                    dst.post_json("/internal/drop", {"key": key})
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        affinity.release(move)
+
+
 def serve(
     argv: Sequence[str],
     host: str,
@@ -530,7 +808,9 @@ def serve(
     hip: bool,
 ) -> None:
     """Start the replicas, wait for all of them, then route requests until stopped."""
-    replicas = start_replicas(argv, layout, hip)
+    migrate = migrate_enabled() and len(layout) > 1
+    channels = move_channels(len(layout)) if migrate else []
+    replicas = start_replicas(argv, layout, hip, channels)
 
     def stop(signum: int, frame: object) -> None:
         stop_replicas(replicas)
@@ -547,6 +827,10 @@ def serve(
         len(replicas),
         min_tokens=env_int("ENGINE_AFFINITY_MIN_TOKENS") or 64,
         idle_seconds=float(os.environ.get("ENGINE_SESSION_IDLE_SECONDS") or 10.0),
+        migrate=migrate,
+        gap=int(os.environ.get("ENGINE_MIGRATE_GAP") or 2),
+        move_idle_seconds=float(os.environ.get("ENGINE_MIGRATE_IDLE_SECONDS") or 3.0),
+        move_wait_seconds=float(os.environ.get("ENGINE_MIGRATE_WAIT_MS") or 100) / 1e3,
     )
     front = _Front((host, port), replicas, affinity)
 

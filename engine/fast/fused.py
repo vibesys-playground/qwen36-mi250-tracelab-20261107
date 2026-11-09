@@ -35,7 +35,7 @@ import sys
 
 import torch
 
-from engine.fast import kernels, mfma
+from engine.fast import gdn_hip, kernels, mfma
 
 triton, tl = kernels.triton, kernels.tl
 
@@ -719,6 +719,7 @@ class FusedDecode:
         self.w_moe: dict[int, torch.Tensor] = {}
         self.rope: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cus: dict[torch.device, int] = {}
+        self.gdn_hip = gdn_hip.ENABLED
         indices = list(range(len(fast.layers)))
         if getattr(fast, "mtp", None) is not None:
             indices.append(fast.mtp_index)  # the MTP head's decoder layer (full attention)
@@ -728,6 +729,8 @@ class FusedDecode:
                 m = layer.linear_attn
                 self.w_in[i] = _pack([m.in_proj_qkv.weight, m.in_proj_z.weight,
                                       m.in_proj_b.weight, m.in_proj_a.weight])
+                if self.gdn_hip and gdn_hip.supported(m) and m.conv1d.weight.device.type == "cuda":
+                    gdn_hip.prepare(m)  # plan 50: compiled and loaded here, before /health
             else:
                 m = layer.self_attn
                 self.w_in[i] = _pack([m.q_proj.weight, m.k_proj.weight, m.v_proj.weight])
@@ -748,6 +751,10 @@ class FusedDecode:
             if dev not in self.cus:
                 self.cus[dev] = (torch.cuda.get_device_properties(dev).multi_processor_count
                                  if dev.type == "cuda" else 4)
+        if self.gdn_hip:
+            hip_layers = sum(getattr(self._layer(i).linear_attn, "_gdn_hip", None) is not None
+                             for i in indices if self._is_gdn(i))
+            print(f"engine: gdn_hip (plan 50) layers={hip_layers} layout={gdn_hip.LAYOUT}", flush=True)
 
     def _layer(self, i: int) -> torch.nn.Module:
         fast = self.fast
@@ -925,6 +932,10 @@ class FusedDecode:
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
+        if getattr(m, "_gdn_hip", None) is not None:  # plan 50: conv + step + norm in HIP
+            proj = self._gemv(h, self.w_in[i])
+            core = gdn_hip.layer_core(m, conv_state, rec_state, proj, slots, 1)
+            return self._gemv(core, m.out_proj.weight)
         conv_dim = 2 * m.key_dim + m.value_dim
         proj = self._gemv(h, self.w_in[i], conv=(conv_state, slots, m.conv1d.weight, conv_dim))
         core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
@@ -960,6 +971,12 @@ class FusedDecode:
         (``kernels.gdn_conv_``) and the step run on the first half, the first half's states
         are copied to the second half's rows, then the second half runs there. Both give
         the same bits: each row's math and order are the same."""
+        m = self.fast.layers[i].linear_attn
+        if getattr(m, "_gdn_hip", None) is not None:  # plan 50: G rows per slot in HIP
+            conv_state, rec_state = self.fast.gdn_state[i]
+            proj = self._gemv(h, self.w_in[i])
+            core = gdn_hip.layer_core(m, conv_state, rec_state, proj, states, groups)
+            return self._gemv(core, m.out_proj.weight)
         if mfma.CHAIN or groups != 2:  # plan 31: G rows per slot, states to the ring
             return mfma.gdn_chain(self, i, h, states, groups)
         fast = self.fast

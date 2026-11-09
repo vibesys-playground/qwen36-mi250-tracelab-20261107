@@ -1,5 +1,5 @@
-"""Plan 50 (stage 0, not on the served path): the decode / chained-verify GDN step as one
-hand-written HIP kernel per layer (``engine/fast/hip/gdn_chain.hip``), compiled with hipRTC
+"""Plan 50: the decode / verify / chained-verify GDN step (short conv, delta rule, gated norm)
+as one hand-written HIP kernel per layer (``engine/fast/hip/gdn_chain.hip``), compiled with hipRTC
 from torch's wheel (``hipmega_rtc``, in a child process) and launched on the current stream
 (graph-capturable).
 
@@ -12,12 +12,25 @@ Layouts (``LAYOUTS``: name -> (LPC lanes per column group, CPL columns per lane)
 - ``f2``: conv in the prologue, one block per k-head (both v-heads, HPW=2): one launch;
 - ``v2`` / ``v4`` / ``v8``: as ``f1`` with each head's value columns split over 2 / 4 / 8 blocks
   (VS); the pre-norm o goes to a buffer and ``gdn_post`` runs the gated norm and the q / k ring.
+
+Served (stage 1, ``ENGINE_GDN_HIP=1``, default on): ``FusedDecode`` runs every decode (G = 1),
+verify (G = 2) and chained-verify (G = k + 1) GDN layer through ``layer_core`` with one layout
+(``ENGINE_GDN_HIP_LAYOUT``, default L4) and the column split chosen by the step's slot count
+(``vs_for``: 1 slot -> 4 blocks per head, 2 -> 2, more -> 1). The layout fixes every fp32
+summation order, and the split and G change none, so a slot's state, conv ring and output bits
+are the same in a decode, a verify and a chained-verify step and at any slot count (spec ==
+plain stays bitwise). Kernels are compiled once per process at load (``prepare``, from
+``FusedDecode.__init__``) for G = 1..8 and loaded on each rank's device; nothing compiles
+after /health.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import torch
@@ -55,11 +68,13 @@ def kname(layout: str, mode: str, g: int, prof: int = 0) -> str:
     return f"gdn_{layout}_{mode}_g{g}_p{prof}"
 
 
-def source(layout: str, groups=(2, 4), prof_groups=(4,), dv: int = 128) -> str:
+def source(layout: str, groups=(2, 4), prof_groups=(4,), dv: int = 128, only=None) -> str:
     lpc, cpl = LAYOUTS[layout]
     out = [SRC.read_text(), "\n// ---- generated entry points\n"]
     for g in groups:
         for mode in modes(layout, dv):
+            if only is not None and mode not in only:
+                continue
             conv, hpw, vs = MODES[mode]
             for p in (0, 1) if g in prof_groups else (0,):
                 nt = threads(layout, hpw, vs, dv)
@@ -75,10 +90,10 @@ def source(layout: str, groups=(2, 4), prof_groups=(4,), dv: int = 128) -> str:
     return "".join(out)
 
 
-def compile_layout(layout: str, dims: dict, groups=(2, 4)) -> tuple[bytes, str]:
+def compile_layout(layout: str, dims: dict, groups=(2, 4), prof_groups=(4,), only=None) -> tuple[bytes, str]:
     """(code object, compiler log) of ``layout``'s kernels for the shard ``dims``."""
-    src = source(layout, groups, dv=dims["head_v_dim"])
-    path = Path(tempfile.gettempdir()) / f"gdn_chain_{layout}.hip"
+    src = source(layout, groups, prof_groups, dv=dims["head_v_dim"], only=only)
+    path = Path(tempfile.gettempdir()) / f"gdn_chain_{layout}_{os.getpid()}.hip"
     path.write_text(src)
     opts = (f"-DKEY_DIM={dims['key_dim']}", f"-DV_HEADS={dims['num_v_heads']}",
             f"-DDK={dims['head_k_dim']}", f"-DDV={dims['head_v_dim']}")
@@ -142,3 +157,135 @@ class GdnHip:
             self.qk_ring(L, proj, states, n, groups)
         elif MODES[mode][2] > 1:
             self.post(L, proj, states, core, n, groups)
+
+
+# ====================================================================== served path (stage 1)
+ENABLED = os.environ.get("ENGINE_GDN_HIP", "1") == "1"
+LAYOUT = os.environ.get("ENGINE_GDN_HIP_LAYOUT", "L4")
+SERVED_GROUPS = tuple(range(1, 9))
+SERVED_MODES = ("f1", "v2", "v4", "v8")
+_lock = threading.Lock()
+_codes: dict[tuple, bytes] = {}
+_mods: dict[tuple, rtc.Module] = {}
+
+
+def _jit_log(what: str, seconds: float) -> None:
+    """Reported like a Triton compile: ``ENGINE_LOG_JIT`` lines and ``TRITON_COMPILE_LOG``
+    entries (tools/compile_hook, tools/live_compile_probe.py count them)."""
+    log = os.environ.get("TRITON_COMPILE_LOG")
+    if log:
+        import json
+        try:
+            with open(log, "a") as f:
+                f.write(json.dumps({"t": time.time() - seconds, "pid": os.getpid(), "name": f"gdn_hip:{what}",
+                                    "s": round(seconds, 3)}) + "\n")
+        except OSError:
+            pass
+    if os.environ.get("ENGINE_LOG_JIT") == "1":
+        from engine.fast import jit_log
+        print(f"engine-jit: compile pid={os.getpid()} serving={jit_log.SERVING} s={seconds:.3f} "
+              f"fn=gdn_hip:{what}", flush=True)
+
+
+def vs_for(n: int) -> int:
+    """Value-column blocks per head for a step of ``n`` slots (``ENGINE_GDN_HIP_VS``, e.g.
+    ``1:4,2:2,*:1``, overrides). Any choice gives the same bits."""
+    table = {1: 4, 2: 2}
+    default = 1
+    for item in filter(None, os.environ.get("ENGINE_GDN_HIP_VS", "").split(",")):
+        k, v = item.split(":")
+        if k == "*":
+            default = int(v)
+        else:
+            table[int(k)] = int(v)
+    vs = table.get(n, default)
+    mode = {1: "f1", 2: "v2", 4: "v4", 8: "v8"}.get(vs, "f1")
+    return vs if valid(LAYOUT, mode) else 1
+
+
+def dims_of(m) -> dict:
+    return dict(key_dim=m.key_dim, num_v_heads=m.num_v_heads, num_k_heads=m.num_k_heads,
+                head_k_dim=m.head_k_dim, head_v_dim=m.head_v_dim)
+
+
+def supported(m) -> bool:
+    d = dims_of(m)
+    return (d["head_k_dim"] == 128 and d["head_v_dim"] == 128 and d["num_v_heads"] == 2 * d["num_k_heads"]
+            and d["key_dim"] == d["num_k_heads"] * 128 and m.conv1d.weight.shape[-1] == 4
+            and m.in_proj_z.weight.shape[0] == d["num_v_heads"] * 128
+            and m.in_proj_b.weight.shape[0] == d["num_v_heads"]
+            and m.in_proj_a.weight.shape[0] == d["num_v_heads"])
+
+
+def _module(dev: torch.device, d: dict) -> rtc.Module:
+    key = (LAYOUT, d["key_dim"], d["num_v_heads"], d["head_k_dim"], d["head_v_dim"])
+    with _lock:
+        if key not in _codes:
+            t0 = time.perf_counter()
+            code, log = compile_layout(LAYOUT, d, groups=SERVED_GROUPS, prof_groups=(), only=SERVED_MODES)
+            _codes[key] = code
+            res = rtc.resources(log)
+            spills = {k: v.get("VGPRs Spill") for k, v in res.items() if v.get("VGPRs Spill") not in (None, "0")}
+            print(f"engine: gdn_hip compiled layout={LAYOUT} dims={d} kernels={len(res)} "
+                  f"s={time.perf_counter() - t0:.1f} spills={spills or 0}", flush=True)
+            _jit_log(f"compile:{LAYOUT}", time.perf_counter() - t0)
+        mk = key + (dev.index,)
+        if mk not in _mods:
+            t0 = time.perf_counter()
+            prev = torch.cuda.current_device()
+            try:
+                _mods[mk] = rtc.Module(_codes[key], dev)
+            finally:  # the loader makes ``dev`` current; the caller's device stays current
+                torch.cuda.set_device(prev)
+                rtc.check(rtc.hip().hipSetDevice(prev), "hipSetDevice")
+            _jit_log(f"load:{LAYOUT}:cuda{dev.index}", time.perf_counter() - t0)
+        return _mods[mk]
+
+
+def prepare(m) -> None:
+    """Load time: compile (once per process) and load the kernels on ``m``'s device, and the
+    exact fp32 copies of the layer's small weights."""
+    dev = m.conv1d.weight.device
+    conv_dim = 2 * m.key_dim + m.value_dim
+    m._gdn_hip = dict(
+        mod=_module(dev, dims_of(m)),
+        cw=m.conv1d.weight.reshape(conv_dim, 4).float().contiguous(),
+        alog=m.A_log.float().contiguous(), dtb=m.dt_bias.float().contiguous(),
+        nw=m.norm.weight.float().contiguous(),
+    )
+
+
+def layer_core(m, conv_state: torch.Tensor, rec_state: torch.Tensor, proj: torch.Tensor,
+               states: torch.Tensor, groups: int) -> torch.Tensor:
+    """The GDN step of ``proj``'s rows (raw q|k|v|z|b|a projections, rows ``j * n + r`` = slot
+    r's j-th token), state rows ``states`` (ring entry j of slot r at ``states[j * n + r]``;
+    entry 0 is the slot's current row): conv and recurrent ring states written, returns the
+    gated-norm output (bf16 [rows, heads * DV]) for ``out_proj``."""
+    hp = m._gdn_hip
+    rows = proj.shape[0]
+    n = rows // groups
+    assert n * groups == rows and states.shape[0] >= rows and states.dtype == torch.int64
+    assert states.stride(0) == 1
+    assert proj.stride(1) == 1 and conv_state.is_contiguous() and rec_state.is_contiguous()
+    heads = m.num_v_heads
+    hv = heads * m.head_v_dim
+    core = torch.empty((rows, hv), dtype=proj.dtype, device=proj.device)
+    vs = vs_for(n)
+    mode = {1: "f1", 2: "v2", 4: "v4", 8: "v8"}[vs]
+    obuf = torch.empty((rows, hv), dtype=torch.float32, device=proj.device) if vs > 1 else core
+    mod = hp["mod"]
+    mod.fn(kname(LAYOUT, mode, groups)).launch(
+        (n, heads, vs), threads(LAYOUT, 1, vs, m.head_v_dim), [
+            conv_state, rec_state, states, proj, hp["cw"], hp["alog"], hp["dtb"], hp["nw"], core, obuf,
+            core, n, proj.stride(0), conv_state.stride(0), rec_state.stride(0),
+            ctypes.c_float(m.norm.variance_epsilon), ctypes.c_float(m.head_k_dim ** -0.5)])
+    qkb = (2 * m.key_dim + 255) // 256
+    if vs > 1:
+        mod.fn(f"gdn_post_g{groups}").launch(
+            (rows * heads + 3) // 4 + n * qkb, 256,
+            [obuf, proj, hp["nw"], core, conv_state, states, n, proj.stride(0), conv_state.stride(0),
+             ctypes.c_float(m.norm.variance_epsilon)])
+    else:
+        mod.fn(f"gdn_qk_ring_g{groups}").launch(
+            (n, qkb, 1), 256, [conv_state, states, proj, n, proj.stride(0), conv_state.stride(0)])
+    return core

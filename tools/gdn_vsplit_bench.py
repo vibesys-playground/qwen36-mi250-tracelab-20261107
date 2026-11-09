@@ -30,6 +30,10 @@ hoist-only BV=128 1.217; state-streaming ceiling 0.245 (split) / 0.317 (today's 
 empty launches 0.053. 1 slot x 4 rows: 1.286 -> 0.877 (0.800 plain-layout norm). Norm folded
 into out_proj (N2) saved <= 0.08 ms over today's kernels + out_proj. States not bitwise
 (max rel 3e-7, reduction order over DK), conv rings bitwise. Kill (< 0.4 ms at 2 x 4).
+
+Round 2 (j231, same GPU type): chunked WY form (``W<BV>w<warps>``) slower than today: best
+1.488 ms at 2 x 4 (today 1.322, gate 0.6), 1.150 at 1 x 4 (1.284), 2.286 at 4 x 4 (1.522),
+1.071 at 2 x 2 (0.768). State max rel 4-5e-7, conv rings bitwise, finite. Plan parked.
 """
 
 from __future__ import annotations

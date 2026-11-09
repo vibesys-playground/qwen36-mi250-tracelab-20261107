@@ -55,7 +55,7 @@ from typing import Any
 import torch
 from torch.nn import functional as F
 
-from engine import cpu_place
+from engine import cpu_place, looptimers
 from engine.fast import kernels
 from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
@@ -1265,6 +1265,9 @@ class TPModel:
         r0 = self.ranks[0]
         if r0.mtp is None:
             raise RuntimeError("verify needs the MTP head")
+        timed = looptimers.ENABLED
+        if timed:
+            t0 = looptimers.now()
         batch = len(tokens)
         for slot, position in zip(slots, positions, strict=True):
             r0._ensure_pages(slot, position + 2)
@@ -1284,10 +1287,30 @@ class TPModel:
             host[1, half : half + batch] = torch.tensor(list(slots), dtype=torch.long)
             host[2, half : half + batch] = torch.tensor(list(pos), dtype=torch.long)
             host[3, half : half + batch] = torch.tensor(states, dtype=torch.long)
+        if timed:
+            stream0 = torch.cuda.current_stream(r0.vsegments[0].device)
+            ev_start, ev_mid, ev_end = (torch.cuda.Event(enable_timing=True) for _ in range(3))
+            ev_start.record(stream0)
+            looptimers.cur["_build_t"] = looptimers.now()
         self._load_inputs(host)
+        if timed:
+            t1 = looptimers.now()
+            looptimers.add("build", t1 - t0)
+            looptimers.replay_start()
         outs, out = self._run(size, rows, verify=True)
+        if timed:
+            ev_mid.record(stream0)
+            t2 = looptimers.now()
+            looptimers.add("launch", t2 - t1)
         logits = self._gather([o[:batch] for o in outs])
+        if timed:
+            ev_end.record(stream0)
+            t3 = looptimers.now()
+            looptimers.add("gather", t3 - t2)
         picks = out.cpu().tolist()
+        if timed:
+            looptimers.add("wait", looptimers.now() - t3)
+            looptimers.picks_ready(batch, ev_start, ev_mid, ev_end)
         g, d = picks[0], picks[1]
         return logits, g[:batch], g[size : size + batch], d[:batch], d[size : size + batch]
 
@@ -1306,11 +1329,43 @@ class TPModel:
         batch = len(tokens)
         groups = len(drafts[0]) + 1
         size = r0.bucket(batch) if r0.use_graphs else batch
+        timed = looptimers.ENABLED
+        if timed:
+            T = looptimers
+            t0 = T.now()
+            stream0 = torch.cuda.current_stream(self.devices_tp[0])
+            ev_start, ev_launch, ev_mid, ev_end = (torch.cuda.Event(enable_timing=True) for _ in range(4))
+            ev_start.record(stream0)
         host = r0._chain_host(tokens, drafts, slots, positions, groups, size)
+        if timed:
+            t1 = T.now()
+            T.add("chost", t1 - t0)
         self._load_inputs(host)
+        if timed:
+            ev_launch.record(stream0)
+            t2 = T.now()
+            T.add("h2d", t2 - t1)
+            T.add("build", t2 - t0)
+            T.cur["_build_t"] = t2
+            T.replay_start()
         outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        if timed:
+            ev_mid.record(stream0)
+            t3 = T.now()
+            T.add("launch", t3 - t2)
         logits = self._gather([o[:batch] for o in outs])
+        if timed:
+            ev_end.record(stream0)
+            t4 = T.now()
+            T.add("gather", t4 - t3)
+            out = out.cpu()
+            t5 = T.now()
+            T.add("wait", t5 - t4)
         picks, acc, nxt = FastModel._chain_parse(out, batch, size, groups)
+        if timed:
+            T.add("parse", T.now() - t5)
+            T.cur["_k"] = groups - 1
+            T.picks_ready(batch, ev_start, ev_mid, ev_end, ev_launch)
         return logits, picks, acc, nxt
 
     # ------------------------------------------------------------ graphs

@@ -178,6 +178,13 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
     cached = sum(int((r["usage"].get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
                  for r in results)
     engine_lines = [x for x in log.read_text().splitlines() if x.startswith("engine:")]
+    # ENGINE_LOOP_TIMERS=1: each replica's per-stage loop timers, one line each.
+    timer_sets = [health.pop("loop_timers", None)] + [
+        r.pop("loop_timers", None) for r in health.get("replicas", [])
+    ]
+    for index, timers in enumerate(t for t in timer_sets if t):
+        print(json.dumps({"event": "loop_timers", "setting": setting or "default",
+                          "replica": index, **timers}), flush=True)
     print(json.dumps({
         "event": "setting", "setting": setting or "default", "load_s": round(load_s, 1),
         "wall_s": round(wall, 2), "requests": len(results), "output_tokens": tokens,

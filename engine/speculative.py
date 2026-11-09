@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from engine import looptimers
 from engine.protocol import Sampling
 
 if TYPE_CHECKING:
@@ -135,17 +136,24 @@ def choose_k(generator: Generator, generations: list[Generation]) -> int:
 def chain_step(generator: Generator, generations: list[Generation]) -> None:
     """One ``FastModel.verify_chain`` for every running request; queues its next tokens."""
     fast = generator.fast
+    timed = looptimers.ENABLED
+    if timed:
+        t0 = looptimers.now()
     k = choose_k(generator, generations)
     drafts = []
     for g in generations:
         ds = list(g.drafts) if g.drafts and g.drafts[0] == g.draft else [g.draft]
         ds = (ds + [ds[-1]] * k)[:k]
         drafts.append(ds if g.speculates else [0] * k)
+    if timed:
+        looptimers.add("choosek", looptimers.now() - t0)
     logits, picks, acc, nxt = fast.verify_chain(
         [g.last_token for g in generations], drafts, [g.slot for g in generations],
         [g.length for g in generations],
     )
     generator.verify_steps += 1
+    if timed:
+        t0 = looptimers.now()
     for i, g in enumerate(generations):
         g.flipped = False
         g.advanced = 0
@@ -172,6 +180,8 @@ def chain_step(generator: Generator, generations: list[Generation]) -> None:
             generator.mtp_accepted += acc[i]
             g.spec_checked = g.spec_checked * DECAY + checked
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
 
 
 def verify_step(generator: Generator, generations: list[Generation]) -> None:
@@ -187,6 +197,9 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
         [g.length for g in generations],
     )
     generator.verify_steps += 1
+    timed = looptimers.ENABLED
+    if timed:
+        t0 = looptimers.now()
     for i, g in enumerate(generations):
         g.flipped = False
         if not g.speculates:
@@ -208,6 +221,8 @@ def verify_step(generator: Generator, generations: list[Generation]) -> None:
                 continue
         g.length += 1
         g.draft = d1[i]
+    if timed:
+        looptimers.add("book", looptimers.now() - t0)
 
 
 def settle(generator: Generator, g: Generation, slot: int | None) -> None:

@@ -14,8 +14,9 @@ def fast(n_rows: int = 256) -> NS:
     return NS(use_graphs=True, _rows=n_rows, bucket=lambda n: next(b for b in (1, 2, 4, 8, 16, 32) if b >= n))
 
 
-def gen(p_depth=None, rate=None, need=200, steps=40.0) -> NS:
-    g = NS(speculates=True, _max_tokens=need, _count=0, queue=[], spec_checked=0.0, spec_accepted=0.0)
+def gen(p_depth=None, rate=None, need=200, steps=40.0, have=3) -> NS:
+    g = NS(speculates=True, _max_tokens=need, _count=0, queue=[], spec_checked=0.0, spec_accepted=0.0,
+           draft=11, drafts=[11] + [12] * (have - 1))
     if p_depth is not None:
         g.spec_depth_checked = [steps if j < len(p_depth) else 0.0 for j in range(max(S.KS))]
         g.spec_depth_accepted = [steps * p_depth[j] if j < len(p_depth) else 0.0 for j in range(max(S.KS))]
@@ -101,3 +102,16 @@ def test_depth_book_counts():
     assert g.spec_depth_accepted[:5] == [1.0, 1.0, 0.0, 0.0, 0.0]
     S._depth_book(g, 3, 3)
     assert g.spec_depth_checked[:4] == [1.95, 1.95, 1.95, 0.0]
+
+
+def test_running_deep_stays_unless_beaten():
+    # a batch whose last step ran k=4 keeps k=4 unless 5 or 7 beats it by the margin
+    flat = [0.95] * 4
+    assert choose([gen(flat, rate=0.95, have=4)]) in (4, 5, 7)
+    assert choose([gen(NATURAL, rate=0.79, have=7)]) == 3  # no longer worth it: back to 3
+
+
+def test_padding_positions_not_booked():
+    g = gen()
+    S._depth_book(g, 3, 5)  # a k=7 step with 3 real drafts, 5 accepted (padding happened to match)
+    assert g.spec_depth_checked[:4] == [1.0, 1.0, 1.0, 0.0]

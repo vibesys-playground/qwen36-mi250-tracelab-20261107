@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 import torch
-from conftest import CHUNK, Server, load_on_cpu, load_weights, repeat_reuse
+from conftest import CHUNK, Server, load_weights, repeat_reuse
 from engine.generator import Generation, Generator
 from engine.protocol import Sampling
 
@@ -158,24 +158,6 @@ def loaded(checkpoint: Path) -> Generator:
     )
 
 
-@pytest.fixture(scope="module")
-def loaded_cpu(checkpoint: Path, loaded: Generator) -> Generator:
-    """``loaded``, on the CPU. A Transformers-path decode step of two requests together equals
-    each alone exactly only on the CPU: on a GPU the BF16 GEMMs of one and two rows run other
-    kernels, and a one-ulp difference can flip the tiny random model's top-2-of-8 expert routing
-    or a top-1 tie (plan 74, j340: logits 2.5 apart at a step whose solo top-2 margin was 0)."""
-    if not any(p.is_cuda for p in loaded.model.parameters()):
-        return loaded
-    torch.manual_seed(0)
-    return load_on_cpu(
-        str(checkpoint),
-        max_model_len=4096,
-        chunk_tokens=CHUNK,
-        prefix_cache_tokens=1 << 20,
-        prefix_cache_entries=0,
-    )
-
-
 def _run(gen: Generator, prompts: list[list[int]], n: int) -> tuple[list[list[int]], list[int]]:
     """Serve ``prompts`` together, as the server's worker does; outputs and cached tokens."""
     sampling = Sampling(max_tokens=n, temperature=0.0, ignore_eos=True)
@@ -237,8 +219,7 @@ def test_tails_are_evicted_least_recently_used_under_a_byte_budget(loaded: Gener
         assert gen._prefix_cache.bytes <= budget
 
 
-def test_a_tail_from_a_batched_decode_holds_only_its_own_rows(loaded_cpu: Generator) -> None:
-    loaded = loaded_cpu
+def test_a_tail_from_a_batched_decode_holds_only_its_own_rows(loaded: Generator) -> None:
     prompts = [_new_tokens(30, 5), _new_tokens(31, 3 * CHUNK + 1)]
     n = 4
     gen = _generator(loaded, None)

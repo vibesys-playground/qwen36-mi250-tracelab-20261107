@@ -944,7 +944,9 @@ def main() -> None:
                     if run_mode(dens[0][0], dens[0][1], sm)[1] == 0:
                         sels.append(sm)
             if dens:
-                mode = {"STRIDED": dens[0][0], "TREE": dens[0][1], "SELMODE": sels[0] if sels else 1}
+                # an explicit order (1, 2, 3) when one is exact, else the kernel's own sum
+                pick = [v for v in sels if v != 0] or sels or [1]
+                mode = {"STRIDED": dens[0][0], "TREE": dens[0][1], "SELMODE": pick[0]}
             out(f"RESULT calib chosen {mode} exact_den_modes={dens} exact_sel_modes={sels}")
     except Exception as exc:  # noqa: BLE001
         out(f"RESULT calib error: {type(exc).__name__}: {exc}")
@@ -1029,7 +1031,11 @@ def main() -> None:
                 outs.append(o)
             replay(gs)
             sync()
-            ok = all(same(outs[0][k], outs[1][k])[0] for k in ("x3", "h3", "idx", "wt", "r", "x2", "h2"))
+            # (``r``'s shared-expert gate/up columns are each rank's shard: only the router
+            # logits and the shared-expert gate column are replicated)
+            ok = all(same(outs[0][k], outs[1][k])[0] for k in ("x3", "h3", "idx", "wt", "x2", "h2", "h1"))
+            ok = ok and same(outs[0]["r"][:, :E], outs[1]["r"][:, :E])[0] \
+                and same(outs[0]["r"][:, -1:], outs[1]["r"][:, -1:])[0]
             out(f"RESULT ref R={R} ranks_agree={ok} ar_timeouts={errs()} "
                 f"unique_experts={len(set(outs[0]['idx'].flatten().tolist()))}")
             glong = [capture(r, lambda r=r: ref_span(ranks[r], *ins[r]), reps=args.long)[0] for r in (0, 1)]
@@ -1133,6 +1139,42 @@ def main() -> None:
                         o[r]["h2"], o[r]["idx"], w["gu"], act, R, w["gu"].stride(0), o[r]["r"], o[r]["wt"],
                         N3, H=H, I=I, TOPK=TOPKN, BN=8, BK=min(1024, triton.next_power_of_2(H)),
                         ORDER=1, E=E, TOPKP=8, FUSE_TOPK=False, num_warps=4)
+                    if r == 0 and R == rows_list[0]:
+                        # today's kernels' registers and occupancy (the compiled launches)
+                        try:
+                            kinfo = {}
+                            kinfo["moe_up"] = FZ._moe_up_kernel[(items,)](
+                                o[r]["h2"], o[r]["idx"], w["gu"], act, R, w["gu"].stride(0), o[r]["r"],
+                                o[r]["wt"], N3, H=H, I=I, TOPK=TOPKN, BN=8,
+                                BK=min(1024, triton.next_power_of_2(H)), ORDER=1, E=E, TOPKP=8,
+                                FUSE_TOPK=False, num_warps=4)
+                            mo = torch.empty((R, H), dtype=torch.bfloat16, device=devs[r])
+                            kinfo["moe_down"] = FZ._moe_down_kernel[(min(R * H // 8, FZ.MOE_GRID * cus[r]),)](
+                                act, o[r]["r"], o[r]["idx"], o[r]["wt"], w["dn"], w["sd"], mo, mo, R,
+                                w["dn"].stride(0), N3, H=H, I=I, IS=IS, E=E, TOPK=TOPKN, BN=8,
+                                BKI=min(1024, triton.next_power_of_2(I)),
+                                BKS=min(1024, triton.next_power_of_2(IS)), ORDER=1, HAS_RES=False,
+                                num_warps=4)
+                            for nm, (ww, tt) in (("mfma_out_proj", (w["wo"], t_o)),
+                                                 ("mfma_router", (w["w3"], t_r)),
+                                                 ("mfma_in_proj", (w["win"], t_i))):
+                                nn_ = ww.shape[0]
+                                oo_ = torch.empty((R, nn_), dtype=torch.bfloat16, device=devs[r])
+                                pp_ = torch.empty((tt[3] * MF.BM * nn_,), dtype=torch.float32, device=devs[r])
+                                xx_ = o[r]["h2"] if ww.shape[1] == H else core
+                                kinfo[nm] = MF._mfma_gemv_kernel[(triton.cdiv(nn_, tt[0]) * tt[3],)](
+                                    xx_, ww, oo_, pp_, R, nn_, nn_, K=ww.shape[1], BM=MF.BM, BN=tt[0],
+                                    BK=tt[1], KSPLIT=tt[3], DOT_F32=False, num_warps=tt[2])
+                            torch.cuda.synchronize(devs[r])
+                            for nm, kk_ in kinfo.items():
+                                if kk_ is None:
+                                    continue
+                                inf = asm_info(kk_)
+                                out(f"RESULT today_kernel {nm} n_regs={inf['n_regs']} n_spills={inf['n_spills']} "
+                                    f"shared={inf['shared']} total_vgprs={inf['asm'].get('TotalNumVgprs')} "
+                                    f"occupancy_waves_per_simd={inf['asm'].get('Occupancy')}")
+                        except Exception as exc:  # noqa: BLE001
+                            out(f"RESULT today_kernel error: {type(exc).__name__}: {exc}")
                 prep.append(dict(kp_o=kp_o, kp_r=kp_r, act=act))
             sync()
 
@@ -1238,11 +1280,12 @@ def main() -> None:
 
     # barrier microbenchmark
     def calib(dev, nprog: int) -> int:
-        c = torch.zeros(1, dtype=torch.int32, device=dev)
-        _calib_kernel[(nprog,)](c, num_warps=4)
-        torch.cuda.synchronize(dev)
+        with torch.cuda.device(dev):  # Triton launches on the current device
+            c = torch.zeros(1, dtype=torch.int32, device=dev)
+            _calib_kernel[(nprog,)](c, num_warps=4)
+            torch.cuda.synchronize(dev)
         total = int(c.item())
-        assert total % nprog == 0, (total, nprog)
+        assert total > 0 and total % nprog == 0, (total, nprog)
         return total
 
     bar_us = {}
@@ -1448,12 +1491,18 @@ def main() -> None:
                     sp.pair()
                     sync()
                     ok, bad = sp.compare()
+                    out(f"RESULT span_eager R={R} stages={stages} pf={pf} per_cu={gpc} grid={sp.nprog} "
+                        f"calib={sp.pb} bitwise={ok} bad={bad} errs(ar,bar,pf)={sp.errs()}")
                     gs = [capture(r, lambda r=r: sp.launch(r))[0] for r in (0, 1)]
                     replay(gs)
                     sync()
                     ok2, bad2 = sp.compare()
                     t1 = time_pair(gs, args.iters)
-                    st0 = [sp.stamps(r, args.iters) for r in (0, 1)]
+                    try:
+                        st0 = [sp.stamps(r, args.iters) for r in (0, 1)]
+                    except Exception as exc:  # noqa: BLE001
+                        out(f"RESULT stamps error: {type(exc).__name__}: {exc}")
+                        st0 = [None, None]
                     glong = [capture(r, lambda r=r: sp.launch(r), reps=args.long)[0] for r in (0, 1)]
                     tl_ = time_pair(glong, max(args.iters // args.long, 20))
                     per_long = tl_["max_ms"] / args.long

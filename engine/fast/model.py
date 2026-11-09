@@ -40,7 +40,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import fla_pin, flash_prefill, gdn_chunk, kernels, mfma, moe_prefill, prefill_kernels
+from engine.fast import draft_ivf, fla_pin, flash_prefill, gdn_chunk, kernels, mfma, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -363,6 +363,11 @@ class FastModel:
             self.mtp_embed = self.embed if self.embed.device == mdev else self.embed.to(mdev)
         # Plan 31's chained verify (``engine.fast.mfma``; it needs the Triton kernels).
         self.chain = mtp is not None and mfma.CHAIN and self.use_triton
+        # Plan 47: the chain's drafts from an IVF shortlist of this lm_head (shard), with a
+        # predicated full-vocabulary fallback (``engine.fast.draft_ivf``). Verify is unchanged.
+        self.ivf = None
+        if self.chain and self.use_graphs and draft_ivf.ENABLED:
+            self.ivf = draft_ivf.Served(self.lm_head, max_rows=max(self.buckets))
         # A verify step runs two rows per slot; any batch has at most one (two) rows per slot.
         self._rows = max(max(self.buckets) * (2 if mtp is not None else 1), slots)
         if self.chain:  # a chained verify step: up to RING rows per slot
@@ -1707,19 +1712,26 @@ class FastModel:
             slots, positions = meta.slots[:rows], meta.positions[:rows]
             z = self._fused_layer(self.mtp_index, self._mtp_in(x, picks, True), slots, positions, meta)
             y = _rms(z, self.mtp.norm.weight, self.eps)
-            d = self._argmax(self.fused.gemv(y, self.lm_head))
+            if self.ivf is None:
+                d = self._argmax(self.fused.gemv(y, self.lm_head))
             tokens = meta.tokens[:rows].view(groups, b)
             match = (tokens[1:] == picks.view(groups, b)[:-1]).long()
             a = torch.cumprod(match, dim=0).sum(dim=0)
             sel = a * b + torch.arange(b, device=a.device)
             h = y.index_select(0, sel)
-            d = d.index_select(0, sel)
+            if self.ivf is None:
+                d = d.index_select(0, sel)
+            else:  # plan 47: link 1's draft only for the accepted row of each slot
+                d = self.ivf.draft(h, self)
             base = positions[:b] + a
             drafts = [d]
             for j in range(1, k):
                 z = self._fused_layer(self.mtp_index, self._mtp_in(h, d, True), slots[:b], base + j, meta)
                 h = _rms(z, self.mtp.norm.weight, self.eps)
-                d = self._argmax(self.fused.gemv(h, self.lm_head))
+                if self.ivf is None:
+                    d = self._argmax(self.fused.gemv(h, self.lm_head))
+                else:
+                    d = self.ivf.draft(h, self)
                 drafts.append(d)
             self._chain_out = torch.cat((picks, a, torch.stack(drafts).flatten()))
             return logits

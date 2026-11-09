@@ -143,32 +143,35 @@ def main() -> None:
         return logits
 
     # ------------------------------------------------------------ 2. step time
-    slots = [0, 1]
-    prompts = [corpus[9973 * k : 9973 * k + args.prompt_len] for k in range(2)]
-    lasts = [int(torch.argmax(prefill(s, p))) for s, p in zip(slots, prompts, strict=True)]
-    length = args.prompt_len
     KS = [k for k in (1, 3, 7) if k <= mfma.KMAX]  # k up to the ring (ENGINE_SPEC_KMAX)
     step_ms = {}
-    for k in KS:
-        drafts = [[lasts[b]] * k for b in range(2)]
-        try:
-            fn = lambda: fast.verify_chain(lasts, drafts, slots, [length] * 2)  # noqa: E731
-            for _ in range(3):
-                fn()
-            times = []
-            for _ in range(args.iters):
-                sync()
-                t0 = time.perf_counter()
-                fn()
-                sync()
-                times.append((time.perf_counter() - t0) * 1e3)
-            step_ms[k] = statistics.median(times)
-            out("step", k=k, slots=2, rows=2 * (k + 1), verify_chain_ms=round(step_ms[k], 3),
-                p10=round(sorted(times)[len(times) // 10], 3), graph_error=fast.graph_error)
-        except Exception:  # noqa: BLE001
-            out("error", what=f"step k={k}", error=traceback.format_exc().replace("\n", " | ")[-1500:])
-    for s in slots:
-        fast.reset(s)
+    for nslots in (1, 2):
+        slots = list(range(nslots))
+        prompts = [corpus[9973 * k : 9973 * k + args.prompt_len] for k in range(nslots)]
+        lasts = [int(torch.argmax(prefill(s, p))) for s, p in zip(slots, prompts, strict=True)]
+        length = args.prompt_len
+        for k in KS:
+            drafts = [[lasts[b]] * k for b in range(nslots)]
+            try:
+                fn = lambda: fast.verify_chain(lasts, drafts, slots, [length] * nslots)  # noqa: E731
+                for _ in range(3):
+                    fn()
+                times = []
+                for _ in range(args.iters):
+                    sync()
+                    t0 = time.perf_counter()
+                    fn()
+                    sync()
+                    times.append((time.perf_counter() - t0) * 1e3)
+                if nslots == 2:
+                    step_ms[k] = statistics.median(times)
+                out("step", k=k, slots=nslots, rows=nslots * (k + 1),
+                    verify_chain_ms=round(statistics.median(times), 3),
+                    p10=round(sorted(times)[len(times) // 10], 3), graph_error=fast.graph_error)
+            except Exception:  # noqa: BLE001
+                out("error", what=f"step k={k} slots={nslots}", error=traceback.format_exc().replace("\n", " | ")[-1500:])
+        for s in slots:
+            fast.reset(s)
 
     # ------------------------------------------------------------ 3. acceptance and parity
     groups = {

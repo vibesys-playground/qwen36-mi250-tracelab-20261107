@@ -508,6 +508,8 @@ class Served:
             self.flag = torch.zeros((1,), dtype=torch.int32, device=dev)
             self.rb = max(16, triton.next_power_of_2(max_rows))
             self._warm()
+            if w.is_cuda:
+                torch.cuda.empty_cache()  # the build's temporaries, before the KV pool is sized
         print(f"engine: IVF drafts on {w.device}: {clusters} clusters, P {p}, gap {gap}, "
               f"built in {idx.build_s:.1f}s (sizes {idx.stats['min']}..{idx.stats['max']})", flush=True)
 

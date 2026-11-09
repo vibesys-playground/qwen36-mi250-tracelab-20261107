@@ -82,6 +82,56 @@ def test_kernels_match_reference() -> None:
         assert torch.equal(both[:, :2], torch.zeros_like(both[:, :2]))
 
 
+def test_served_draft_graph_and_fallback() -> None:
+    """The served path alone (no TP): eager and captured-graph drafts equal the reference
+    rule (the IVF pick, or the full argmax where the gap is under the threshold), with the
+    gap set so that both branches occur."""
+    if DEV != "cuda" or draft_ivf.triton is None:
+        return
+    from types import SimpleNamespace
+
+    from engine.fast import mfma
+
+    torch.manual_seed(3)
+    w = (torch.randn((40_000, 2048), device="cuda") * 0.05).to(torch.bfloat16)
+    y = (torch.randn((8, 2048), device="cuda")).to(torch.bfloat16)
+    probe = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=0.0)
+    # the reference: IVF pick and gap per row
+    s = draft_ivf.cluster_scores(y, probe.index)
+    order = torch.sort(s, dim=1, descending=True, stable=True).indices
+    nxt = s.gather(1, order[:, 8:9])[:, 0]
+    logits = (y.float() @ w.float().T).to(torch.bfloat16).float()
+    full = logits.argmax(1)
+    _, ivf = draft_ivf.reference_draft(y, w, probe.index, 8)
+    top = logits.gather(1, ivf[:, None])[:, 0]
+    gaps = top - nxt
+    sg = torch.sort(gaps).values
+    gap = float((sg[3] + sg[4]) / 2)  # half the rows fall back, none on the edge
+    served = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=gap)
+    want = torch.where(gaps < gap, full, ivf)
+    model = SimpleNamespace(tp=None, rank=0, vocab_offset=0, lm_head=w,
+                            fused=SimpleNamespace(gemv=lambda a, b: mfma.gemv(a, b)),
+                            _argmax=lambda lg: lg.argmax(-1))
+    eager = served.draft(y, model)
+    assert torch.equal(eager, want), (eager, want)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        got = served.draft(y, model)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(got, want), (got, want)
+    # no row falls back: the full pass is skipped and the IVF picks stand
+    none = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=-1e9)
+    graph2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph2, stream=stream):
+        got2 = none.draft(y, model)
+    graph2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(got2, ivf) and int(none.flag[0]) == 0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

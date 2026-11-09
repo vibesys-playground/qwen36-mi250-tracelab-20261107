@@ -1722,7 +1722,7 @@ class FastModel:
             if self.ivf is None:
                 d = d.index_select(0, sel)
             else:  # plan 47: link 1's draft only for the accepted row of each slot
-                d = self.ivf.draft(h, self)
+                d = self.ivf.draft(h, self, first=True)
             base = positions[:b] + a
             drafts = [d]
             for j in range(1, k):

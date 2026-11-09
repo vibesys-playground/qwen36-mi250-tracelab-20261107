@@ -106,30 +106,35 @@ def test_served_draft_graph_and_fallback() -> None:
     top = logits.gather(1, ivf[:, None])[:, 0]
     gaps = top - nxt
     sg = torch.sort(gaps).values
-    gap = float((sg[3] + sg[4]) / 2)  # half the rows fall back, none on the edge
-    served = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=gap)
-    want = torch.where(gaps < gap, full, ivf)
+    mid = float((sg[3] + sg[4]) / 2)  # half the rows under the gap, none on the edge
     model = SimpleNamespace(tp=None, rank=0, vocab_offset=0, lm_head=w,
                             fused=SimpleNamespace(gemv=lambda a, b: mfma.gemv(a, b)),
                             _argmax=lambda lg: lg.argmax(-1))
-    eager = served.draft(y, model)
-    assert torch.equal(eager, want), (eager, want)
+    # a rank falls back as a whole: any row under the gap puts every row on the full pass,
+    # and the flag holds for the rest of the step's chain (until the next first link)
+    probe.gap = mid
+    assert torch.equal(probe.draft(y, model, first=True), full)
+    probe.gap = -1e9
+    assert torch.equal(probe.draft(y, model), full)
+    assert torch.equal(probe.draft(y, model, first=True), ivf)
+    assert torch.equal(probe.draft(y[:3], model), ivf[:3])
+    probe.gap = float(sg[0]) - 1.0  # no row under the gap
+    assert torch.equal(probe.draft(y, model, first=True), ivf) and int(probe.flag[0]) == 0
+    st = probe.stats.tolist()
+    assert st[0] == 8 + 8 + 8 + 3 + 8 and st[1] == 16, st
+    # the same inside captured graphs: a falling-back chain and a clean one
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        got = served.draft(y, model)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(got, want), (got, want)
-    # no row falls back: the full pass is skipped and the IVF picks stand
-    none = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=-1e9)
-    graph2 = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph2, stream=stream):
-        got2 = none.draft(y, model)
-    graph2.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(got2, ivf) and int(none.flag[0]) == 0
+    for gap, want in ((mid, full), (-1e9, ivf)):
+        served = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=gap)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            a = served.draft(y, model, first=True)
+            b = served.draft(y, model)
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(a, want) and torch.equal(b, want), (gap, a, b, want)
 
 
 if __name__ == "__main__":

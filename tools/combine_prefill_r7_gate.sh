@@ -26,7 +26,7 @@ S="timeout 1800 python -u tools/prefill_op_split.py all --devices 0,1 --news 61,
 F="Loading weights|amdgpu.ids|^\s*$|it/s\]|ROCTracer produced"
 PT="python -X faulthandler -m pytest -q -rf -p no:cacheprovider"
 
-echo "=== stack"; python -c "import torch, triton; print('torch', torch.__version__, 'hip', torch.version.hip, 'triton', triton.__version__)"
+echo "=== stack"; python -c "import torch, triton; print('torch', torch.__version__, 'hip', torch.version.hip, 'triton', triton.__version__); print('tunable', [n for n in dir(torch.cuda.tunable) if not n.startswith('_')])"
 echo "=== phase 1 $(date +%T)"
 ( ENGINE_TP=2 timeout 1500 python -u tools/blas_tune_probe.py record --devices 0,1 --dir $D ) > $L/record.log 2>&1 &
 ( env ENGINE_TP=2 HIP_VISIBLE_DEVICES=2,3 $OFF timeout 1800 python -u $P --mode ref --out $D/ref_off.pt ) > $L/top1.log 2>&1 &
@@ -34,10 +34,12 @@ echo "=== phase 1 $(date +%T)"
 ( HIP_VISIBLE_DEVICES=7 timeout 1800 $PT tests/test_moe_prefill.py 2>&1 | tail -15 ) > $L/tests_moe.log 2>&1 &
 wait
 grep -E "RESULT|prefill BLAS|prefill graphs|Traceback|Error" $L/record.log | cut -c1-600
+echo "=== unit tests: test_gdn_chunk.py"; grep -vE "$F" $L/tests_gdn.log
+echo "=== unit tests: test_moe_prefill.py"; grep -vE "$F" $L/tests_moe.log
 
 echo "=== phase 2 tune $(date +%T)"
 timeout 2700 python -u tools/blas_tune_probe.py tune --dir $D --gpus 0,1,2,3,4,5,6,7 2>&1 | tee $L/tune.log | grep -vE "$F" | cut -c1-600
-if [ ! -s $D/table.csv ]; then echo "NO TABLE: tuning failed"; for f in $L/*.log; do grep -B2 -A25 Traceback $f | head -60; done; exit 1; fi
+if [ ! -s $D/table.csv ]; then echo "NO TABLE: tuning failed; phase 3 runs with the default BLAS"; grep -B2 -A25 Traceback $L/tune.log | head -60; fi
 
 echo "=== phase 3 $(date +%T)"
 ( echo "=== op split (graph) OFF"; env ENGINE_TP=2 $OFF $S; \
@@ -59,13 +61,11 @@ echo "=== phase 3 $(date +%T)"
 wait
 echo "=== done $(date +%T)"
 
-echo "=== unit tests: test_gdn_chunk.py"; grep -vE "$F" $L/tests_gdn.log
-echo "=== unit tests: test_moe_prefill.py"; grep -vE "$F" $L/tests_moe.log
 echo "=== teacher-forced top-1 ON vs OFF"; grep -E "RESULT|Error|^---|failed in mode|prefill BLAS" $L/top1.log | cut -c1-600
 echo "=== cross-process, repeat (ON)"; grep -E "RESULT|Error|^---|failed in mode|prefill BLAS" $L/repeat.log | cut -c1-600
-echo "=== per-shape, blas_tune tests, spec == plain, live compiles"; grep -E "RESULT|Error|^---|passed|failed|prefill BLAS" $L/misc.log | grep -v "RESULT shape" | cut -c1-1500 | tail -80
+echo "=== per-shape, blas_tune tests, spec == plain, live compiles"; grep -E "RESULT|Error|^---|passed|failed|prefill BLAS|GDN WY" $L/misc.log | grep -v "RESULT shape" | cut -c1-1500 | tail -80
 echo "--- per shape where tuned is slower"; grep "RESULT shape" $L/misc.log | grep "saving_pct=-" | cut -c1-260
-echo "=== op split (graph)"; grep -E "^=== op split|kill|prefill BLAS" $L/split.log | cut -c1-500
+echo "=== op split (graph)"; grep -E "^=== op split|kill|prefill BLAS|GDN WY|graph capture" $L/split.log | cut -c1-500
 echo "--- per pass (ms per GCD)"
 grep -E "^=== op split|\"kind\": \"split\"" $L/split.log | python -c "
 import json, sys

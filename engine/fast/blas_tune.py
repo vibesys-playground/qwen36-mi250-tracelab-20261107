@@ -73,7 +73,7 @@ def _register_validators() -> None:
 def _quiet_base() -> None:
     tunable = torch.cuda.tunable
     tunable.tuning_enable(False)
-    tunable.write_file_on_exit(False)
+    getattr(tunable, "write_file_on_exit", lambda v: None)(False)  # gone in torch 2.10
     tunable.set_filename(SCRATCH, False)
 
 

@@ -478,6 +478,19 @@ if triton is not None:
         return _op(tl.load(p + rows.to(tl.int64)[:, None] * S + c[None, :], mask=(rows < T)[:, None], other=0.0),
                    WIDEN)
 
+    @triton.jit
+    def _wu_store(p0, p1, p2, p3, e0, e1, e2, e3, I00, I10, I11, I20, I21, I22, I30, I31, I32, I33,
+                  t0, t1, t2, t3):
+        """``gdn_chunk_wu_kernel``'s w / u block rows: Ai (rows) times the scaled operands, the
+        block dots in the fused kernel's order. Called inside each role's branch, so no pointer
+        leaves an ``if`` (Triton 3.6's TritonAMDGPUCanonicalizePointers fails on one that does)."""
+        tl.store(p0, tl.dot(I00, e0).to(tl.bfloat16), mask=t0[:, None])
+        tl.store(p1, (tl.dot(I10, e0) + tl.dot(I11, e1)).to(tl.bfloat16), mask=t1[:, None])
+        tl.store(p2, (tl.dot(I20, e0) + tl.dot(I21, e1) + tl.dot(I22, e2)).to(tl.bfloat16), mask=t2[:, None])
+        tl.store(p3,
+                 (tl.dot(I30, e0) + tl.dot(I31, e1) + tl.dot(I32, e2) + tl.dot(I33, e3)).to(tl.bfloat16),
+                 mask=t3[:, None])
+
     @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_wu_kernel(
         mixed, b_ptr, meta_ptr, ai, qn, kn, w, u, gc, aqk, T, SM, SB,
@@ -596,6 +609,8 @@ if triton is not None:
                 p1 = po + r1.to(tl.int64)[:, None] * (HV * K)
                 p2 = po + r2.to(tl.int64)[:, None] * (HV * K)
                 p3 = po + r3.to(tl.int64)[:, None] * (HV * K)
+                _wu_store(p0, p1, p2, p3, e0, e1, e2, e3, I00, I10, I11, I20, I21, I22, I30, I31, I32, I33,
+                          t0, t1, t2, t3)
             else:
                 col = (role - 1 - NW) * BW
                 # u = Ai (v * beta), columns col .. col + BW
@@ -609,12 +624,8 @@ if triton is not None:
                 p1 = po + r1.to(tl.int64)[:, None] * (HV * V)
                 p2 = po + r2.to(tl.int64)[:, None] * (HV * V)
                 p3 = po + r3.to(tl.int64)[:, None] * (HV * V)
-            tl.store(p0, tl.dot(I00, e0).to(tl.bfloat16), mask=t0[:, None])
-            tl.store(p1, (tl.dot(I10, e0) + tl.dot(I11, e1)).to(tl.bfloat16), mask=t1[:, None])
-            tl.store(p2, (tl.dot(I20, e0) + tl.dot(I21, e1) + tl.dot(I22, e2)).to(tl.bfloat16), mask=t2[:, None])
-            tl.store(p3,
-                     (tl.dot(I30, e0) + tl.dot(I31, e1) + tl.dot(I32, e2) + tl.dot(I33, e3)).to(tl.bfloat16),
-                     mask=t3[:, None])
+                _wu_store(p0, p1, p2, p3, e0, e1, e2, e3, I00, I10, I11, I20, I21, I22, I30, I31, I32, I33,
+                          t0, t1, t2, t3)
 
     @triton.jit(do_not_specialize=["T"])
     def gdn_chunk_state_kernel(
@@ -679,6 +690,8 @@ def wy(mixed, a, b, a_log, dt_bias, meta, heads, qn, kn, w, u, gc, aqk, warps=No
     kd = vd = 128
     nt = triton.cdiv(tokens, BT)
     mp = meta if meta is not None else gc
+    if kind not in ("mono", "stack") and _SPLIT_FAILED and variant is None:
+        kind, ws = "mono", 8
     if kind in ("mono", "stack"):
         gdn_chunk_wy_kernel[(nt, hv)](
             mixed, a, b, a_log, dt_bias, mp, qn, kn, w, u, gc, aqk,
@@ -687,6 +700,22 @@ def wy(mixed, a, b, a_log, dt_bias, meta, heads, qn, kn, w, u, gc, aqk, warps=No
             num_warps=warps if warps is not None else ws if ws else _opts()[1],
         )
         return
+    try:
+        _wy_split(mixed, a, b, a_log, dt_bias, meta, mp, heads, hv, kd, vd, nt, tokens, qn, kn, w, u, gc,
+                  aqk, kind, ws, ww, bw, s2)
+    except Exception as exc:  # noqa: BLE001 - a compiler that rejects the split form: the fused one
+        if _SPLIT_FAILED or variant is not None:  # an explicit form (the tests) must build
+            raise
+        _SPLIT_FAILED.append(f"{type(exc).__name__}: {str(exc)[:300]}")
+        print(f"engine: GDN WY split form failed ({_SPLIT_FAILED[0]}); using mono:8", flush=True)
+        wy(mixed, a, b, a_log, dt_bias, meta, heads, qn, kn, w, u, gc, aqk, warps=warps, variant=("mono", 8))
+
+
+_SPLIT_FAILED: list[str] = []  # set once when the split form's kernels fail to build or launch
+
+
+def _wy_split(mixed, a, b, a_log, dt_bias, meta, mp, heads, hv, kd, vd, nt, tokens, qn, kn, w, u, gc,
+              aqk, kind, ws, ww, bw, s2):
     ai = torch.empty((tokens, hv, BT), dtype=torch.bfloat16, device=mixed.device)
     gdn_chunk_norm_kernel[(nt, heads)](
         mixed, mp, qn, kn, tokens, mixed.stride(0), H=heads, K=kd, BC=BC, HAS_META=meta is not None,

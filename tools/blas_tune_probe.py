@@ -83,7 +83,7 @@ import sys, time, torch
 part, res, budget = sys.argv[1], sys.argv[2], float(sys.argv[3])
 tunable = torch.cuda.tunable
 tunable.set_filename(res, False)
-tunable.write_file_on_exit(False)
+getattr(tunable, "write_file_on_exit", lambda v: None)(False)  # gone in torch 2.10
 tunable.enable(True)
 tunable.tuning_enable(True)
 tunable.record_untuned_enable(False)
@@ -202,7 +202,7 @@ def time_shapes(args) -> int:
     torch.cuda.set_device(dev)
     tunable = torch.cuda.tunable
     tunable.set_filename("/tmp/p61_time_scratch.csv", False)
-    tunable.write_file_on_exit(False)
+    getattr(tunable, "write_file_on_exit", lambda v: None)(False)  # gone in torch 2.10
     tunable.tuning_enable(False)
     for f in out.glob("time_missed*"):
         f.unlink()

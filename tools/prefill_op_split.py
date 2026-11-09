@@ -1,5 +1,9 @@
 """Plan 26 step 0: per-GCD prefill GPU time by call site (which eager work could be fused).
 
+A captured (plan 33 prefill graph) pass runs no Python per op, so its kernels are attributed
+by kernel name only; ``all --eager`` (ENGINE_PREFILL_GRAPH=0) gives the per-call-site split.
+Both print the GDN chunk + prep total that plan 40 part B's kill rule reads.
+
     python tools/prefill_op_split.py all [--devices 4,5] [--news 61,561,1650] [--reps 5]
     python tools/prefill_op_split.py passes [--news ...] [--reps 5]   # one process, visible GPUs
 
@@ -181,6 +185,12 @@ class Log:
             self.restore.append((gdn, "fla_chunk", chunk))
             gdn.fla_chunk = hf.torch_chunk_gated_delta_rule
         self.wrap(moe_prefill, "moe_prefill", "routed")
+        try:  # plan 40 part B's fused chunk chain (ENGINE_GDN_CHUNK), where the head has it
+            from engine.fast import gdn_chunk
+        except ImportError:
+            gdn_chunk = None
+        if gdn_chunk is not None and hasattr(gdn_chunk, "chunk"):
+            self.wrap(gdn_chunk, "chunk", "chunk")
         self.wrap(tp.Group, "_exchange", "exchange")
         # The fused prefill path (plan 26, ENGINE_PREFILL_FUSED), where the head has it.
         for attr, label in (("_prefill_fused", "fused"), ("_reduce_rms", "reduce"), ("_gdn_prefill_fused", "gdn")):
@@ -343,7 +353,10 @@ def attribute(trace_path: str, entries: list[tuple], main_tid: int, ranks_by_dev
             if len(cand) > len(diffs):
                 diffs = cand
     if not diffs:
-        raise RuntimeError(f"no clock pairs (annotation threads {len(ann_by_tid)}, main entries {len(mine)})")
+        # A captured pass (plan 33's prefill graphs) runs no Python per op, so no wrapper
+        # fires: attribute by kernel name only.
+        return attribute_by_name(xs, note=f"no clock pairs (annotation threads {len(ann_by_tid)}, "
+                                           f"main entries {len(mine)}): kernel names only")
     offset = statistics.median(diffs)
     spread = max(abs(d - offset) for d in diffs)
     # Ranges per tid and per rank, in trace microseconds.
@@ -431,6 +444,58 @@ def attribute(trace_path: str, entries: list[tuple], main_tid: int, ranks_by_dev
         "paths": {f"{dev}|{p}|{c}": (round(v[0], 3), v[1]) for (dev, p, c), v in path_table.items()},
         "bucket_top_names": {b: [(n, round(t, 2)) for n, t in c.most_common(4)] for b, c in names.items()},
     }
+
+
+def name_bucket(name: str) -> str:
+    """The bucket of a kernel by its name alone (the graph-replayed pass)."""
+    n = name.lower()
+    cls = kclass(name)
+    if "gdn_chunk_" in n:
+        return "gdn chunk (fused, ENGINE_GDN_CHUNK)"
+    if cls == "fla":
+        return "gdn chunk (fla)"
+    if "_gdn_conv" in n:
+        return "gdn conv (pad + MIOpen)"
+    if "_gdn_gates" in n:
+        return "gdn heads prep (split, beta, g, repeat_interleave)"
+    if "_gated_rms" in n:
+        return "gdn gated norm"
+    if cls == "conv":
+        return "gdn conv (pad + MIOpen)"
+    if "repeat_interleave" in n:
+        return "gdn prep (cat window, state copy, silu, transpose)"
+    return f"by name: {cls}"
+
+
+def attribute_by_name(xs: list, note: str) -> dict:
+    gpu = [e for e in xs if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
+    devs = sorted({str((e.get("args") or {}).get("device", e.get("pid"))) for e in gpu}, key=lambda d: (len(d), d))
+    table: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0.0, 0])
+    names: dict[str, Counter] = defaultdict(Counter)
+    for e in gpu:
+        dev = str((e.get("args") or {}).get("device", e.get("pid")))
+        b = name_bucket(e["name"]) if e.get("cat") == "kernel" else "by name: copy"
+        cell = table[(dev, b)]
+        cell[0] += float(e.get("dur", 0)) / 1e3
+        cell[1] += 1
+        names[b][e["name"][:70]] += float(e.get("dur", 0)) / 1e3
+    out_rows = defaultdict(dict)
+    for (dev, b), (ms, n) in table.items():
+        out_rows[b][dev] = (round(ms, 3), n)
+    return {
+        "devices": devs, "mode": "names", "note": note, "buckets": out_rows,
+        "bucket_top_names": {b: [(n, round(t, 3)) for n, t in c.most_common(12)] for b, c in names.items()},
+    }
+
+
+GDN_CHUNK_PREP = (  # the kill rule's "chunk + prep" (plan 40 part B): conv through the core output
+    "gdn conv (pad + MIOpen)",
+    "gdn heads prep (split, beta, g, repeat_interleave)",
+    "gdn prep (cat window, state copy, silu, transpose)",
+    "gdn chunk (fla)",
+    "gdn chunk wrapper other",
+    "gdn chunk (fused, ENGINE_GDN_CHUNK)",
+)
 
 
 # ============================================================================ passes
@@ -597,6 +662,15 @@ def report(splits: list[dict], hosts: list[dict]) -> None:
             line += f" {ms:>9.2f} {cnt:>5.0f}"
         print(line)
     print(f"{'TOTAL kernel+copy':<74}" + "".join(f" {totals[n]:>9.2f} {'':>5}" for n in ns))
+    print("\n=== GDN chunk + prep (plan 40 part B kill rule: conv through the core output), ms per GCD ===")
+    for n in ns:
+        mode = by_n[n].get("mode", "call sites")
+        parts = {b: round(per_gcd(n, b)[0], 3) for b in GDN_CHUNK_PREP if b in by_n[n]["buckets"]}
+        tot = round(sum(parts.values()), 3)
+        launches = sum(per_gcd(n, b)[1] for b in GDN_CHUNK_PREP if b in by_n[n]["buckets"])
+        print(f"N={n} ({mode}): {tot} ms, {launches:.0f} launches per GCD; {parts}")
+        result("gdn_chunk_prep", new_tokens=n, mode=mode, ms_per_gcd=tot, launches_per_gcd=launches, parts=parts,
+               gated_norm_ms=round(per_gcd(n, "gdn gated norm")[0], 3))
     print("\n=== fusible groups (plan 26), ms per GCD ===")
     groups = sorted({g for n in ns for g in fuse_tot[n]})
     for g in groups:
@@ -606,7 +680,7 @@ def report(splits: list[dict], hosts: list[dict]) -> None:
         s = by_n[n]
         print(f"\nN={n}: wall median {s['wall_ms_median']} ms; kernel_sum_ms {s.get('kernel_sum_ms')}; busy_ms {s.get('busy_ms')}; "
               f"busy_any {s.get('busy_any_ms')}; idle_any {s.get('idle_any_ms')}; kernels {s.get('kernels')}; "
-              f"clock spread {s.get('clock_spread_us')} us over {s.get('clock_pairs')} pairs; attribution {s.get('attribution')}")
+              f"clock spread {s.get('clock_spread_us')} us over {s.get('clock_pairs')} pairs; attribution {s.get('attribution') or s.get('note')}")
     for h in hosts:
         print(f"host N={h['new_tokens']}: wall {h['wall_ms_median']} ms; per-rank prefill host ms {h['rank_prefill_host_ms']}; "
               f"rendezvous {h['exchange_host_ms']}")
@@ -621,10 +695,13 @@ def run_all(args) -> int:
     started = time.time()
     env = dict(os.environ)
     env["HIP_VISIBLE_DEVICES"] = args.devices
+    if args.eager:  # per-op call-site attribution needs Python per op: no captured prefill
+        env["ENGINE_PREFILL_GRAPH"] = "0"
     env.pop("CUDA_VISIBLE_DEVICES", None)
     cmd = [sys.executable, str(Path(__file__).resolve()), "passes", "--reps", str(args.reps), "--news", args.news,
            "--prof", str(args.prof)]
-    print(f"all: {' '.join(cmd)} (HIP_VISIBLE_DEVICES={args.devices}, ENGINE_TP={env.get('ENGINE_TP', 'default')})",
+    print(f"all: {' '.join(cmd)} (HIP_VISIBLE_DEVICES={args.devices}, ENGINE_TP={env.get('ENGINE_TP', 'default')}, "
+          f"ENGINE_PREFILL_GRAPH={env.get('ENGINE_PREFILL_GRAPH', 'default')})",
           flush=True)
     splits, hosts = [], []
     proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -653,6 +730,9 @@ def main() -> int:
         p.add_argument("--prof", type=int, default=2)
         if name == "all":
             p.add_argument("--devices", default="4,5")
+            p.add_argument("--eager", action="store_true",
+                           help="ENGINE_PREFILL_GRAPH=0: eager passes, attributed per call site (the "
+                                "default captured passes are attributed by kernel name only)")
     args = parser.parse_args()
     return run_all(args) if args.cmd == "all" else passes(args)
 

@@ -32,6 +32,12 @@ The all-reduce (``Group.allreduce``):
   are fine-grained (``hipExtMallocWithFlags``) and double-buffered by epoch parity; 64 words
   per one-wavefront CTA, each CTA with its own epoch. The kernel keeps its epochs in device
   memory, so the graphs need no host input and the ranks rendezvous inside them.
+- Inside a captured prefill graph, for BF16 tensors of at least ``BULK_MIN_WORDS`` words
+  (``ENGINE_TP_BULK_AR``, plan 52): the bulk protocol (``_bulk_ar_kernel``). One CTA per chunk
+  of ``BULK_BW`` words stores its data, without epochs, into the peer's receive buffer
+  (write-through, parity ``e & 1``), then releases one flag per CTA at system scope; it
+  acquires its own flag and sums with the same formula. Half the bytes of LL on the link and
+  64x fewer CTAs; the same bits.
 - Eagerly (prefill, capture warm-up, the eager decode fallback): the ranks run in two host
   threads (``TPModel._both``) and exchange partials through a host mailbox and a
   stream-ordered peer copy. No device spin, so no host ordering can deadlock it.
@@ -99,6 +105,15 @@ GLUE_ARRMS = os.environ.get("ENGINE_GLUE_ARRMS", "0") == "1"
 # index of it do not depend on the order of the scan.
 GLUE_ARGMAX = os.environ.get("ENGINE_GLUE_ARGMAX", "1") == "1"
 ARGMAX_BLOCK = 8192
+# Plan 52 (ENGINE_TP_BULK_AR=1, default on; prefill graphs only): BF16 all-reduces of at least
+# BULK_MIN_WORDS 32-bit words (512 rows of 2,048) in a captured graph use the bulk protocol
+# (``_bulk_ar_kernel``) instead of LL; smaller ones (decode, verify, small prefill buckets) and
+# fp32 stay on LL. BULK_BW words per one-CTA chunk, BULK_WARPS waves per CTA.
+BULK_AR = os.environ.get("ENGINE_TP_BULK_AR", "1") == "1" and PREFILL_GRAPH
+BULK_MIN_WORDS = int(os.environ.get("ENGINE_TP_BULK_MIN_WORDS", str(512 * 1024)))
+BULK_BW = int(os.environ.get("ENGINE_TP_BULK_BW", "4096"))
+BULK_WARPS = int(os.environ.get("ENGINE_TP_BULK_WARPS", "1"))
+BULK_CAP = max(PG_BUCKETS) * 1024  # words per parity buffer: the largest bucket's BF16 rows
 RMS_ROWS = 64  # rows per call of the fused all-reduce + RMSNorm
 RMS_WIDTH = 2048  # BF16 values per row (the hidden size)
 
@@ -157,6 +172,51 @@ if triton is not None:
                 s = tl.load(res_ptr + offs, mask=m, other=0).to(tl.float32, bitcast=True) + s
             res = s.to(tl.int32, bitcast=True)
         tl.store(out_ptr + offs, res, mask=m)
+        tl.store(epoch_ptr + p, e)
+
+
+    @triton.jit
+    def _bulk_ar_kernel(
+        x_ptr, res_ptr, out_ptr, recv_local, recv_peer, flag_local, flag_peer, epoch_ptr, err_ptr,
+        NW, CAP, BW: tl.constexpr, RES: tl.constexpr, MAXIT: tl.constexpr,
+    ):
+        """``_ll_allreduce_kernel``'s BF16 sum (same rounding, same bits) over the bulk
+        protocol: data-only stores to the peer, then one system-scope release of the peer's
+        flag of this CTA (its epoch); spin on our own flag with system-scope acquire (a
+        wrapping compare: a fast peer may already have released the next epoch), then read
+        the peer's chunk uncached. ``NW`` is specialized (divisible by 16) so the masked
+        accesses vectorize."""
+        p = tl.program_id(0)
+        e = tl.load(epoch_ptr + p) + 1
+        buf = (e & 1).to(tl.int64) * CAP
+        offs = p.to(tl.int64) * BW + tl.arange(0, BW)
+        m = offs < NW
+        xi = tl.load(x_ptr + offs, mask=m, other=0)
+        tl.store(recv_peer + buf + offs, xi, mask=m, cache_modifier=".wt")
+        tl.debug_barrier()
+        tl.atomic_xchg(flag_peer + p, e, sem="release", scope="sys")
+        v = tl.atomic_add(flag_local + p, 0, sem="acquire", scope="sys")
+        it = v * 0
+        while ((v - e) < 0) & (it < MAXIT):
+            v = tl.atomic_add(flag_local + p, 0, sem="acquire", scope="sys")
+            it += 1
+        if (v - e) < 0:
+            tl.atomic_add(err_ptr, 1)
+        tl.debug_barrier()
+        yi = tl.load(recv_local + buf + offs, mask=m, other=0, volatile=True, cache_modifier=".cv")
+        s_lo = (((xi & 0xFFFF) << 16).to(tl.float32, bitcast=True)
+                + ((yi & 0xFFFF) << 16).to(tl.float32, bitcast=True))
+        s_hi = ((xi & -65536).to(tl.float32, bitcast=True)
+                + (yi & -65536).to(tl.float32, bitcast=True))
+        s_lo = s_lo.to(tl.bfloat16).to(tl.float32)
+        s_hi = s_hi.to(tl.bfloat16).to(tl.float32)
+        if RES:
+            ri = tl.load(res_ptr + offs, mask=m, other=0)
+            s_lo = (((ri & 0xFFFF) << 16).to(tl.float32, bitcast=True) + s_lo).to(tl.bfloat16).to(tl.float32)
+            s_hi = ((ri & -65536).to(tl.float32, bitcast=True) + s_hi).to(tl.bfloat16).to(tl.float32)
+        lo = s_lo.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        hi = s_hi.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32) << 16
+        tl.store(out_ptr + offs, lo | hi, mask=m)
         tl.store(epoch_ptr + p, e)
 
 
@@ -336,8 +396,25 @@ class _LL:
                 x = torch.zeros((1, 256), dtype=dtype, device=dev)
                 self._launch(rank, x, x if residual else None, loop=True)
             torch.cuda.synchronize(dev)
+        self.bulk = False
+        if BULK_AR:
+            ctas = triton.cdiv(BULK_CAP, BULK_BW)
+            self.b_recv = [self._fine(d, 2 * BULK_CAP * 4, torch.int32) for d in self.devices]
+            self.b_loop = [self._fine(d, 2 * BULK_CAP * 4, torch.int32) for d in self.devices]
+            self.b_flag = [self._fine(d, ctas * 4, torch.int32) for d in self.devices]
+            self.b_loop_flag = [self._fine(d, ctas * 4, torch.int32) for d in self.devices]
+            self.b_epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
+            self.b_loop_epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
+            # Compile both variants on both GPUs (loopback, as LL's) with a word count divisible
+            # by 16, the specialization every BF16 prefill bucket has.
+            for rank, dev in enumerate(self.devices):
+                x = torch.zeros((64, 2048), dtype=torch.bfloat16, device=dev)
+                for residual in (False, True):
+                    self._launch_bulk(rank, x, x if residual else None, loop=True)
+                torch.cuda.synchronize(dev)
+            self.bulk = True
 
-    def _fine(self, dev: torch.device, nbytes: int) -> _Raw:
+    def _fine(self, dev: torch.device, nbytes: int, dtype: torch.dtype = torch.int64) -> _Raw:
         ptr = ctypes.c_void_p()
         hip = self.hip
         if hip.hipSetDevice(dev.index) != 0:
@@ -349,7 +426,7 @@ class _LL:
         if hip.hipMemset(ptr, 0, ctypes.c_size_t(nbytes)) != 0 or hip.hipDeviceSynchronize() != 0:
             raise RuntimeError("hipMemset failed")
         torch.cuda.set_device(self.devices[0])
-        return _Raw(ptr.value, torch.int64)
+        return _Raw(ptr.value, dtype)
 
     def _launch(self, rank: int, x: torch.Tensor, residual: torch.Tensor | None,
                 loop: bool = False) -> torch.Tensor:
@@ -358,6 +435,9 @@ class _LL:
         nw = nbytes // 4
         if nbytes % 4 or nw > CAPACITY or x.dtype not in (torch.bfloat16, torch.float32):
             raise ValueError(f"all-reduce of {tuple(x.shape)} {x.dtype} is not supported in a graph")
+        if (not loop and self.bulk and x.dtype == torch.bfloat16
+                and BULK_MIN_WORDS <= nw <= BULK_CAP and nw % 16 == 0):
+            return self._launch_bulk(rank, x, residual)
         out = torch.empty_like(x)
         res = residual.contiguous() if residual is not None else x
         if residual is not None and (res.dtype != x.dtype or res.shape != x.shape):
@@ -371,6 +451,32 @@ class _LL:
                 out.view(-1).view(torch.int32), local, peer, epoch, self.err[rank], nw, CAPACITY,
                 CHUNK=CHUNK, BF16=x.dtype == torch.bfloat16, RES=residual is not None,
                 MAXIT=MAXIT, num_warps=1,
+            )
+        return out
+
+    def _launch_bulk(self, rank: int, x: torch.Tensor, residual: torch.Tensor | None,
+                     loop: bool = False) -> torch.Tensor:
+        """The BF16 all-reduce over the bulk protocol (``_bulk_ar_kernel``)."""
+        x = x.contiguous()
+        nw = x.numel() // 2
+        out = torch.empty_like(x)
+        res = residual.contiguous() if residual is not None else x
+        if residual is not None and (res.dtype != x.dtype or res.shape != x.shape):
+            raise ValueError("the residual must match the all-reduced tensor")
+        if loop:
+            local = peer = self.b_loop[rank]
+            flag = peer_flag = self.b_loop_flag[rank]
+            epoch = self.b_loop_epoch[rank]
+        else:
+            local, peer = self.b_recv[rank], self.b_recv[1 - rank]
+            flag, peer_flag = self.b_flag[rank], self.b_flag[1 - rank]
+            epoch = self.b_epoch[rank]
+        with torch.cuda.device(x.device):
+            _bulk_ar_kernel[(triton.cdiv(nw, BULK_BW),)](
+                x.view(-1).view(torch.int32), res.view(-1).view(torch.int32),
+                out.view(-1).view(torch.int32), local, peer, flag, peer_flag, epoch, self.err[rank],
+                nw, BULK_CAP, BW=BULK_BW, RES=residual is not None, MAXIT=MAXIT,
+                num_warps=BULK_WARPS,
             )
         return out
 

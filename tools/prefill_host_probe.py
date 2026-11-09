@@ -86,7 +86,7 @@ def category(name: str) -> str:
         return "gdn"
     if any(s in n for s in ("cijk", "gemm", "gemv", "hipblaslt", "rocblas", "matmul", "_mt", "tensile")):
         return "gemm"
-    if "ll_allreduce" in n:
+    if "ll_allreduce" in n or "bulk_ar" in n:
         return "allreduce"
     return "other"
 

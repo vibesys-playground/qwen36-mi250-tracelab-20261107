@@ -43,6 +43,8 @@ def main() -> int:
     ap.add_argument("--news", default="61,561,700,1650")
     ap.add_argument("--start", type=int, default=3600)
     ap.add_argument("--reps", type=int, default=12)
+    ap.add_argument("--dump", default="", help="save each N's graph pass (logits, drafts, state)")
+    ap.add_argument("--against", default="", help="compare each N's graph pass bitwise with a --dump")
     args = ap.parse_args()
     news = [int(n) for n in args.news.split(",")]
     start = args.start
@@ -122,6 +124,8 @@ def main() -> int:
         return out
 
     rows = []
+    dumped = {}
+    ref = torch.load(args.against) if args.against else None
     with torch.inference_mode():
         for n in news:
             ids = pool[start + 5 * n: start + 6 * n]
@@ -137,6 +141,15 @@ def main() -> int:
                 "drafts_equal": bool(torch.equal(dg.cpu(), de.cpu())) if dg is not None else None,
                 **diff(sg, se, ("conv", "rec", "k", "v")),
             }
+            if args.dump:
+                dumped[n] = {"logits": lg, "drafts": None if dg is None else dg.cpu(), "state": sg}
+            if ref is not None and n in ref:
+                o = ref[n]
+                bad = [k for k in sg if not torch.equal(sg[k], o["state"][k])]
+                rec["graph_vs_dump_bitwise"] = {
+                    "logits": bool(torch.equal(lg, o["logits"])),
+                    "drafts": None if dg is None else bool(torch.equal(dg.cpu(), o["drafts"])),
+                    "state": not bad, "state_mismatch": bad[:8]}
             rec["graph_vs_graph_bitwise"] = bool(
                 torch.equal(lg, lg2) and (dg is None or torch.equal(dg, dg2))
                 and all(torch.equal(sg[k], sg2[k]) for k in sg))
@@ -177,6 +190,8 @@ def main() -> int:
             rec["graph_over_eager"] = round(med["graph"] / med["eager"], 3)
             result("case", **rec)
             rows.append(rec)
+    if args.dump:
+        torch.save(dumped, args.dump)
     result("timeouts", ll=fast.timeouts())
     print(f"\n=== plan 33 step 1: captured vs eager prefill (TP2, start {start}, median of {args.reps})")
     print(f"{'N':>6} {'size':>5} {'eager ms':>9} {'graph ms':>9} {'ratio':>6}  top1  conv/rec max diff  repeat  pad-leak-free")

@@ -75,7 +75,7 @@ def kclass(name: str) -> str:
     n = name.lower()
     if "_gate_up_kernel" in n or "_down_kernel" in n:
         return "moe_kernel"
-    if "ll_allreduce" in n:
+    if "ll_allreduce" in n or "bulk_ar" in n:
         return "allreduce_kernel"
     if any(s in n for s in ("miopen", "conv", "naive_conv")):
         return "conv"

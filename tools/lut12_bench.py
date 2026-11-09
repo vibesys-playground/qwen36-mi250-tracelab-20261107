@@ -186,7 +186,11 @@ def shard(mlp, rank: int, ranks: int = 2):
 
 
 def real(args) -> None:
-    os.environ.setdefault("ENGINE_MTP", "1")
+    # --load-layers N (one-GPU slice, e.g. MI210): only layers 0..N-1 are loaded, no MTP head;
+    # the MoE inputs of the picked layers depend on those layers only. The decode steps are
+    # then teacher-forced with the prompts' own continuation (a truncated model's greedy
+    # tokens would be noise), so rows are real text through the real layers.
+    os.environ.setdefault("ENGINE_MTP", "0" if args.load_layers else "1")
     os.environ.setdefault("ENGINE_TP", "1")
     import moe_decode_bench as mdb
     from engine.fast import fused
@@ -197,7 +201,18 @@ def real(args) -> None:
     codes = compile_all(shape)
 
     started = time.perf_counter()
-    g = Generator.load(CHECKPOINT["model"], CHECKPOINT["revision"], max_model_len=262144,
+    config = None
+    if args.load_layers:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(CHECKPOINT["model"], revision=CHECKPOINT["revision"])
+        for cfg in {id(c): c for c in (config, config.get_text_config())}.values():
+            if hasattr(cfg, "layer_types"):
+                cfg.layer_types = list(cfg.layer_types)[: args.load_layers]
+                cfg.num_hidden_layers = args.load_layers
+            if hasattr(cfg, "mtp_num_hidden_layers"):
+                cfg.mtp_num_hidden_layers = 0
+    g = Generator.load(CHECKPOINT["model"], CHECKPOINT["revision"], config=config, max_model_len=262144,
                        chunk_tokens=2048, prefix_cache_tokens=0, prefix_cache_entries=0)
     fast, tok = g.fast, g.tokenizer
     if fast.fused is None:
@@ -205,6 +220,17 @@ def real(args) -> None:
     dev0 = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(dev0)
     cus = props.multi_processor_count
+    import subprocess
+
+    try:
+        prod = subprocess.run(["rocm-smi", "--showproductname"], capture_output=True, text=True,
+                              timeout=30).stdout
+        prod = " | ".join(ln.strip() for ln in prod.splitlines() if "Card" in ln and ("series" in ln or "model" in ln))
+    except Exception as exc:  # noqa: BLE001
+        prod = f"rocm-smi unavailable ({type(exc).__name__})"
+    out(f"RESULT device name={props.name!r} total_GB={props.total_memory / 1e9:.1f} cus={cus} "
+        f"gpus={torch.cuda.device_count()} placement_hint={os.environ.get('VIBESYS_PLACEMENT', '?')} "
+        f"rocm_smi={prod!r} load_layers={args.load_layers or 'all'}")
     out(f"RESULT env load_s={time.perf_counter() - started:.0f} gcn={getattr(props, 'gcnArchName', '?')} "
         f"cus={cus} torch={torch.__version__} triton={triton.__version__} "
         f"visible={os.environ.get('HIP_VISIBLE_DEVICES')} moe_order={fused.MOE_ORDER} "
@@ -261,12 +287,17 @@ def real(args) -> None:
     with torch.inference_mode():
         slots = list(range(S))
         lasts = [int(torch.argmax(prefill(s, p))) for s, p in zip(slots, prompts, strict=True)]
+        if args.load_layers:
+            lasts = [corpus[9973 * k + args.prompt_len] for k in range(S)]
         fast.use_graphs = False
         for step in range(args.steps):
             state["on"] = True
             logits = fast.decode(lasts, slots, [args.prompt_len + step] * S)
             state["on"] = False
-            lasts = logits.argmax(-1).tolist()
+            if args.load_layers:
+                lasts = [corpus[9973 * k + args.prompt_len + step + 1] for k in range(S)]
+            else:
+                lasts = logits.argmax(-1).tolist()
         for s in slots:
             fast.reset(s)
     fast.fused._moe = moe0
@@ -535,6 +566,8 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--prompt-len", type=int, default=1800)
+    parser.add_argument("--load-layers", type=int, default=0,
+                        help="load only layers 0..N-1 (one GPU); decode teacher-forced")
     args = parser.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", args.devices)
     try:

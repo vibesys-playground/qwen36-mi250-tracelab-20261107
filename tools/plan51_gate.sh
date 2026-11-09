@@ -8,7 +8,7 @@
 #   GCD 0,1  glue_split chain k=3 B=1,2 + parity hashes, flags (GLUE,KSUM) 00 10 01 11
 #   GCD 2,3  the same in the reverse order 11 01 10 00
 #   GCD 4,5  chain_gate (step ms, acceptance, spec == plain on the chained path) 00 then 11
-#   GCD 6,7  unit tests, spec == plain (spec_step_bench, defaults), then Triton compiles after
+#   GCD 6,7  unit tests (tools/plan51_tests.sh, per file), spec == plain (spec_step_bench, defaults), then Triton compiles after
 #            /health under a served replay-like load (live_compile_probe, defaults)
 # Phase B, whole node (4 x TP2): served replay-like A/B 00 / 11 / 00 / 11.
 set -x
@@ -22,7 +22,7 @@ G="timeout 900 python -u tools/glue_split.py --configs chain:1:3,chain:2:3 --par
     env ENGINE_CHAIN_GLUE=${f%?} ENGINE_AR_KSUM=${f#?} $G --devices 2,3; done ) > $L/split23.log 2>&1 &
 ( for f in 00 11; do echo "=== flags $f"; \
     env ENGINE_CHAIN_GLUE=${f%?} ENGINE_AR_KSUM=${f#?} timeout 1800 python -u tools/chain_gate.py --devices 4,5; done ) > $L/gate.log 2>&1 &
-( HIP_VISIBLE_DEVICES=6,7 timeout 1500 python -m pytest -q -rf tests/test_chain_glue.py tests/test_spec_chain.py tests/test_runahead.py 2>&1 | tail -25; \
+( sh tools/plan51_tests.sh; \
   echo "--- spec == plain (defaults)"; timeout 2400 python -u tools/spec_step_bench.py --devices 6,7 --iters 10 --max-new 128; \
   echo "--- live compiles (defaults)"; HIP_VISIBLE_DEVICES=6,7 timeout 3000 python tools/live_compile_probe.py; \
   cp /tmp/live-compile-server.log $L/live-server.log ) > $L/tests.log 2>&1 &

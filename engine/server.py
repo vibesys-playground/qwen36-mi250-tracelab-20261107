@@ -461,8 +461,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
+            stamps: dict[str, Any] = {}
+            if os.environ.get("ENGINE_AR_STAMP") == "1":  # plan 55's all-reduce stamps
+                from engine.fast import arstamp
+
+                stamps = arstamp.summary()
             self._send_json(
-                200, {"status": "ok", **self.server.generator.stats(), **looptimers.summary()}
+                200,
+                {"status": "ok", **self.server.generator.stats(), **looptimers.summary(), **stamps},
             )
         elif self.path == "/v1/models":
             card = {

@@ -56,7 +56,7 @@ import torch
 from torch.nn import functional as F
 
 from engine import cpu_place, looptimers
-from engine.fast import kernels, mfma
+from engine.fast import arstamp, kernels, mfma
 from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
 
 triton, tl = kernels.triton, kernels.tl
@@ -119,15 +119,22 @@ if triton is not None:
     @triton.jit(do_not_specialize=["NW"])
     def _ll_allreduce_kernel(
         x_ptr, res_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr, NW, CAP, part_ptr, N,
+        stamp_ptr, sctr_ptr,
         CHUNK: tl.constexpr, BF16: tl.constexpr, RES: tl.constexpr, MAXIT: tl.constexpr,
-        KSPLIT: tl.constexpr, BM: tl.constexpr,
+        KSPLIT: tl.constexpr, BM: tl.constexpr, STAMP: tl.constexpr = False,
+        RING: tl.constexpr = 1,
     ):
         """out = [res +] (x_self + x_peer) over 32-bit words of BF16 pairs or fp32 values,
         rounded as ``bf16(fp32(a) + fp32(b))`` (then ``bf16(res + that)``); see the module doc.
         With KSPLIT > 1 (BF16, plan 51) x_self is first built from a K-split GEMV's fp32 parts
         (``mfma.KParts``: ``part[(p BM + r) N + n]``) as ``mfma._ksum_kernel`` builds it:
-        summed in part order, rounded to BF16."""
+        summed in part order, rounded to BF16.
+        With STAMP (plan 55, ``arstamp``) program 0 and the last program record their clocks
+        at entry, spin end and end in ``stamp_ptr`` (results unchanged)."""
         p = tl.program_id(0)
+        if STAMP:
+            t_in = arstamp.realtime()
+            c_in = arstamp.memtime()
         e = tl.load(epoch_ptr + p) + 1
         buf = (e % 2).to(tl.int64) * CAP
         offs = p * CHUNK + tl.arange(0, CHUNK)
@@ -158,6 +165,8 @@ if triton is not None:
             it += 1
         if pending > 0:
             tl.atomic_add(err_ptr, 1)
+        if STAMP:
+            t_spin = arstamp.realtime()
         yi = (w & 0xFFFFFFFF).to(tl.int32)
         if BF16:
             s_lo = (((xi & 0xFFFF) << 16).to(tl.float32, bitcast=True)
@@ -180,6 +189,26 @@ if triton is not None:
             res = s.to(tl.int32, bitcast=True)
         tl.store(out_ptr + offs, res, mask=m)
         tl.store(epoch_ptr + p, e)
+        if STAMP:
+            t_end = arstamp.realtime()
+            if p == 0:
+                if e < RING:
+                    base = stamp_ptr + e.to(tl.int64) * 8
+                    kind = NW.to(tl.int64)
+                    if BF16:
+                        kind += 4294967296
+                    tl.store(base, kind)
+                    tl.store(base + 1, t_in)
+                    tl.store(base + 2, t_spin)
+                    tl.store(base + 3, t_end)
+                    tl.store(base + 4, c_in)
+            if p == tl.num_programs(0) - 1:
+                k = tl.atomic_add(sctr_ptr, 1) + 1
+                if k < RING:
+                    base = stamp_ptr + k.to(tl.int64) * 8
+                    tl.store(base + 5, t_in)
+                    tl.store(base + 6, t_spin)
+                    tl.store(base + 7, t_end)
 
 
     @triton.jit(do_not_specialize=["eps"])
@@ -338,6 +367,10 @@ class _LL:
         self.epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.loop_epoch = [torch.zeros(ctas, dtype=torch.int32, device=d) for d in self.devices]
         self.err = [torch.zeros(1, dtype=torch.int32, device=d) for d in self.devices]
+        # Plan 55 (ENGINE_AR_STAMP=1, default off): per-rank clock stamps of every call.
+        self.stamps = arstamp.Stamps(self.devices, self.epoch) if arstamp.ENABLED else None
+        if self.stamps is not None:
+            self.stamps.calibrate()
         self.rms_cap = RMS_ROWS * RMS_WIDTH
         self.rms_ready = False
         if GLUE_ARRMS:
@@ -404,13 +437,15 @@ class _LL:
         local = (self.loop if loop else self.recv)[rank]
         peer = local if loop else self.recv[1 - rank]
         epoch = (self.loop_epoch if loop else self.epoch)[rank]
+        stamp, sctr = self.stamps.ar_args(rank, loop) if self.stamps is not None else (epoch, epoch)
         with torch.cuda.device(x.device):
             _ll_allreduce_kernel[(triton.cdiv(nw, CHUNK),)](
                 x.view(-1).view(torch.int32), res.view(-1).view(torch.int32),
                 out.view(-1).view(torch.int32), local, peer, epoch, self.err[rank], nw, CAPACITY,
-                part if part is not None else x, n,
+                part if part is not None else x, n, stamp, sctr,
                 CHUNK=CHUNK, BF16=x.dtype == torch.bfloat16, RES=residual is not None,
-                MAXIT=MAXIT, KSPLIT=ksplit, BM=mfma.BM, num_warps=1,
+                MAXIT=MAXIT, KSPLIT=ksplit, BM=mfma.BM, STAMP=self.stamps is not None,
+                RING=arstamp.RING, num_warps=1,
             )
         return out
 
@@ -787,6 +822,8 @@ class TPModel:
             model.tp, model.rank, model.vocab_offset = self.group, r, shard.vocab_offset
             self.ranks.append(model)
         r0, r1 = self.ranks
+        if self.group.ll is not None and self.group.ll.stamps is not None:
+            self.group.ll.stamps.layer_types = list(r0.layer_types)
         if r1.pool.pages != r0.pool.pages:
             raise RuntimeError(f"ranks hold {r0.pool.pages} and {r1.pool.pages} KV pages")
         if len(r0.segments) != 1 or len(r1.segments) != 1:
@@ -1023,9 +1060,13 @@ class TPModel:
         host = FastModel.pg_host(size, ids, start, follow, slot, r0._g(slot))
         for buf in bufs:
             buf.copy_(host)
-        for g, buf in zip(graphs, bufs, strict=True):
-            with torch.cuda.device(buf.device):
-                g.replay()
+        stamps = self.group.ll.stamps if self.group.ll is not None else None
+        if stamps is not None:  # plan 55: the same replays, stamped
+            stamps.replay(graphs, [buf.device for buf in bufs], arstamp.tag(arstamp.PREFILL, size, len(ids)))
+        else:
+            for g, buf in zip(graphs, bufs, strict=True):
+                with torch.cuda.device(buf.device):
+                    g.replay()
         self.pg_replays += 1
         self.last_drafts = drafts[0].clone() if drafts[0] is not None else None
         return self._gather(outs)
@@ -1274,9 +1315,10 @@ class TPModel:
             for meta in model.devices.values():
                 meta.packed.copy_(host)
 
-    def _run(self, size: int, rows: int, verify: bool, chain: int = 0
-             ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
-        """Both ranks' outputs (their logits shards) and, for a verify step, the picks."""
+    def _run(self, size: int, rows: int, verify: bool, chain: int = 0, batch: int = 0,
+             ahead: bool = False) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+        """Both ranks' outputs (their logits shards) and, for a verify step, the picks.
+        ``batch`` and ``ahead`` (a run-ahead launch) only tag the plan-55 stamps."""
         r0 = self.ranks[0]
         if r0.use_graphs and self.graph_error is None:
             segs = [m._segs(verify, chain) for m in self.ranks]
@@ -1288,10 +1330,17 @@ class TPModel:
                     meta.packed.copy_(packed)
             if self.graph_error is None:
                 outs = []
-                for model, seg in zip(self.ranks, segs, strict=True):
-                    with torch.cuda.device(seg[0].device):
-                        seg[0].graphs[size].replay()
-                    outs.append(seg[0].outputs[size])
+                stamps = self.group.ll.stamps if self.group.ll is not None else None
+                if stamps is not None:  # plan 55: the same replays, stamped
+                    kind = arstamp.CHAIN if chain else (arstamp.VERIFY if verify else arstamp.DECODE)
+                    stamps.replay([seg[0].graphs[size] for seg in segs], [seg[0].device for seg in segs],
+                                  arstamp.tag(kind, size, batch or size, chain, ahead))
+                    outs = [seg[0].outputs[size] for seg in segs]
+                else:
+                    for model, seg in zip(self.ranks, segs, strict=True):
+                        with torch.cuda.device(seg[0].device):
+                            seg[0].graphs[size].replay()
+                        outs.append(seg[0].outputs[size])
                 if chain:
                     return outs, r0._chain_static[(size, chain)]
                 return outs, (r0._verify_static[size] if verify else None)
@@ -1322,7 +1371,7 @@ class TPModel:
         host[2, :batch] = torch.tensor(list(positions), dtype=torch.long)
         host[3, :batch] = torch.tensor([r0._g(s) for s in slots], dtype=torch.long)
         self._load_inputs(host)
-        outs, _ = self._run(size, size, verify=False)
+        outs, _ = self._run(size, size, verify=False, batch=batch)
         return self._gather([o[:batch] for o in outs])
 
     @torch.inference_mode()
@@ -1369,7 +1418,7 @@ class TPModel:
             t1 = looptimers.now()
             looptimers.add("build", t1 - t0)
             looptimers.replay_start()
-        outs, out = self._run(size, rows, verify=True)
+        outs, out = self._run(size, rows, verify=True, batch=batch)
         if timed:
             ev_mid.record(stream0)
             t2 = looptimers.now()
@@ -1420,7 +1469,7 @@ class TPModel:
             T.add("build", t2 - t0)
             T.cur["_build_t"] = t2
             T.replay_start()
-        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        outs, out = self._run(size, groups * size, verify=False, chain=groups, batch=batch)
         if timed:
             ev_mid.record(stream0)
             t3 = T.now()
@@ -1516,7 +1565,7 @@ class TPModel:
             looptimers.add("build", t2 - t0)
             looptimers.cur["_build_t"] = t2
             looptimers.replay_start()
-        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        outs, out = self._run(size, groups * size, verify=False, chain=groups, batch=batch)
         self._chain_d2h(out, handle)
         if gather:
             handle["logits"] = self._gather([o[:batch] for o in outs])
@@ -1549,7 +1598,7 @@ class TPModel:
         if timed:
             t1 = looptimers.now()
             looptimers.add("next_build", t1 - t0)
-        outs, out = self._run(size, groups * size, verify=False, chain=groups)
+        outs, out = self._run(size, groups * size, verify=False, chain=groups, batch=batch, ahead=True)
         self._chain_d2h(out, handle)
         if timed:
             looptimers.add("launch", looptimers.now() - t1)

@@ -118,6 +118,45 @@ def pct(values: list[float], q: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, int(q * len(ordered)))], 2)
 
 
+class ClockSampler:
+    """``--sclk``: each GPU's current shader clock (the starred level of the sysfs
+    ``pp_dpm_sclk``) once per second while the sessions run."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.paths = sorted(Path("/sys/class/drm").glob("card*/device/pp_dpm_sclk"))
+        self.samples: dict[str, list[int]] = {str(p.parent.parent.name): [] for p in self.paths}
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            for p in self.paths:
+                try:
+                    for line in p.read_text().splitlines():
+                        if line.rstrip().endswith("*"):
+                            mhz = int(line.split(":")[1].strip().lower().split("mhz")[0])
+                            self.samples[str(p.parent.parent.name)].append(mhz)
+                except (OSError, ValueError, IndexError) as exc:
+                    self.error = f"{type(exc).__name__}: {exc}"
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def result(self) -> dict:
+        out = {}
+        for card, values in self.samples.items():
+            if values:
+                ordered = sorted(values)
+                out[card] = {"n": len(values), "min": ordered[0], "p50": ordered[len(ordered) // 2],
+                             "mean": round(sum(values) / len(values), 1), "max": ordered[-1]}
+        return {"cards": out, "paths": len(self.paths), "error": self.error}
+
+
 def per_request(health: dict, key: str, requests: int) -> float | None:
     """A /health counter (the router's total over replicas) per request."""
     value = health.get(key)
@@ -154,11 +193,14 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
                 pass
             time.sleep(2)
         load_s = time.perf_counter() - t0
+        clocks = ClockSampler() if args.sclk else None
         t0 = time.perf_counter()
         with ThreadPoolExecutor(args.concurrency or args.sessions) as ex:
             results = [r for s in ex.map(lambda i: session(url, pool, i, args), range(args.sessions)) for r in s]
         wall = time.perf_counter() - t0
-        health = httpx.get(url + "/health", timeout=30).json()
+        if clocks is not None:
+            clocks.stop()
+        health = httpx.get(url + "/health", timeout=120).json()
     finally:
         proc.terminate()
         try:
@@ -185,6 +227,17 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
     for index, timers in enumerate(t for t in timer_sets if t):
         print(json.dumps({"event": "loop_timers", "setting": setting or "default",
                           "replica": index, **timers}), flush=True)
+    # ENGINE_AR_STAMP=1 (plan 55): each replica's all-reduce stamp summary, one line each.
+    stamp_sets = [health.pop("ar_stamp", None)] + [
+        r.pop("ar_stamp", None) for r in health.get("replicas", [])
+    ]
+    for index, pairs in enumerate(t for t in stamp_sets if t):
+        for pair in pairs:
+            print(json.dumps({"event": "ar_stamp", "setting": setting or "default",
+                              "replica": index, **pair}), flush=True)
+    if clocks is not None:
+        print(json.dumps({"event": "sclk", "setting": setting or "default", **clocks.result()}),
+              flush=True)
     print(json.dumps({
         "event": "setting", "setting": setting or "default", "load_s": round(load_s, 1),
         "wall_s": round(wall, 2), "requests": len(results), "output_tokens": tokens,
@@ -215,6 +268,8 @@ def main() -> None:
     parser.add_argument("--grow", type=int, default=300)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
+    parser.add_argument("--sclk", action="store_true",
+                        help="sample each GPU's sysfs shader clock once per second (plan 55)")
     parser.add_argument(
         "--corpus",
         choices=("source", "synthetic"),

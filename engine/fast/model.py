@@ -50,6 +50,13 @@ DECODE_EXPERT_TOKENS = 16
 SCORE_BUDGET = 1 << 30
 # Prefill conv inputs are right-padded to a multiple of this many positions (``prefill_conv``).
 CONV_BUCKET = 256
+# Plan 51 (ENGINE_CHAIN_GLUE, default on; 0 restores the torch ops): the MTP head's decode-side
+# glue in Triton: its fc input (embedding, both RMSNorms, the cat) in one launch
+# (``kernels.mtp_in``), its final RMSNorm through ``kernels.add_rms``, and the chained verify's
+# accept step (accepted count, the accepted row's hidden and draft, the next links' positions,
+# the output layout) in one launch (``kernels.chain_accept``). Draft-side only: drafts are
+# verified, so served tokens do not change.
+CHAIN_GLUE = os.environ.get("ENGINE_CHAIN_GLUE", "1") == "1"
 
 
 class FastPathUnavailable(RuntimeError):
@@ -893,11 +900,15 @@ class FastModel:
                 h = pending[2]
             else:
                 _, h = kernels.add_rms(x, None, layer.input_layernorm.weight, self.eps)
+            # Plan 51: in a captured graph the mixer's last GEMV may leave its K parts unsummed
+            # (``mfma.KParts``) for the all-reduce to sum (``tp.AR_KSUM``).
+            defer = (tp_mod.AR_KSUM and not arrms and x.is_cuda
+                     and torch.cuda.is_current_stream_capturing())
             if fused._is_gdn(i):
-                h = (fused._gdn_verify(i, h, states, groups=mfma.groups_of(verify)) if verify
-                     else fused._gdn(i, h, states))
+                h = (fused._gdn_verify(i, h, states, groups=mfma.groups_of(verify), defer=defer)
+                     if verify else fused._gdn(i, h, states, defer=defer))
             else:
-                h = fused._attn(i, h, slots, positions, meta)
+                h = fused._attn(i, h, slots, positions, meta, defer=defer)
             if arrms:
                 x, h = self.tp.allreduce_rms(self.rank, h, x, layer.post_attention_layernorm.weight,
                                              self.eps)
@@ -1615,15 +1626,25 @@ class FastModel:
         """``fc(cat(norm(embed(x[t+1])), norm(H[t])))``: embedding first (``engine.mtp``).
         With ``gemv``, ``fc`` through the fused multi-row GEMV (a decode step's rows)."""
         m = self.mtp
+        if gemv and CHAIN_GLUE and kernels.triton_usable(hidden.device):  # plan 51: one launch
+            x = kernels.mtp_in(tokens, self.mtp_embed, hidden, m.pre_fc_norm_embedding.weight,
+                               m.pre_fc_norm_hidden.weight, self.eps)
+            return self.fused.gemv(x, m.fc.weight)
         e = _rms(F.embedding(tokens, self.mtp_embed), m.pre_fc_norm_embedding.weight, self.eps)
         h = _rms(hidden, m.pre_fc_norm_hidden.weight, self.eps)
         if gemv:
             return self.fused.gemv(torch.cat((e, h), dim=-1), m.fc.weight)
         return F.linear(torch.cat((e, h), dim=-1), m.fc.weight)
 
+    def _mtp_norm(self, z: torch.Tensor) -> torch.Tensor:
+        """The head's final RMSNorm (one launch with ``CHAIN_GLUE`` on a Triton device)."""
+        if CHAIN_GLUE and kernels.triton_usable(z.device):
+            return kernels.add_rms(z.contiguous(), None, self.mtp.norm.weight, self.eps)[1]
+        return _rms(z, self.mtp.norm.weight, self.eps)
+
     def _mtp_logits(self, z: torch.Tensor, gemv: bool = False) -> torch.Tensor:
         if gemv:
-            return self.fused.gemv(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
+            return self.fused.gemv(self._mtp_norm(z), self.lm_head)
         return F.linear(_rms(z, self.mtp.norm.weight, self.eps), self.lm_head)
 
     def _mtp_prefill(
@@ -1706,8 +1727,20 @@ class FastModel:
             picks = self._argmax(logits)
             slots, positions = meta.slots[:rows], meta.positions[:rows]
             z = self._fused_layer(self.mtp_index, self._mtp_in(x, picks, True), slots, positions, meta)
-            y = _rms(z, self.mtp.norm.weight, self.eps)
+            y = self._mtp_norm(z)
             d = self._argmax(self.fused.gemv(y, self.lm_head))
+            if CHAIN_GLUE and kernels.triton_usable(y.device):  # plan 51: the accept step in one launch
+                out, h, posn = kernels.chain_accept(meta.tokens[:rows], picks, d, y, positions[:b],
+                                                    groups)
+                d = out[rows + b: rows + 2 * b]
+                for j in range(1, k):
+                    z = self._fused_layer(self.mtp_index, self._mtp_in(h, d, True), slots[:b],
+                                          posn[j - 1], meta)
+                    h = self._mtp_norm(z)
+                    d = self._argmax(self.fused.gemv(h, self.lm_head))
+                    out[rows + (j + 1) * b: rows + (j + 2) * b].copy_(d)
+                self._chain_out = out
+                return logits
             tokens = meta.tokens[:rows].view(groups, b)
             match = (tokens[1:] == picks.view(groups, b)[:-1]).long()
             a = torch.cumprod(match, dim=0).sum(dim=0)

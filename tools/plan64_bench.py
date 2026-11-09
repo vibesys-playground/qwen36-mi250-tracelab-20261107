@@ -160,7 +160,8 @@ def ar_norm(torch, args):
     H = tp.RMS_WIDTH
     eps = 1e-6
     g = torch.Generator(device="cpu").manual_seed(7)
-    w = [(torch.randn(H, generator=g) * 0.3).to(torch.bfloat16).to(d) for d in devs]
+    w0 = (torch.randn(H, generator=g) * 0.3).to(torch.bfloat16)
+    w = [w0.to(d) for d in devs]  # the same norm weight on both ranks, as in the model
 
     def hidden(R):
         x = torch.randn(R, H, generator=g)

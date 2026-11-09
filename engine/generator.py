@@ -49,7 +49,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, GenerationConfig
 
-from engine import batching, experts, gdn, speculative
+from engine import batching, experts, gdn, reqstamps, speculative
 from engine.protocol import ChatRequest, FinishReason, RequestError, Sampling
 
 CHECKPOINT = json.loads((Path(__file__).with_name("checkpoint.json")).read_text())
@@ -160,6 +160,9 @@ class PrefixCache:
         return (
             0 < length < len(prompt)
             and (entry.tail or length % self._chunk == 0 or length == len(prompt) - 1)
+            # Plan 46: cheap element probes first, so only a real match pays the slice.
+            and prompt[length - 1] == key[-1]
+            and prompt[length >> 1] == key[length >> 1]
             and prompt[:length] == key
         )
 
@@ -468,6 +471,25 @@ class Generation:
         g.keep_tail(key, cache)
 
 
+# Plan 46: tokenize completion prompts in the HTTP handler thread, incrementally (exact).
+REQ_FAST = os.environ.get("ENGINE_REQ_FAST", "1") == "1"
+
+
+def _prompt_encoder(tokenizer: Any) -> Any:
+    from engine.inctok import PromptEncoder
+
+    backend = None
+    source = getattr(tokenizer, "backend_tokenizer", None)
+    if source is not None:
+        try:
+            from tokenizers import Tokenizer
+
+            backend = Tokenizer.from_str(source.to_str())  # its own instance for handler threads
+        except Exception:  # noqa: BLE001 - full encodes only
+            backend = None
+    return PromptEncoder(lambda text: tokenizer.encode(text), backend)
+
+
 class Generator:
     """The model, its tokenizer and the prefix cache, owned by one thread."""
 
@@ -521,6 +543,8 @@ class Generator:
         self.verify_steps = 0
         self.mtp_proposed = 0
         self.mtp_accepted = 0
+        # Plan 46: exact incremental tokenization of growing prompts (``engine.inctok``).
+        self.prompt_encoder = _prompt_encoder(tokenizer)
         think_end = tokenizer.convert_tokens_to_ids("</think>")
         self.think_end_id = (
             think_end
@@ -616,6 +640,10 @@ class Generator:
         return generator
 
     def encode_text(self, prompt: str) -> tuple[int, ...]:
+        """Exactly ``tokenizer.encode(prompt)``; with ``ENGINE_REQ_FAST`` (default on) reusing
+        the ids of a recent prompt that ``prompt`` extends. Thread-safe."""
+        if REQ_FAST:
+            return self.prompt_encoder.encode(prompt)
         return tuple(self.tokenizer.encode(prompt))
 
     def encode_chat(self, request: ChatRequest) -> tuple[int, ...]:
@@ -748,6 +776,7 @@ class Generator:
             "prefix_cache_entries": len(pc),
             "prefix_cache_bytes": pc.bytes,
             "prefix_cache_evictions": pc.evictions,
+            **self.prompt_encoder.stats(),
         }
 
     # ---------------------------------------------------------------- fast path
@@ -990,7 +1019,12 @@ class PackedPrefill:
             slot = g._free_slots.pop()
             snap, tail = None, False
             try:
-                reused, snap, tail = g._prefix_cache.lookup(prompt)
+                if reqstamps.ENABLED:
+                    t_lookup = reqstamps.now()
+                    reused, snap, tail = g._prefix_cache.lookup(prompt)
+                    reqstamps.last_lookup = reqstamps.now() - t_lookup
+                else:
+                    reused, snap, tail = g._prefix_cache.lookup(prompt)
                 if snap is not None:
                     if tail:  # a session tail is handed over: the slot takes its pages
                         g.fast.adopt(snap, slot)

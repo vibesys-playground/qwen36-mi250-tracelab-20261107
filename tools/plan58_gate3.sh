@@ -1,6 +1,7 @@
 #!/bin/bash
 # Plan 58 stage 1, gate 3: the padding / hysteresis fix (1f1a052) on head 0f17705. One served
-# A/B on 8 GCDs, three rounds of off / nodeep / on / on1 (see plan58_gate2.sh), then:
+# A/B on 8 GCDs, in run order off/on/nodeep/on1/off/on/off/on (three rounds of off and on, one of
+# nodeep and on1: twelve runs overran the command job's time limit, j281), then:
 #   - mean tok/s, TPOT p50/p90, TTFT per setting over the rounds and on vs off;
 #   - per setting: steps and emitted tokens per slot-step by (requests : k), k changes,
 #     run-ahead eligibility (all steps and deep steps), KV pages, prefix-cache evictions;
@@ -13,10 +14,10 @@ OFF="ENGINE_SPEC_KMAX=3+ENGINE_SLOTS=32"
 NODEEP="ENGINE_SPEC_KMAX=7+ENGINE_SLOTS=14+ENGINE_SPEC_DEEP_MARGIN=1000"
 ON="ENGINE_SPEC_KMAX=7+ENGINE_SLOTS=14"
 ON1="ENGINE_SPEC_KMAX=7+ENGINE_SLOTS=14+ENGINE_SPEC_DEEP_SIZES=1"
-S="$OFF,$NODEEP,$ON,$ON1"
-echo "=== [ab] served A/B, 3 rounds $(date +%T)"
-timeout 9000 python -u tools/topk_epi_ab.py --settings "$S,$S,$S" 2>&1 | tee $L/ab.log \
-  | grep -v '^engine:' | grep -v '"event": "setting"' | grep -v '"kind": "identical"'
+S="$OFF,$ON,$NODEEP,$ON1,$OFF,$ON,$OFF,$ON"
+echo "=== [ab] served A/B $(date +%T)"
+timeout 1680 python -u tools/topk_epi_ab.py --settings "$S" 2>&1 | tee $L/ab.log \
+  | grep -v '^engine:' | grep -v '"kind": "identical"' | grep -v '"event": "loop_timers"' | cut -c1-420
 echo "=== [ab] exit ${PIPESTATUS[0]} $(date +%T)"
 python - $L/ab.log <<'PY'
 import json, re, statistics, sys

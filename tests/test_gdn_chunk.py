@@ -124,3 +124,51 @@ def test_chunk_strided_inputs():
     assert _err(got.cpu(), ref_o) < 3e-2
     assert _err(st.cpu(), ref_s) < 3e-2
 
+
+
+def _wy_outputs(variant, tokens, heads, hv, count, seed):
+    """The WY stage's outputs (qn, kn, w, u, gc, aqk) in the form ``variant``."""
+    from engine.fast.prefill_kernels import gdn_conv_
+
+    dev = _device()
+    qkv, conv, weight, a, b, a_log, dt_bias, _ = _inputs(tokens, heads, hv, seed)
+    meta = torch.tensor([count, 0], dtype=torch.long, device=dev) if count is not None else None
+    mixed = gdn_conv_(qkv.to(dev), conv.clone().to(dev), weight.to(dev), meta=meta)
+    outs = (
+        torch.full((tokens, heads, 128), 7.0, dtype=torch.bfloat16, device=dev),
+        torch.full((tokens, heads, 128), 7.0, dtype=torch.bfloat16, device=dev),
+        torch.full((tokens, hv, 128), 7.0, dtype=torch.bfloat16, device=dev),
+        torch.full((tokens, hv, 128), 7.0, dtype=torch.bfloat16, device=dev),
+        torch.full((tokens, hv), 7.0, dtype=torch.float32, device=dev),
+        torch.full((tokens, hv, gdn_chunk.BT), 7.0, dtype=torch.bfloat16, device=dev),
+    )
+    with kernels.on_device(mixed):
+        gdn_chunk.wy(mixed, a.to(dev), b.to(dev), a_log.to(dev), dt_bias.to(dev), meta, heads, *outs, warps=4,
+                     variant=variant)
+    return [t.cpu() for t in outs]
+
+
+@pytest.mark.parametrize("variant", [("stack", 2, 4, 64), ("split", 2, 4, 64), ("split1", 1, 4, 128),
+                                     ("split", 4, 8, 128)])
+@pytest.mark.parametrize("tokens,count", [(61, None), (130, None), (128, 100)])
+def test_wy_variants_match_fused(variant, tokens, count):
+    """Plan 54: every form of the WY stage writes what the fused kernel writes (the same
+    operations per element). Under the interpreter bitwise, except w and u of the split form:
+    numpy's matmul rounds differently by operand memory layout, which differs there. On a
+    GPU a tolerance (the reductions' order may differ with layout and warps);
+    tools/gdn_wy_bench.py reports which outputs are bitwise there."""
+    heads, hv = 2, 4
+    ref = _wy_outputs(("mono", 0, 0, 0), tokens, heads, hv, count, tokens)
+    got = _wy_outputs(variant, tokens, heads, hv, count, tokens)
+    for name, x, y in zip(("qn", "kn", "w", "u", "gc", "aqk"), got, ref):
+        if kernels.INTERPRET and (name not in ("w", "u") or variant[0] == "stack"):
+            assert torch.equal(x, y), (name, _err(x, y))
+        else:
+            assert _err(x, y) < 1e-2, (name, _err(x, y))
+
+
+@pytest.mark.parametrize("variant", ["mono", "stack", "split", "split1"])
+def test_chunk_variants_match_recurrence(variant, monkeypatch):
+    monkeypatch.setenv("ENGINE_GDN_WY", variant)
+    test_chunk_padding_rows_and_device_row(61, 128)
+    test_chunk_matches_recurrence(130, 2, 4)

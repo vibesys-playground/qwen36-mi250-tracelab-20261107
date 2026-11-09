@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import sys
 import threading
 import time
 from typing import Any
@@ -162,6 +163,12 @@ def serve(args: Any, revision: str | None, port_list: list[int]) -> None:
     from engine import server
 
     generators, gates = load(args, revision)
+    # Two pairs' worker threads (and their rank-1 threads) share this process's GIL. With the
+    # default 5 ms switch interval, a worker whose step is ready can wait that long for the
+    # other pair's host code: hand the GIL over sooner (ENGINE_PAIR_SWITCH_S; 0 keeps Python's).
+    switch = float(os.environ.get("ENGINE_PAIR_SWITCH_S", "0.0005"))
+    if switch > 0:
+        sys.setswitchinterval(switch)
     name = args.served_model_name or args.model
     servers = []
     for p, (g, gate) in enumerate(zip(generators, gates, strict=True)):

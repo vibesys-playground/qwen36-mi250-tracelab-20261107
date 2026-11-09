@@ -27,8 +27,8 @@ wait
 echo "=== split vs single"; grep -vE "Loading weights|amdgpu.ids|^\s*$|it/s\]" $L/check.log | cut -c1-1500 | tail -120
 echo "=== tests, live compiles"; grep -vE "Loading weights|amdgpu.ids|^\s*$|it/s\]" $L/tests.log | cut -c1-3000 | tail -80
 echo "=== served A/B"
-S="ENGINE_SPLIT_PREFILL=0,ENGINE_SPLIT_PREFILL=1,ENGINE_SPLIT_PREFILL=0,ENGINE_SPLIT_PREFILL=1"
-S="$S,ENGINE_SPLIT_PREFILL=1+ENGINE_SPLIT_MIN_TOKENS=1000000,ENGINE_SPLIT_PREFILL=1+ENGINE_MTP=0"
+S="${PLAN41_SETTINGS:-ENGINE_SPLIT_PREFILL=0,ENGINE_SPLIT_PREFILL=1,ENGINE_SPLIT_PREFILL=0,ENGINE_SPLIT_PREFILL=1}"
+S="$S,${PLAN41_EXTRA:-ENGINE_SPLIT_PREFILL=1+ENGINE_SPLIT_MIN_TOKENS=1000000,ENGINE_SPLIT_PREFILL=1+ENGINE_MTP=0}"
 timeout 5400 python -u tools/serve_probe.py --sessions 32 --rounds 4 --concurrency 8 \
   --first-spread 800:2600 --grow 250 --max-new 200 --wait 0.5 --corpus synthetic --settings "$S" 2>&1 \
   | grep --line-buffered -vE "Loading weights|amdgpu.ids|it/s\]" | cut -c1-6000

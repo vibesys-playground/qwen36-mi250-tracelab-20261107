@@ -579,12 +579,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, first)
             self._drain(job)
             return
+        # Plan 46: the router's pooled connection asks for a chunked stream, so the connection
+        # stays open for its next request; any other client gets the stream until close.
+        chunked = self.headers.get("X-Engine-Keepalive") == "1"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
-        self.close_connection = True
         event = first
         try:
             while event is not _DONE:
@@ -592,15 +598,19 @@ class _Handler(BaseHTTPRequestHandler):
                     payload = protocol.error_body(str(event), event.status)
                 else:
                     payload = event
-                self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+                data = b"data: " + json.dumps(payload).encode() + b"\n\n"
+                if chunked:
+                    data = b"%x\r\n%s\r\n" % (len(data), data)
+                self.wfile.write(data)
                 self.wfile.flush()
                 if job.stamps is not None and "written" not in job.stamps:
                     job.stamps["written"] = reqstamps.now()
                     reqstamps.record_request(job.stamps)
                 event = job.events.get()
-            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.write(b"e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n" if chunked else b"data: [DONE]\n\n")
             self.wfile.flush()
         except OSError:  # the client went away: stop generating for it
+            self.close_connection = True
             job.cancelled.set()
             self._drain(job)
 

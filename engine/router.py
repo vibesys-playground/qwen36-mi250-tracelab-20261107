@@ -292,15 +292,39 @@ def _die_with_parent() -> None:
         pass
 
 
+# Plan 46: keep router -> replica connections open between requests (the replica streams
+# chunked to the router), so a request takes no new connection and no new handler thread.
+KEEPALIVE = os.environ.get("ENGINE_ROUTER_KEEPALIVE", "1") == "1"
+
+
 @dataclass
 class Replica:
     index: int
     devices: tuple[int, ...]
     port: int
     process: subprocess.Popen
+    _idle: list[http.client.HTTPConnection] = field(default_factory=list)
+    _idle_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def connection(self, timeout: float | None = None) -> http.client.HTTPConnection:
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+
+    def take(self) -> tuple[http.client.HTTPConnection, bool]:
+        """An idle pooled connection (True) or a new one (False)."""
+        with self._idle_lock:
+            if self._idle:
+                return self._idle.pop(), True
+        conn = self.connection()
+        conn.connect()
+        conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return conn, False
+
+    def give_back(self, conn: http.client.HTTPConnection) -> None:
+        with self._idle_lock:
+            if len(self._idle) < 64:
+                self._idle.append(conn)
+                return
+        conn.close()
 
     def get_json(self, path: str, timeout: float = 10.0) -> dict[str, Any]:
         conn = self.connection(timeout)
@@ -488,21 +512,42 @@ class _FrontHandler(BaseHTTPRequestHandler):
 
     def _relay(self, replica: Replica, raw: bytes) -> None:
         """Send the request to ``replica`` and copy its response back as it arrives."""
-        conn = replica.connection()
+        headers = {h: self.headers[h] for h in _FORWARD_HEADERS if self.headers.get(h)}
+        headers["Content-Length"] = str(len(raw))
+        stamped = reqstamps.ENABLED
+        if stamped:
+            t_sent = reqstamps.now()
+            reqstamps.record("r_parse", t_sent - self._t_recv)
+            headers["X-Engine-Sent"] = repr(t_sent)
+        reusable = False
+        conn = None
         try:
-            headers = {h: self.headers[h] for h in _FORWARD_HEADERS if self.headers.get(h)}
-            headers["Content-Length"] = str(len(raw))
-            stamped = reqstamps.ENABLED
-            if stamped:
-                t_sent = reqstamps.now()
-                reqstamps.record("r_parse", t_sent - self._t_recv)
-                headers["X-Engine-Sent"] = repr(t_sent)
-            try:
-                conn.request("POST", self.path, body=raw, headers=headers)
-                response = conn.getresponse()
-            except OSError as exc:
-                message = f"replica {replica.index} unavailable: {exc}"
-                self._send_json(503, protocol.error_body(message, 503))
+            if KEEPALIVE:
+                headers["X-Engine-Keepalive"] = "1"
+            response = None
+            for _attempt in range(2):
+                pooled = False
+                try:
+                    if KEEPALIVE:
+                        conn, pooled = replica.take()
+                    else:
+                        conn = replica.connection()
+                    conn.request("POST", self.path, body=raw, headers=headers)
+                    response = conn.getresponse()
+                    break
+                except OSError as exc:
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    # A pooled connection the replica closed while idle fails before the replica
+                    # reads the request (no response at all): send it again on a new one.
+                    if pooled and isinstance(exc, (ConnectionError, http.client.RemoteDisconnected)):
+                        continue
+                    message = f"replica {replica.index} unavailable: {exc}"
+                    self._send_json(503, protocol.error_body(message, 503))
+                    return
+            if response is None:
+                self._send_json(503, protocol.error_body(f"replica {replica.index} unavailable", 503))
                 return
             self.send_response(response.status)
             for name in _RETURN_HEADERS:
@@ -513,7 +558,9 @@ class _FrontHandler(BaseHTTPRequestHandler):
             if size is not None:
                 self.send_header("Content-Length", size)
                 self.end_headers()
-                self.wfile.write(response.read())
+                body = response.read()
+                reusable = KEEPALIVE and not response.will_close
+                self.wfile.write(body)
                 return
             # A stream: no length, ends when the replica closes it. Pass each piece on at once.
             self.send_header("Connection", "close")
@@ -531,10 +578,16 @@ class _FrontHandler(BaseHTTPRequestHandler):
                         reqstamps.record("r_upstream", t_first - t_sent)
                         reqstamps.record("r_relay", t_out - t_first)
                         reqstamps.record("r_total", t_out - self._t_recv)
-            except OSError:  # the client went away; closing our side cancels the replica's job
+                # The whole response was read: the connection can take another request.
+                reusable = KEEPALIVE and not response.will_close
+            except (OSError, http.client.HTTPException):  # client gone (or replica): close both
                 pass
         finally:
-            conn.close()
+            if conn is not None:
+                if reusable:
+                    replica.give_back(conn)
+                else:
+                    conn.close()
 
 
 def serve(

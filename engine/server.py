@@ -579,18 +579,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, first)
             self._drain(job)
             return
-        # Plan 46: the router's pooled connection asks for a chunked stream, so the connection
-        # stays open for its next request; any other client gets the stream until close.
-        chunked = self.headers.get("X-Engine-Keepalive") == "1"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        if chunked:
-            self.send_header("Transfer-Encoding", "chunked")
-        else:
-            self.send_header("Connection", "close")
-            self.close_connection = True
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         event = first
         try:
             while event is not _DONE:
@@ -598,19 +592,15 @@ class _Handler(BaseHTTPRequestHandler):
                     payload = protocol.error_body(str(event), event.status)
                 else:
                     payload = event
-                data = b"data: " + json.dumps(payload).encode() + b"\n\n"
-                if chunked:
-                    data = b"%x\r\n%s\r\n" % (len(data), data)
-                self.wfile.write(data)
+                self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
                 self.wfile.flush()
                 if job.stamps is not None and "written" not in job.stamps:
                     job.stamps["written"] = reqstamps.now()
                     reqstamps.record_request(job.stamps)
                 event = job.events.get()
-            self.wfile.write(b"e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n" if chunked else b"data: [DONE]\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except OSError:  # the client went away: stop generating for it
-            self.close_connection = True
             job.cancelled.set()
             self._drain(job)
 
@@ -724,11 +714,6 @@ def main(argv: list[str] | None = None) -> None:
         experts_impl=args.experts_implementation,
     )
     server = _Server((args.host, args.port), generator, args.served_model_name or args.model)
-    switch_us = os.environ.get("ENGINE_SWITCH_INTERVAL_US", "").strip()
-    if switch_us:
-        # Plan 46 probe: a shorter GIL switch interval, so an HTTP handler thread waiting for
-        # the GIL gets it sooner from the engine thread (and the other way round).
-        sys.setswitchinterval(float(switch_us) * 1e-6)
     if gpus:
         per_gpu = ", ".join(
             f"{d}: {torch.cuda.memory_allocated(d) / 2**30:.1f} GiB" for d in range(gpus)

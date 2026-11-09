@@ -273,9 +273,9 @@ def test_errors_and_non_streaming_pass_through(front: str) -> None:
     _ = router  # imported for the module under test
 
 
-def test_pooled_replica_connections_survive_a_client_that_leaves(front: str) -> None:
-    """Plan 46: router -> replica connections are reused; a client leaving mid-stream closes
-    its upstream connection (cancelling the job) and later requests still stream whole."""
+def test_a_client_that_leaves_does_not_disturb_later_requests(front: str) -> None:
+    """A client leaving mid-stream cancels its job; later requests (token ids and growing
+    text prompts, tokenized incrementally) still stream whole."""
     prompt = [11 + (i * 7) % 300 for i in range(2 * CHUNK + 3)]
     want, _ = _completion(front, prompt, 12)
     body = {"prompt": prompt, "max_tokens": 64, "temperature": 0, "ignore_eos": True,

@@ -9,9 +9,10 @@
 #   GCD 0,1  spec == plain greedy, 8 sequences (tools/spec_step_bench.py), defaults
 #   GCD 4,5  served replay-like load with every Triton compile logged: 0 after /health
 # Phase B, whole node (4 x TP2), text prompts growing as the replay's (48 sessions, 8 at a
-#   time, 1800 + 300 new, 190 out): A/B without stamps, head path (ENGINE_REQ_FAST=0,
-#   ENGINE_ROUTER_KEEPALIVE=0) then the candidate defaults, then the reverse order; then the
-#   candidate with stamps and every prompt checked against the full encode.
+#   time, 1800 + 300 new, 190 out): A/B without stamps, tokenizing on the engine thread with
+#   full encodes (ENGINE_REQ_FAST=0) then the candidate default, then the reverse order; then
+#   the candidate with stamps and every prompt checked against the full encode. (The vocab
+#   check fix in Generator._validate is on in both.)
 set -x
 (python -c "import pytest" 2>/dev/null || pip install -q pytest)
 L=/tmp/p46-logs
@@ -28,8 +29,8 @@ echo "=== live compiles"; grep -vE "Loading weights|amdgpu.ids|^\s*$" $L/compile
 echo "=== tracebacks"; for f in $L/*.log; do grep -B2 -A25 Traceback $f | head -60; done
 
 P="timeout 1500 python -u tools/serve_probe.py --sessions 48 --concurrency 8 --rounds 6.3 --first 1800 --grow 300 --max-new 190 --corpus synthetic --text"
-OFF=ENGINE_REQ_FAST=0+ENGINE_ROUTER_KEEPALIVE=0
-ON=ENGINE_REQ_FAST=1+ENGINE_ROUTER_KEEPALIVE=1
+OFF=ENGINE_REQ_FAST=0
+ON=ENGINE_REQ_FAST=1
 echo "=== served A/B: head path then candidate"
 $P --settings $OFF,$ON 2>&1 | grep -v '^engine:' | grep -E '"event": "(setting|agreement)"' | sed 's/"health": .*"engine"/"engine"/'
 echo "=== served A/B: candidate then head path"

@@ -83,16 +83,34 @@ def rounds_of(index: int, args) -> int:
     return max(1, math.floor((index + 1) * args.rounds) - math.floor(index * args.rounds))
 
 
+def first_of(index: int, args) -> int:
+    """Session ``index``'s first prompt length: ``--first``, or with ``--first-spread lo:hi``
+    spread evenly over [lo, hi] in a fixed shuffled order."""
+    if not getattr(args, "first_spread", None):
+        return args.first
+    lo, hi = (int(x) for x in args.first_spread.split(":"))
+    n = max(args.sessions, 2)
+    k = (index * 5 + 3) % n if n % 5 else index
+    return lo + (hi - lo) * k // (n - 1)
+
+
 def session(url: str, pool: list[int], index: int, args) -> list[dict]:
     rounds = rounds_of(index, args)
-    span = args.first + rounds * args.grow
-    stride = args.first + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
+    first = first_of(index, args)
+    span = first + rounds * args.grow
+    spread = getattr(args, "first_spread", None)
+    top = max(args.first, int(spread.split(":")[1]) if spread else 0)
+    stride = top + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
     offset = (index * stride) % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
-    prompt = fresh[: args.first]
-    used = args.first
+    prompt = fresh[:first]
+    used = first
     out = []
+    if getattr(args, "stagger", 0):
+        time.sleep(index * args.stagger)
     for r in range(rounds):
+        if r and getattr(args, "wait", 0):
+            time.sleep(args.wait)
         body = {
             "prompt": prompt,
             "max_tokens": args.max_new,
@@ -206,6 +224,9 @@ def main() -> None:
     )
     parser.add_argument("--first", type=int, default=2000)
     parser.add_argument("--grow", type=int, default=300)
+    parser.add_argument("--first-spread", default=None, help="lo:hi first-prompt lengths over sessions")
+    parser.add_argument("--stagger", type=float, default=0.0, help="seconds between session starts")
+    parser.add_argument("--wait", type=float, default=0.0, help="seconds between a session's rounds")
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
     parser.add_argument(
@@ -224,23 +245,26 @@ def main() -> None:
 
     model = args.model or CHECKPOINT["model"]
     revision = None if args.model else CHECKPOINT["revision"]
-    need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
+    top = max(args.first, int(args.first_spread.split(":")[1]) if args.first_spread else 0)
+    need = args.sessions * (top + math.ceil(args.rounds) * args.grow) + 1
     pool = token_pool(model, revision, need, args.corpus)
     print(json.dumps({"event": "shape", **vars(args)}), flush=True)
-    outputs = {}
+    runs = []
     for setting in args.settings.split(","):
-        outputs[setting] = serve_and_run(None if setting == "default" else setting, args.port, args, pool)
-    names = list(outputs)
-    if len(names) == 2:
-        a, b = outputs[names[0]], outputs[names[1]]
-        same = sum(a[k] == b[k] for k in a)
-        first_div = []
-        for k in a:
-            n = next((i for i, (x, y) in enumerate(zip(a[k], b[k])) if x != y), None)
-            if n is not None:
-                first_div.append(n)
-        print(json.dumps({"event": "agreement", "identical_requests": same, "requests": len(a),
-                          "first_divergence_positions": sorted(first_div)[:16]}), flush=True)
+        runs.append((setting, serve_and_run(None if setting == "default" else setting, args.port, args, pool)))
+    # Token agreement between every two runs (a repeated setting: across processes).
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs)):
+            (na, a), (nb, b) = runs[i], runs[j]
+            same = sum(a[k] == b[k] for k in a)
+            first_div = []
+            for k in a:
+                n = next((i for i, (x, y) in enumerate(zip(a[k], b[k])) if x != y), None)
+                if n is not None:
+                    first_div.append(n)
+            print(json.dumps({"event": "agreement", "a": f"{i}:{na}", "b": f"{j}:{nb}",
+                              "identical_requests": same, "requests": len(a),
+                              "first_divergence_positions": sorted(first_div)[:16]}), flush=True)
 
 
 if __name__ == "__main__":

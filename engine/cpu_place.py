@@ -263,6 +263,20 @@ def replica_slices(layout: list[tuple[int, ...]]) -> tuple[list[Slice], list[int
     return slices, leftover
 
 
+def merge(pieces: list[Slice]) -> Slice:
+    """One process's slice for several replicas (``engine.pair_host``): their CPUs together,
+    their rank cores in order (replica 0's ranks, then replica 1's)."""
+    if len(pieces) == 1:
+        return pieces[0]
+    nodes = {p.node for p in pieces}
+    return Slice(
+        [c for p in pieces for c in p.cpus],
+        [c for p in pieces for c in p.ranks],
+        [c for p in pieces for c in p.rest],
+        nodes.pop() if len(nodes) == 1 else None,
+    )
+
+
 def child_env(env: dict[str, str], s: Slice) -> dict[str, str]:
     out = dict(env)
     out["ENGINE_CPUS"] = format_list(s.cpus)

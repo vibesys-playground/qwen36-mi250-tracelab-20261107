@@ -34,7 +34,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from engine import cpu_place, experts, protocol, router
+from engine import cpu_place, experts, pair_host, protocol, router, split_prefill
 from engine.generator import CHECKPOINT, Generation, Generator, PackedPrefill, Step
 from engine.protocol import (
     ChatRequest,
@@ -92,9 +92,13 @@ class Worker:
     prefilled alone (``Generator.start``) before the decode step, as before.
     """
 
-    def __init__(self, generator: Generator) -> None:
+    def __init__(self, generator: Generator, gate: Any = None, rank: int = 0) -> None:
         self._generator = generator
         self._jobs: queue.Queue[Job] = queue.Queue()
+        # A split-prefill host's pair (``engine.split_prefill``): each loop iteration is a turn,
+        # between which another pair may borrow this one; ``rank`` is its first rank core.
+        self._gate = gate if gate is not None else split_prefill.NoGate()
+        self._rank = rank
         threading.Thread(target=self._loop, name="engine-worker", daemon=True).start()
 
     def submit(self, job: Job) -> None:
@@ -142,7 +146,8 @@ class Worker:
         events.close()  # type: ignore[attr-defined]
 
     def _loop(self) -> None:
-        cpu_place.pin_rank(0)  # this thread drives rank 0 (and the whole replica on one GPU)
+        cpu_place.pin_rank(self._rank)  # this thread drives rank 0 (and the whole replica on one GPU)
+        gate = self._gate
         g = self._generator
         packer = PackedPrefill(g) if g.packing else None
         prefilling: dict[int, tuple[Job, Iterator[Any]]] = {}
@@ -151,12 +156,15 @@ class Worker:
             block = not running and not prefilling
             ready: list[tuple[Job, Iterator[Any], Generation]] = []
             serial: list[tuple[Job, Iterator[Any], Prefill]] = []
+            gate.leave()  # between turns: another pair may borrow this one now
+            first = self._jobs.get() if block else None  # idle: wait for a job outside a turn
+            gate.enter()
             while True:
                 try:
-                    job = self._jobs.get(block=block)
+                    job = first if first is not None else self._jobs.get(block=False)
                 except queue.Empty:
                     break
-                block = False
+                first = None
                 events = job.run()
                 want = self._advance(job, events)
                 if not isinstance(want, Prefill):
@@ -170,7 +178,7 @@ class Worker:
             if packer is not None:
                 for ticket, exc in packer.failed():
                     self._fail(*prefilling.pop(ticket), exc)
-                if packer.busy:
+                if packer.busy and gate.may_prefill():
                     for ticket, result in packer.step():
                         job, events = prefilling.pop(ticket)
                         if isinstance(result, Exception):
@@ -456,11 +464,18 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], generator: Generator, model_name: str) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        generator: Generator,
+        model_name: str,
+        gate: Any = None,
+        rank: int = 0,
+    ) -> None:
         super().__init__(address, _Handler)
         self.generator = generator
         self.model_name = model_name
-        self.worker = Worker(generator)
+        self.worker = Worker(generator, gate, rank)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -536,6 +551,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     import torch
 
+    revision = args.revision
+    if revision is None and args.model == CHECKPOINT["model"]:
+        revision = CHECKPOINT["revision"]
+    pair_ports = pair_host.ports()
+    if pair_ports:  # two replicas in this process (split prefill; see engine.pair_host)
+        pair_host.serve(args, revision, pair_ports)
+        return
     gpus = router.visible_gpus()
     layout = router.resolve_layout(
         gpus, args.replicas, args.gpus_per_replica, args.replica_devices or None
@@ -543,9 +565,6 @@ def main(argv: list[str] | None = None) -> None:
     if len(layout) > 1 or (gpus and len(layout[0]) < gpus):
         router.serve(argv, args.host, args.port, layout, hip=bool(torch.version.hip))
         return
-    revision = args.revision
-    if revision is None and args.model == CHECKPOINT["model"]:
-        revision = CHECKPOINT["revision"]
     generator = Generator.load(
         args.model,
         revision,

@@ -315,17 +315,33 @@ class Replica:
             conn.close()
 
 
+def hosts(layout: list[tuple[int, ...]]) -> list[list[int]]:
+    """Which replicas share a process: with split prefill on (``engine.split_prefill``,
+    ``ENGINE_SPLIT_PREFILL``) and an even number of 2-GPU replicas, consecutive replicas two by
+    two (``engine.pair_host``); otherwise one process per replica."""
+    from engine import split_prefill
+
+    pairs = len(layout) >= 2 and len(layout) % 2 == 0 and all(len(g) == 2 for g in layout)
+    if split_prefill.enabled() and pairs:
+        return [[i, i + 1] for i in range(0, len(layout), 2)]
+    return [[i] for i in range(len(layout))]
+
+
 def start_replicas(
     argv: Sequence[str], layout: list[tuple[int, ...]], hip: bool
 ) -> list[Replica]:
-    """Launch one ``engine.server`` process per device group, all loading at once, each on its
-    own slice of host cores (``engine.cpu_place``) when the topology allows."""
+    """Launch one ``engine.server`` process per device group (or per two, ``hosts``), all
+    loading at once, each on its own slice of host cores (``engine.cpu_place``) when the
+    topology allows."""
     from engine import cpu_place
 
     placed = cpu_place.replica_slices(layout) if layout and any(layout) else None
     replicas = []
-    for index, devices in enumerate(layout):
-        port = _free_port()
+    for members in hosts(layout):
+        index = members[0]
+        devices = tuple(d for m in members for d in layout[m])
+        member_ports = [_free_port() for _ in members]
+        port = member_ports[0]
         command = [
             sys.executable,
             "-m",
@@ -342,18 +358,24 @@ def start_replicas(
         ]
         env = device_env(dict(os.environ), devices, hip)
         env["ENGINE_REPLICA_INDEX"] = str(index)
+        env.pop("ENGINE_PAIR_PORTS", None)
+        if len(members) > 1:
+            env["ENGINE_PAIR_PORTS"] = ",".join(map(str, member_ports))
         preexec = _die_with_parent
         if placed is not None:
-            piece = placed[0][index]
+            piece = cpu_place.merge([placed[0][m] for m in members])
             env = cpu_place.child_env(env, piece)
             preexec = _chain(cpu_place.preexec(piece), _die_with_parent)
         else:
             env.pop("ENGINE_CPUS", None)
             env.pop("ENGINE_RANK_CPUS", None)
         where = ",".join(map(str, devices)) or "cpu"
-        print(f"router: starting replica {index} on devices {where}, port {port}", flush=True)
+        names = ",".join(map(str, members))
+        print(f"router: starting replica {names} on devices {where}, port "
+              f"{','.join(map(str, member_ports))}", flush=True)
         process = subprocess.Popen(command, env=env, preexec_fn=preexec)  # noqa: PLW1509
-        replicas.append(Replica(index, devices, port, process))
+        for m, p in zip(members, member_ports, strict=True):
+            replicas.append(Replica(m, layout[m], p, process))
     if placed is not None:
         cpu_place.pin_router(placed[1])
     return replicas

@@ -167,3 +167,82 @@ def test_tile_table_one_program_bitwise(tokens, bm, mode):
             mp.build_tiles(counts, meta[0], meta[1], table, max_tiles, bm, one=one)
         out.append((meta.cpu(), table.cpu()))
     assert torch.equal(out[0][0], out[1][0]) and torch.equal(out[0][1], out[1][1])
+
+
+def _pair_buffers(x, idx, gate_up, down, cfg):
+    """The grouped path's bookkeeping and act (``moe_prefill``'s steps), for the down tests."""
+    tokens, k = idx.shape
+    experts, two_i, hidden = gate_up.shape
+    inter = two_i // 2
+    pairs = tokens * k
+    dev = x.device
+    ids = idx.reshape(-1)
+    order = torch.argsort(ids, stable=True).to(torch.int32)
+    counts = torch.zeros(experts, dtype=torch.int32, device=dev)
+    counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
+    meta = torch.empty((2, experts), dtype=torch.int32, device=dev)
+    max_tiles = -(-pairs // cfg.bm) + experts
+    table = torch.empty(3 * max_tiles + 1, dtype=torch.int32, device=dev)
+    act = torch.empty((pairs, inter), dtype=torch.bfloat16, device=dev)
+    bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
+    with kernels.on_device(x):
+        mp.build_tiles(counts, meta[0], meta[1], table, max_tiles, cfg.bm)
+        mp._gate_up_kernel[(max_tiles, -(-inter // bn1))](
+            x, gate_up, order, table, act, gate_up.stride(0), gate_up.stride(1), max_tiles,
+            H=hidden, I=inter, TOP_K=k, BLOCK_M=cfg.bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=mp._WIDEN,
+            **mp.launch_options(cfg.gate_up),
+        )
+    return act, order, table, max_tiles
+
+
+@pytest.mark.skipif(_device() is None, reason="needs Triton (GPU or TRITON_INTERPRET=1)")
+@pytest.mark.parametrize("inter", [128, 256])
+@pytest.mark.parametrize("n", [5, 17, 300])
+@pytest.mark.parametrize("mode", ["uniform", "skewed", "sparse"])
+@pytest.mark.parametrize("scfg", [None, "64,2,4,1", "128,4,4,2", "256,2,8,1,16,2", "128,8,4,2,16,0"])
+def test_down_stream_bitwise(monkeypatch, inter, n, mode, scfg):
+    """Plan 60: ``_down_stream_kernel`` writes the pair buffer of ``_down_kernel`` bit for
+    bit (the same BLOCK_K dots in the same order), with empty experts (sparse), one expert
+    over 256 rows (skewed, n=300) and every bucket's BLOCK_M (n=5: 16, else 64)."""
+    if scfg:
+        monkeypatch.setenv("ENGINE_MOE_DOWN_STREAM_CFG", scfg)
+    else:
+        monkeypatch.delenv("ENGINE_MOE_DOWN_STREAM_CFG", raising=False)
+    dev = _device()
+    e, h, k = 8, 1024, 4
+    m = _Experts(e, h, inter, seed=n).to(dev)
+    g = torch.Generator().manual_seed(n + inter)
+    x = torch.randn(n, h, generator=g).bfloat16().to(dev)
+    idx, w = _routing(n, e, k, mode, g)
+    idx, w = idx.to(dev), w.to(dev)
+    pairs = n * k
+    cfg = mp.config(pairs, e)
+    act, order, table, max_tiles = _pair_buffers(x, idx, m.gate_up_proj, m.down_proj, cfg)
+    outs = []
+    for stream in (False, True, True):
+        out = torch.full((pairs, h), float("nan"), dtype=torch.bfloat16, device=dev)
+        with kernels.on_device(x):
+            mp.launch_down(act, m.down_proj, order, table, out, max_tiles, cfg, pairs, stream=stream)
+        outs.append(out.cpu())
+    assert not torch.isnan(outs[0].float()).any()
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[1], outs[2])
+    if mode == "skewed" and n == 300:
+        assert int(torch.bincount(idx.reshape(-1).cpu()).max()) > 256
+    # The whole routed output through ``moe_prefill`` with the stream kernel on and off.
+    monkeypatch.setattr(mp, "_DOWN_STREAM", False)
+    y0 = mp.moe_prefill(x, idx, w, m.gate_up_proj, m.down_proj)
+    monkeypatch.setattr(mp, "_DOWN_STREAM", True)
+    y1 = mp.moe_prefill(x, idx, w, m.gate_up_proj, m.down_proj)
+    assert torch.equal(y0, y1)
+
+
+def test_stream_config_buckets(monkeypatch):
+    """One ``StreamConfig`` per ``BUCKETS`` entry, picked from the token count alone."""
+    monkeypatch.delenv("ENGINE_MOE_DOWN_STREAM_CFG", raising=False)
+    e, k = 256, 8
+    assert len(mp.STREAM_BUCKETS) == len(mp.BUCKETS)
+    for t in mp.bucket_tokens(k, e, 4096):
+        i = [c for _, c in mp.BUCKETS].index(mp.config(t * k, e))
+        assert mp.stream_config(t * k, e) == mp.STREAM_BUCKETS[i]
+    monkeypatch.setenv("ENGINE_MOE_DOWN_STREAM_CFG", "128,4,8,2")
+    assert mp.stream_config(561 * k, e) == mp.StreamConfig(128, 4, 8, 2)

@@ -113,7 +113,6 @@ def env() -> int:
         from engine.fast import hipmega_rtc as rtc
 
         src = r'''
-#include <hip/hip_runtime.h>
 extern "C" __global__ void axpy(float* o, const float* x, const float* y, float a, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) o[i] = a * x[i] + y[i];

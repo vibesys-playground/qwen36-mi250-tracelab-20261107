@@ -15,6 +15,15 @@ prompt tokens and /health, then (for two settings) how many requests produced
 identical tokens in both. ``--corpus synthetic`` uses the replay's own synthetic
 code lines instead of the Transformers source. A hint for the lead, not the
 task's metric.
+
+``--shapes uniform,uneven`` runs several load passes on each started server
+(``--pass-gap`` seconds apart) and reports each pass on its own, including the
+router's per-replica in-flight histogram for that pass. ``uneven`` draws each
+session's shape from a seeded generic distribution (``--seed``): rounds
+geometric with mean ``--rounds``, first prompt log-normal around ``--first``,
+each round's output log-normal around ``--max-new``, and an exponential tool
+wait of mean ``--tool-wait`` seconds before each later round. These are
+synthetic, chosen without any recorded trace; every setting sees the same draws.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import argparse
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -83,19 +93,47 @@ def rounds_of(index: int, args) -> int:
     return max(1, math.floor((index + 1) * args.rounds) - math.floor(index * args.rounds))
 
 
-def session(url: str, pool: list[int], index: int, args) -> list[dict]:
-    rounds = rounds_of(index, args)
-    span = args.first + rounds * args.grow
-    stride = args.first + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
-    offset = (index * stride) % max(1, len(pool) - span)
+def plan_sessions(shape: str, args) -> list[dict]:
+    """Per session: first-prompt length, each round's output length and the wait before it,
+    and the session's token offset in the pool (sessions do not share tokens)."""
+    rng = random.Random(args.seed)
+    plans = []
+    offset = 0
+    for index in range(args.sessions):
+        if shape == "uneven":
+            rounds = 1
+            while rounds < 4 * args.rounds and rng.random() > 1 / args.rounds:
+                rounds += 1
+            first = int(min(max(rng.lognormvariate(math.log(args.first), 0.6), 256), 4 * args.first))
+            outs = [int(min(max(rng.lognormvariate(math.log(args.max_new), 0.8), 16),
+                            4 * args.max_new)) for _ in range(rounds)]
+            waits = [0.0] + [min(rng.expovariate(1 / args.tool_wait), 3 * args.tool_wait)
+                             if args.tool_wait > 0 else 0.0 for _ in range(rounds - 1)]
+        else:
+            rounds = rounds_of(index, args)
+            first = args.first
+            outs = [args.max_new] * rounds
+            waits = [0.0] * rounds
+        plans.append({"first": first, "outs": outs, "waits": waits, "offset": offset})
+        # uniform: the original fixed stride per session; uneven: packed one after another
+        offset += (first + rounds * args.grow if shape == "uneven"
+                   else args.first + math.ceil(args.rounds) * args.grow)
+    return plans
+
+
+def session(url: str, pool: list[int], index: int, args, plan: dict, shape: str) -> list[dict]:
+    span = plan["first"] + len(plan["outs"]) * args.grow
+    offset = plan["offset"] % max(1, len(pool) - span)
     fresh = pool[offset : offset + span]
-    prompt = fresh[: args.first]
-    used = args.first
+    prompt = fresh[: plan["first"]]
+    used = plan["first"]
     out = []
-    for r in range(rounds):
+    for r, (max_new, wait) in enumerate(zip(plan["outs"], plan["waits"], strict=True)):
+        if wait:
+            time.sleep(wait)
         body = {
             "prompt": prompt,
-            "max_tokens": args.max_new,
+            "max_tokens": max_new,
             "temperature": 0,
             "ignore_eos": True,
             "return_token_ids": True,
@@ -103,8 +141,8 @@ def session(url: str, pool: list[int], index: int, args) -> list[dict]:
             "stream_options": {"include_usage": True},
         }
         res = stream(url, body)
-        assert len(res["ids"]) == args.max_new, (len(res["ids"]), args.max_new)
-        res["key"] = f"s{index}r{r}"
+        assert len(res["ids"]) == max_new, (len(res["ids"]), max_new)
+        res["key"] = f"{shape}:s{index}r{r}"
         out.append(res)
         prompt = prompt + res["ids"] + fresh[used : used + args.grow]
         used += args.grow
@@ -154,17 +192,52 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
                 pass
             time.sleep(2)
         load_s = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        with ThreadPoolExecutor(args.concurrency or args.sessions) as ex:
-            results = [r for s in ex.map(lambda i: session(url, pool, i, args), range(args.sessions)) for r in s]
-        wall = time.perf_counter() - t0
-        health = httpx.get(url + "/health", timeout=30).json()
+        outputs: dict[str, list[int]] = {}
+        before = httpx.get(url + "/health", timeout=30).json()
+        for number, shape in enumerate(args.shapes.split(",")):
+            if number:
+                time.sleep(args.pass_gap)  # let the router's idle window lapse between passes
+                before = httpx.get(url + "/health", timeout=30).json()
+            plans = plan_sessions(shape, args)
+            t0 = time.perf_counter()
+            with ThreadPoolExecutor(args.concurrency or args.sessions) as ex:
+                results = [r for s in ex.map(lambda i: session(url, pool, i, args, plans[i], shape),
+                                             range(args.sessions)) for r in s]
+            wall = time.perf_counter() - t0
+            health = httpx.get(url + "/health", timeout=30).json()
+            report(setting, shape, load_s, wall, results, health, before, log)
+            outputs.update({r["key"]: r["ids"] for r in results})
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
             proc.kill()
+    return outputs
+
+
+def router_delta(health: dict, before: dict) -> dict | None:
+    """The router's in-flight histogram over one pass: ``after - before``, per replica."""
+    after, start = health.get("router"), before.get("router")
+    if not after:
+        return None
+    hist = []
+    for r, h in enumerate(after["inflight_seconds"]):
+        b = start["inflight_seconds"][r] if start else []
+        hist.append([round(t - (b[i] if i < len(b) else 0.0), 2) for i, t in enumerate(h)])
+    total = sum(sum(h) for h in hist)
+    busy = sum(sum(h[1:]) for h in hist)
+    over = sum(sum(h[3:]) for h in hist)
+    return {
+        "inflight_seconds": hist,
+        "share_over_2": round(over / total, 4) if total else 0.0,
+        "share_over_2_of_busy": round(over / busy, 4) if busy else 0.0,
+        "max_inflight": [max((i for i, t in enumerate(h) if t > 0), default=0) for h in hist],
+        "idle_seconds": after.get("idle_seconds"),
+    }
+
+
+def report(setting, shape, load_s, wall, results, health, before, log) -> None:
     tpot = [(r["times"][-1] - r["times"][0]) * 1e3 / (len(r["times"]) - 1)
             for r in results if len(r["times"]) > 1]
     ttft = [(r["times"][0] - r["start"]) * 1e3 for r in results if r["times"]]
@@ -186,7 +259,8 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
         print(json.dumps({"event": "loop_timers", "setting": setting or "default",
                           "replica": index, **timers}), flush=True)
     print(json.dumps({
-        "event": "setting", "setting": setting or "default", "load_s": round(load_s, 1),
+        "event": "setting", "setting": setting or "default", "shape": shape,
+        "router_pass": router_delta(health, before), "load_s": round(load_s, 1),
         "wall_s": round(wall, 2), "requests": len(results), "output_tokens": tokens,
         "output_tok_per_s": round(tokens / wall, 2),
         "tpot_ms_p50": pct(tpot, 0.5), "tpot_ms_p90": pct(tpot, 0.9),
@@ -200,7 +274,6 @@ def serve_and_run(setting: str | None, port: int, args, pool) -> dict[str, list[
         "prefill_passes_per_request": per_request(health, "prefill_passes", len(results)),
         "cached_prompt_tokens": cached, "health": health, "engine": engine_lines[:4],
     }), flush=True)
-    return {r["key"]: r["ids"] for r in results}
 
 
 def main() -> None:
@@ -215,6 +288,13 @@ def main() -> None:
     parser.add_argument("--grow", type=int, default=300)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--port", type=int, default=18431)
+    parser.add_argument("--shapes", default="uniform",
+                        help="comma-separated load passes per server: uniform or uneven")
+    parser.add_argument("--pass-gap", type=float, default=12.0,
+                        help="seconds between passes on one server")
+    parser.add_argument("--seed", type=int, default=0, help="uneven shape's draws")
+    parser.add_argument("--tool-wait", type=float, default=0.0,
+                        help="uneven shape: mean seconds before each later round")
     parser.add_argument(
         "--corpus",
         choices=("source", "synthetic"),
@@ -231,7 +311,11 @@ def main() -> None:
 
     model = args.model or CHECKPOINT["model"]
     revision = None if args.model else CHECKPOINT["revision"]
-    need = args.sessions * (args.first + math.ceil(args.rounds) * args.grow) + 1
+    need = max(
+        args.sessions * (args.first + math.ceil(args.rounds) * args.grow),
+        *(sum(p["first"] + len(p["outs"]) * args.grow for p in plan_sessions(shape, args))
+          for shape in args.shapes.split(",")),
+    ) + 1
     pool = token_pool(model, revision, need, args.corpus)
     print(json.dumps({"event": "shape", **vars(args)}), flush=True)
     outputs = {}

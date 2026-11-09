@@ -111,3 +111,21 @@ def migrate_entry(model: _Rank, snap: Snapshot):
     from engine.generator import _FastEntry
 
     return _FastEntry(snap, model.snapshot_bytes(snap), tail=True)
+
+
+def test_streamed_channel_round_trip() -> None:
+    src, dst = _Rank(32, 0), _Rank(32, 1)
+    snap = _snapshot(src, 9 * PAGE + 5, row=3)
+    bufs = migrate.staging(src, snap.length)
+    manifest = migrate.export_into(src, snap, bufs)
+    channel = migrate.HostChannel(4 * manifest.rank_bytes[0] + 8192, ranks=1)
+    for seq in (1, 2):  # a later move on the same channel
+        channel.put_stream(manifest, bufs, seq, chunk=4096)
+        landed = migrate.staging(dst, snap.length)
+        channel.get_stream(migrate.plan(dst, snap.length), landed, seq, chunk=4096, timeout=1.0)
+        got = migrate.import_from(dst, manifest, landed)
+        for (sk, _), (dk, _) in zip(src.kv.values(), dst.kv.values(), strict=True):
+            assert torch.equal(sk[snap.pages], dk[got.pages])
+        dst.release(got)
+    with pytest.raises(TimeoutError):  # nothing published for move 3
+        channel.get_stream(manifest, migrate.staging(dst, snap.length), 3, chunk=4096, timeout=0.05)

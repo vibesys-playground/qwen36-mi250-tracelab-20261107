@@ -164,34 +164,35 @@ class Replica:
             raise RuntimeError(f"no session tail at the {len(key)}-token key")
         return snap
 
-    def export_host(self, key: list[int], sha: bool = True) -> dict:
+    def export(self, kind: str, key: list[int], seq: int = 0) -> dict:
+        """Move ``key``'s tail out by ``kind`` (host, stream or ipc); A's engine thread is busy
+        for ``export_ms``. Digests are taken afterwards (``digest``), outside the timing."""
         snap = self.tail(key)
+        bufs = self.ipc_export.bufs if kind == "ipc" else self.staging
         t0 = now_ns()
+        out = {}
         with self.torch.inference_mode():
-            manifest = self.migrate.export_into(self.fast, snap, self.staging)
-            self.sync()
-            t1 = now_ns()
-            self.channel.put(manifest, self.staging)
-        t2 = now_ns()
-        return {**_wire(manifest), "t0": t0, "t_end": t2, "pack_ms": ms(t1 - t0),
-                "d2h_ms": ms(t2 - t1), "export_ms": ms(t2 - t0),
-                "sha": self.sha(manifest, self.staging) if sha else None}
+            manifest = self.migrate.export_into(self.fast, snap, bufs)
+            if kind == "host":
+                self.sync()
+                out["pack_ms"] = ms(now_ns() - t0)
+                self.channel.put(manifest, bufs)
+            elif kind == "stream":
+                self.channel.put_stream(manifest, bufs, seq)
+            else:
+                self.ipc_export.publish(manifest)
+        t1 = now_ns()
+        self._last = (manifest, bufs)
+        return {**_wire(manifest), **out, "t0": t0, "t_end": t1, "export_ms": ms(t1 - t0)}
+
+    def digest(self) -> list[str]:
+        manifest, bufs = self._last
+        return self.sha(manifest, bufs)
 
     def ipc_handles(self) -> dict:
         self.ipc_export = self.migrate.IpcExport(self.fast, CAPACITY_TOKENS)
         return {"handles": self.ipc_export.handles(), "wrapped": self.ipc_export.wrapped,
                 "wrap_error": self.ipc_export.wrap_error}
-
-    def export_ipc(self, key: list[int], sha: bool = True) -> dict:
-        snap = self.tail(key)
-        ipc = self.ipc_export
-        t0 = now_ns()
-        with self.torch.inference_mode():
-            manifest = self.migrate.export_into(self.fast, snap, ipc.bufs)
-            ipc.publish(manifest)
-        t1 = now_ns()
-        return {**_wire(manifest), "t0": t0, "t_end": t1, "export_ms": ms(t1 - t0),
-                "sha": self.sha(manifest, ipc.bufs) if sha else None}
 
     # ------------------------------------------------------------------ target side
 
@@ -200,14 +201,21 @@ class Replica:
         self.ipc_import = self.migrate.IpcImport(self.fast, handles)
         return {"open_ms": ms(now_ns() - t0)}
 
-    def import_(self, kind: str, manifest, key: list[int] | None, keep: bool, sha: bool = True) -> dict:
+    def import_(self, kind: str, manifest=None, length: int = 0, key: list[int] | None = None,
+                keep: bool = False, seq: int = 0) -> dict:
+        """Take a tail in by ``kind``; ``stream`` needs only the length (the layout is this
+        replica's own ``plan``) and starts before the source does."""
         torch = self.torch
         if isinstance(manifest, bytes):
             manifest = pickle.loads(manifest)
+        if manifest is None:
+            manifest = self.migrate.plan(self.fast, length)
         t0 = now_ns()
         with torch.inference_mode():
             if kind == "host":
                 self.channel.get(manifest, self.staging)
+            elif kind == "stream":
+                self.channel.get_stream(manifest, self.staging, seq)
             else:
                 self.ipc_import.pull(manifest, self.staging)
             self.sync()
@@ -215,14 +223,14 @@ class Replica:
             snap = self.migrate.import_from(self.fast, manifest, self.staging)
             self.sync()
         t2 = now_ns()
-        digest = self.sha(manifest, self.staging) if sha else None
+        self._last = (manifest, self.staging)
         kept = False
         if keep:
             kept = self.g.import_tail(tuple(key), snap)
         else:
             self.fast.release(snap)
         return {"t0": t0, "t_end": t2, "copy_ms": ms(t1 - t0), "scatter_ms": ms(t2 - t1),
-                "import_ms": ms(t2 - t0), "sha": digest, "kept": kept}
+                "import_ms": ms(t2 - t0), "kept": kept}
 
     def serve_peer(self) -> dict:
         """Import whatever the source announces on the peer pipe until it says stop."""
@@ -231,21 +239,33 @@ class Replica:
             msg = self.peer.recv()
             if msg[0] == "stop":
                 return {"imports": log}
-            _, kind, manifest = msg
-            r = self.import_(kind, manifest, None, keep=False, sha=False)
-            log.append({"kind": kind, "t0": r["t0"], "t_end": r["t_end"], "import_ms": r["import_ms"]})
+            _, kind, manifest, length, seq = msg
+            try:
+                r = self.import_(kind, manifest=manifest, length=length, seq=seq)
+            except Exception as exc:  # noqa: BLE001 - tell the source, keep serving
+                self.peer.send(("error", f"{type(exc).__name__}: {exc}"))
+                continue
+            log.append({"kind": kind, "import_ms": r["import_ms"], "copy_ms": r["copy_ms"]})
             self.peer.send(("done", r["t_end"]))
 
     # ------------------------------------------------------------------ the stall test
 
-    def stall(self, key: list[int], bg_prompts: list[list[int]], gap: int, reps: int) -> dict:
+    def stall(self, key: list[int], bg_prompts: list[list[int]], gap: int, reps: int, kinds: list[str]) -> dict:
         """Decode the background requests step by step; between steps, export ``key``'s tail
-        by each transport while the target imports it; time every step."""
+        by each of ``kinds`` while the target imports it; time every step.
+
+        ``host``/``stream``/``ipc``: the export runs inline on this (engine) thread.
+        ``host_async``: pack and copy out on side streams; announce when done.
+        ``stream_async``: pack and copy out on side streams, a helper thread publishes the
+        pieces as they land; the target streams them in meanwhile."""
+        import threading
+
         from engine.generator import PackedPrefill
         from engine.protocol import Sampling
 
         torch, g = self.torch, self.g
         snap = self.tail(key)
+        length = snap.length
         sampling = Sampling(max_tokens=100000, temperature=0.0, ignore_eos=True)
         packer = PackedPrefill(g)
         for p in bg_prompts:
@@ -253,49 +273,74 @@ class Replica:
         gens = []
         while packer.busy:
             gens += [res for _, res in packer.step()]
-        plan = ["host", "host_async", "ipc"] * reps
+        plan = kinds * reps
         steps: list[tuple[int, int]] = []  # (start, end) of each decode step, ns
         events: list[dict] = []
         pending = None  # the move in flight
         index = 0
+        seq = 1000
         total = gap * (len(plan) + 2)
+
+        def on_side(fn):
+            for st, d in zip(self.side, self.devices, strict=True):
+                st.wait_stream(torch.cuda.current_stream(d))
+            ctx = [torch.cuda.stream(st) for st in self.side]
+            for c in ctx:
+                c.__enter__()
+            try:
+                return fn()
+            finally:
+                for c in reversed(ctx):
+                    c.__exit__(None, None, None)
+
         for i in range(total):
             if pending is None and i >= gap and (i % gap) == 0 and index < len(plan):
                 kind = plan[index]
                 index += 1
+                seq += 1
                 t0 = now_ns()
                 with torch.inference_mode():
-                    if kind == "host":
+                    if kind in ("host", "ipc"):
+                        bufs = self.ipc_export.bufs if kind == "ipc" else self.staging
+                        manifest = self.migrate.export_into(self.fast, snap, bufs)
+                        if kind == "host":
+                            self.channel.put(manifest, bufs)
+                        else:
+                            self.ipc_export.publish(manifest)
+                        pending = {"kind": kind, "t0": t0, "inline_ns": now_ns() - t0, "announced": True}
+                        self.peer.send(("import", kind, manifest, length, seq))
+                    elif kind == "stream":
+                        self.peer.send(("import", "stream", None, length, seq))
                         manifest = self.migrate.export_into(self.fast, snap, self.staging)
-                        self.channel.put(manifest, self.staging)
+                        self.channel.put_stream(manifest, self.staging, seq)
                         pending = {"kind": kind, "t0": t0, "inline_ns": now_ns() - t0, "announced": True}
-                        self.peer.send(("import", "host", manifest))
-                    elif kind == "ipc":
-                        manifest = self.migrate.export_into(self.fast, snap, self.ipc_export.bufs)
-                        self.ipc_export.publish(manifest)
-                        pending = {"kind": kind, "t0": t0, "inline_ns": now_ns() - t0, "announced": True}
-                        self.peer.send(("import", "ipc", manifest))
-                    else:  # host_async: pack and copy out on side streams while decoding
-                        for s, d in zip(self.side, self.devices, strict=True):
-                            s.wait_stream(torch.cuda.current_stream(d))
-                        ctx = [torch.cuda.stream(s) for s in self.side]
-                        for c in ctx:
-                            c.__enter__()
-                        try:
-                            manifest = self.migrate.export_into(self.fast, snap, self.staging)
-                            for r, n in enumerate(manifest.rank_bytes):
+                    elif kind == "stream_async":
+                        self.peer.send(("import", "stream", None, length, seq))
+
+                        def launch():
+                            m = self.migrate.export_into(self.fast, snap, self.staging)
+                            return self.channel.launch(m, self.staging)
+
+                        marks = on_side(launch)
+                        helper = threading.Thread(target=self.channel.publish, args=(marks, seq), daemon=True)
+                        helper.start()
+                        pending = {"kind": kind, "t0": t0, "inline_ns": now_ns() - t0, "announced": True,
+                                   "helper": helper}
+                    else:  # host_async
+                        def launch():
+                            m = self.migrate.export_into(self.fast, snap, self.staging)
+                            for r, n in enumerate(m.rank_bytes):
                                 self.channel.rank(r, n).copy_(self.staging[r][:n], non_blocking=True)
-                            done = [s.record_event() for s in self.side]
-                        finally:
-                            for c in reversed(ctx):
-                                c.__exit__(None, None, None)
+                            return m, [st.record_event() for st in self.side]
+
+                        manifest, done = on_side(launch)
                         pending = {"kind": kind, "t0": t0, "inline_ns": now_ns() - t0,
-                                   "announced": False, "events": done, "manifest": manifest}
+                                   "announced": False, "events": done, "manifest": manifest, "seq": seq}
             if pending is not None and not pending["announced"]:
                 if all(e.query() for e in pending["events"]):
                     pending["ready_ns"] = now_ns() - pending["t0"]
                     pending["announced"] = True
-                    self.peer.send(("import", "host", pending.pop("manifest")))
+                    self.peer.send(("import", "host", pending.pop("manifest"), length, pending["seq"]))
                     pending.pop("events")
             # One decode step for every background request, as the server's worker runs it.
             s0 = now_ns()
@@ -308,25 +353,66 @@ class Replica:
             s1 = now_ns()
             steps.append((s0, s1))
             if pending is not None and pending["announced"] and self.peer.poll():
-                _, t_end = self.peer.recv()
-                pending["t_end"] = t_end
+                status, val = self.peer.recv()
+                pending["t_end" if status == "done" else "error"] = val
                 events.append(pending)
                 pending = None
-        while pending is not None:  # not expected: the loop leaves room
+        if pending is not None:  # not expected: the loop leaves room
             if not pending["announced"]:
                 torch.cuda.synchronize()
-                self.peer.send(("import", "host", pending.pop("manifest")))
-                pending["announced"] = True
-            _, t_end = self.peer.recv()
-            pending["t_end"] = t_end
+                self.peer.send(("import", "host", pending.pop("manifest"), length, pending["seq"]))
+            if self.peer.poll(30):
+                status, val = self.peer.recv()
+                pending["t_end" if status == "done" else "error"] = val
+            else:
+                pending["error"] = "no answer from the target in 30 s"
             events.append(pending)
-            pending = None
         self.peer.send(("stop",))
         for gen in gens:
             gen.retire()
-        return {"steps": steps, "events": [
-            {k: v for k, v in e.items() if k not in ("events", "manifest", "announced")} for e in events
-        ], "bytes": self.migrate.plan(self.fast, snap.length).nbytes, "tokens": snap.length}
+        drop = ("events", "manifest", "announced", "helper", "seq")
+        return {"steps": steps, "events": [{k: v for k, v in e.items() if k not in drop} for e in events],
+                "bytes": self.migrate.plan(self.fast, length).nbytes, "tokens": length}
+
+
+# ============================================================================ IPC visibility check
+
+
+def ipc_check_main(args) -> None:
+    """Role C: a process that sees all four GPUs opens A's IPC buffers on several devices
+    (A's own and B's), copies them out and compares digests. Tells whether the failure of
+    the narrowed replica B is about visibility or about the handles."""
+    ctl = Connection(args.ctl)
+    import torch
+
+    from engine import migrate
+
+    _, kw = ctl.recv()
+    hip = migrate.Hip()
+    out = {"visible": os.environ.get("HIP_VISIBLE_DEVICES"), "count": torch.cuda.device_count(), "tries": []}
+    for r, raw in enumerate(kw["handles"]):
+        n = kw["rank_bytes"][r]
+        for dev in kw["devices"][r]:
+            row = {"rank": r, "device": dev}
+            try:
+                d = torch.device("cuda", dev)
+                imp = migrate.IpcImport(None, [raw], devices=[d])
+                buf = torch.empty(n, dtype=torch.uint8, device=d)
+                fake = migrate.Manifest(0, 0, ((),), (n,))
+                for _ in range(2):  # the first copy maps the peer memory
+                    torch.cuda.synchronize(d)
+                    t0 = now_ns()
+                    imp.pull(fake, [buf])
+                    torch.cuda.synchronize(d)
+                    row["copy_ms"] = ms(now_ns() - t0)
+                row["gbps"] = round(n / (row["copy_ms"] * 1e6), 2)
+                row["sha_equal"] = hashlib.sha256(buf.cpu().numpy().tobytes()).hexdigest()[:16] == kw["sha"][r]
+                imp.close()
+            except Exception as exc:  # noqa: BLE001
+                row["error"] = f"{type(exc).__name__}: {exc}"
+            out["tries"].append(row)
+    del hip
+    ctl.send(("ok", out))
 
 
 def replica_main(args) -> None:
@@ -365,7 +451,7 @@ class Child:
         from engine import cpu_place, router
 
         here, there = socket.socketpair()
-        env = router.device_env(dict(os.environ), devices, hip=True)
+        env = router.device_env(dict(os.environ), devices, hip=True) if devices else dict(os.environ)
         env["ENGINE_REPLICA_INDEX"] = "0" if role == "A" else "1"
         preexec = None
         if piece is not None:
@@ -377,9 +463,9 @@ class Child:
         command = [sys.executable, "-u", str(Path(__file__).resolve()), "--role", role,
                    "--ctl", str(there.fileno()), "--peer", str(peer_fd), "--shm", str(shm_fd)]
         self.role = role
+        fds = tuple(f for f in (there.fileno(), peer_fd, shm_fd) if f >= 0)
         self.proc = subprocess.Popen(  # noqa: PLW1509
-            command, env=env, cwd=str(ROOT), preexec_fn=preexec,
-            pass_fds=(there.fileno(), peer_fd, shm_fd),
+            command, env=env, cwd=str(ROOT), preexec_fn=preexec, pass_fds=fds,
         )
         there.close()
         self.conn = Connection(here.detach())
@@ -423,6 +509,9 @@ def summarize_stall(st: dict) -> list[dict]:
     durs = [e - s for s, e in steps]
     rows = []
     for ev in st["events"]:
+        if "t_end" not in ev:
+            rows.append({"kind": ev["kind"], "error": ev.get("error")})
+            continue
         t0, t1 = ev["t0"], ev["t_end"]
         inside = [d for (s, e), d in zip(steps, durs, strict=True) if e > t0 and s < t1]
         first = next(i for i, (s, e) in enumerate(steps) if s >= t0)
@@ -466,6 +555,7 @@ def orchestrate(args) -> int:
     pa.close()
     pb.close()
     children = [a, b]
+    seq = 0
     try:
         for c in children:
             result(kind="ready", **c.recv(1500))
@@ -474,21 +564,44 @@ def orchestrate(args) -> int:
         from engine.generator import CHECKPOINT
 
         tok = AutoTokenizer.from_pretrained(CHECKPOINT["model"], revision=CHECKPOINT["revision"])
-        ipc_ok, ipc_error = False, None
+        ipc_ok, ipc_error, handles = False, None, None
         try:
             h = a.call("ipc_handles")
+            handles = h["handles"]
             result(kind="ipc_export", wrapped=h["wrapped"], wrap_error=h["wrap_error"])
-            result(kind="ipc_open", **b.call("open_ipc", handles=h["handles"]))
+            result(kind="ipc_open", **b.call("open_ipc", handles=handles))
             ipc_ok = True
         except Exception as exc:  # noqa: BLE001 - IPC is optional; report it
             ipc_error = f"{type(exc).__name__}: {exc}"
             result(kind="ipc_unavailable", error=ipc_error)
-        kinds = ["host"] + (["ipc"] if ipc_ok else [])
+        kinds = ["host", "stream"] + (["ipc"] if ipc_ok else [])
+
+        def move(kind: str, key: list[int], keep: bool) -> dict:
+            nonlocal seq
+            seq += 1
+            if kind == "stream":  # both sides at once: the target waits for published pieces
+                b.send("import_", kind=kind, length=len(key), key=key, keep=keep, seq=seq)
+                ex = a.call("export", kind=kind, key=key, seq=seq)
+                im = b.recv(120)
+            else:
+                ex = a.call("export", kind=kind, key=key, seq=seq)
+                im = b.call("import_", kind=kind, manifest=ex["manifest"], key=key, keep=keep, seq=seq)
+            same = a.call("digest") == b.call("digest")
+            row = {
+                "kind": "move", "transport": kind, "tokens": len(key),
+                "bytes_per_rank": ex["rank_bytes"], "mb_total": round(sum(ex["rank_bytes"]) / 1e6, 2),
+                "export_ms": ex["export_ms"], "import_ms": im["import_ms"],
+                "B_copy_ms": im["copy_ms"], "B_scatter_ms": im["scatter_ms"],
+                "end_to_end_ms": ms(im["t_end"] - min(ex["t0"], im["t0"])),
+                "bytes_equal": same, "kept_by_B": im["kept"],
+            }
+            if "pack_ms" in ex:
+                row["A_pack_ms"] = ex["pack_ms"]
+            return row
 
         lengths = [int(x) for x in args.lengths.split(",")]
         moves: dict[tuple[int, str], list[dict]] = {}
-        identical, compared, last_key = True, 0, None
-        sha_ok = True
+        identical, compared, last_key, sha_ok = True, 0, None, True
         for L in lengths:
             for p in range(args.prompts):
                 seed = L * 10 + p
@@ -498,23 +611,9 @@ def orchestrate(args) -> int:
                 keep_kind = kinds[p % len(kinds)]
                 for kind in kinds:
                     for rep in range(args.reps):
-                        keep = kind == keep_kind and rep == args.reps - 1
-                        ex = a.call("export_host" if kind == "host" else "export_ipc", key=key)
-                        im = b.call("import_", kind=kind, manifest=ex["manifest"], key=key, keep=keep)
-                        same = ex["sha"] == im["sha"]
-                        sha_ok &= same
-                        row = {
-                            "kind": "move", "transport": kind, "tokens": len(key), "rep": rep,
-                            "bytes_per_rank": ex["rank_bytes"], "mb_total": round(sum(ex["rank_bytes"]) / 1e6, 2),
-                            "export_ms": ex["export_ms"], "import_ms": im["import_ms"],
-                            "end_to_end_ms": ms(im["t_end"] - ex["t0"]),
-                            "bytes_equal": same, "kept_by_B": im["kept"],
-                        }
-                        for k in ("pack_ms", "d2h_ms"):
-                            if k in ex:
-                                row["A_" + k] = ex[k]
-                        row["B_copy_ms"], row["B_scatter_ms"] = im["copy_ms"], im["scatter_ms"]
-                        result(**row)
+                        row = move(kind, key, keep=kind == keep_kind and rep == args.reps - 1)
+                        sha_ok &= row["bytes_equal"]
+                        result(rep=rep, **row)
                         moves.setdefault((L, kind), []).append(row)
                 round2 = prompt + r1["tokens"] + synthetic(tok, seed + 5, args.new)
                 ca = a.call("run", prompt=round2, max_tokens=args.decode2)
@@ -530,15 +629,34 @@ def orchestrate(args) -> int:
                        A_head=ca["tokens"][:8], B_head=cb["tokens"][:8])
                 last_key = round2 + ca["tokens"][:-1]
 
-        # Source stall: A decodes background requests while the latest (~8k) tail moves.
+        # IPC with every GPU visible (role C), on A's latest ~8k tail packed into its IPC buffers.
+        ipc_check = None
+        if handles is not None:
+            try:
+                ex = a.call("export", kind="ipc", key=last_key)
+                shas = a.call("digest")
+                c = Child("C", (), None, -1, -1)
+                children.append(c)
+                c.send("check", handles=handles, rank_bytes=ex["rank_bytes"], sha=shas,
+                       devices=[[r, 2 + r] for r in range(len(handles))])
+                ipc_check = c.recv(300)
+                for row in ipc_check["tries"]:
+                    result(kind="ipc_all_visible", visible=ipc_check["visible"], count=ipc_check["count"],
+                           tokens=len(last_key), mb_rank=round(ex["rank_bytes"][row["rank"]] / 1e6, 2), **row)
+            except Exception as exc:  # noqa: BLE001
+                result(kind="ipc_all_visible", error=f"{type(exc).__name__}: {exc}")
+
+        # Source stall: A decodes background requests while its latest (~8.6k) tail moves.
         bg = [synthetic(tok, 900 + i, args.bg_len) for i in range(args.bg)]
+        stall_kinds = ["host", "host_async", "stream", "stream_async"] + (["ipc"] if ipc_ok else [])
         b.send("serve_peer")
-        st = a.call("stall", key=last_key, bg_prompts=bg, gap=args.gap, reps=args.stall_reps, timeout=900)
+        st = a.call("stall", key=last_key, bg_prompts=bg, gap=args.gap, reps=args.stall_reps,
+                    kinds=stall_kinds, timeout=900)
         peer_log = b.recv(120)
         rows = summarize_stall(st)
         for row in rows:
             result(kind="stall", tokens=st["tokens"], mb_total=round(st["bytes"] / 1e6, 2), bg=args.bg, **row)
-        result(kind="stall_imports", imports=[{"kind": x["kind"], "import_ms": x["import_ms"]} for x in peer_log["imports"]])
+        result(kind="stall_imports", imports=peer_log["imports"])
 
         summary = {"kind": "summary", "identical_all": identical, "continuations": compared,
                    "bytes_equal_all": sha_ok, "ipc": ipc_ok, "ipc_error": ipc_error}
@@ -546,8 +664,8 @@ def orchestrate(args) -> int:
             summary[f"e2e_ms_{kind}_{L}"] = round(statistics.median(r["end_to_end_ms"] for r in rs), 3)
             summary[f"export_ms_{kind}_{L}"] = round(statistics.median(r["export_ms"] for r in rs), 3)
             summary[f"mb_{kind}_{L}"] = rs[0]["mb_total"]
-        for kind in ("host", "host_async", "ipc"):
-            sel = [r for r in rows if r["kind"] == kind]
+        for kind in stall_kinds:
+            sel = [r for r in rows if r["kind"] == kind and "error" not in r]
             if sel:
                 summary[f"stall_ms_{kind}_8k"] = round(statistics.median(r["stall_ms"] for r in sel), 3)
                 summary[f"move_ms_{kind}_8k"] = round(statistics.median(r["move_ms"] for r in sel), 3)
@@ -567,12 +685,12 @@ def orchestrate(args) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--role", choices=("A", "B"))
+    parser.add_argument("--role", choices=("A", "B", "C"))
     parser.add_argument("--ctl", type=int)
     parser.add_argument("--peer", type=int)
     parser.add_argument("--shm", type=int)
     parser.add_argument("--lengths", default="4050,8130")
-    parser.add_argument("--prompts", type=int, default=3)
+    parser.add_argument("--prompts", type=int, default=2)
     parser.add_argument("--decode1", type=int, default=50)
     parser.add_argument("--new", type=int, default=256)
     parser.add_argument("--decode2", type=int, default=200)
@@ -582,6 +700,9 @@ def main() -> None:
     parser.add_argument("--gap", type=int, default=25)
     parser.add_argument("--stall-reps", type=int, default=3)
     args = parser.parse_args()
+    if args.role == "C":
+        ipc_check_main(args)
+        return
     if args.role:
         replica_main(args)
         return

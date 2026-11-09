@@ -18,14 +18,15 @@ for line in open(sys.argv[1]):
 if s is None:
     sys.exit(0)
 out = []
-for kind, stall_kind in (("host", "host"), ("host", "host_async"), ("ipc", "ipc")):
+pairs = (("host", "host"), ("host", "host_async"), ("stream", "stream"), ("stream", "stream_async"), ("ipc", "ipc"))
+for kind, stall_kind in pairs:
     for L in (4050, 8130):
         e2e = s.get(f"e2e_ms_{kind}_{L}")
         stall = s.get(f"stall_ms_{stall_kind}_8k")
         if e2e is None or stall is None:
             continue
-        if stall_kind == "host_async":
-            e2e = max(e2e, s.get("move_ms_host_async_8k", e2e))
+        if stall_kind.endswith("_async"):
+            e2e = max(e2e, s.get(f"move_ms_{stall_kind}_8k", e2e))
         out += ["--cost-ms", str(e2e), "--stall-ms", str(stall), "--label", f"{stall_kind}@{L}"]
 print(" ".join(out))
 PY

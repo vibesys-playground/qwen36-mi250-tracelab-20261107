@@ -252,17 +252,30 @@ def _memfd(name: str) -> int:
 class HostChannel:
     """A shared memory file of ``nbytes`` (``os.memfd_create``; another process maps it from
     the inherited descriptor ``fd``), registered as pinned host memory for every device of
-    this process. Rank ``r`` of a snapshot goes at ``r * stride``."""
+    this process. A header page holds one progress counter per rank; rank ``r`` of a snapshot
+    goes at ``HEADER + r * stride``.
+
+    ``put``/``get`` move a whole snapshot (the target starts after the source has finished).
+    ``put_stream``/``get_stream`` overlap the two: the source copies each rank in ``chunk``
+    pieces and publishes, per rank, how many bytes of move ``seq`` have landed; the target,
+    started at the same time, copies each piece to its GPUs as soon as it is published. A
+    move's ``seq`` must exceed every earlier one on the channel.
+    """
+
+    HEADER = 4096
 
     def __init__(self, nbytes: int, fd: int | None = None, ranks: int = 2) -> None:
+        import numpy as np
+
         if fd is None:
             fd = _memfd("engine-migrate")
             os.ftruncate(fd, nbytes)
         self.fd = fd
         self.nbytes = nbytes
-        self.stride = (nbytes // ranks) // ALIGN * ALIGN
+        self.stride = ((nbytes - self.HEADER) // ranks) // ALIGN * ALIGN
         self._map = mmap.mmap(fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         self.host = torch.frombuffer(self._map, dtype=torch.uint8)
+        self._ready = np.frombuffer(self._map, dtype=np.int64, count=ranks)
         self.pinned = False
         if torch.cuda.is_available():
             hip = Hip()
@@ -273,7 +286,8 @@ class HostChannel:
     def rank(self, r: int, nbytes: int) -> torch.Tensor:
         if nbytes > self.stride:
             raise ValueError(f"{nbytes} B do not fit the channel's {self.stride} B per rank")
-        return self.host[r * self.stride : r * self.stride + nbytes]
+        at = self.HEADER + r * self.stride
+        return self.host[at : at + nbytes]
 
     def put(self, manifest: Manifest, bufs: Sequence[torch.Tensor]) -> None:
         """Device buffers to the channel; returns when the bytes are in host memory."""
@@ -287,6 +301,57 @@ class HostChannel:
         """The channel to device buffers, queued on the current streams."""
         for r, n in enumerate(manifest.rank_bytes):
             bufs[r][:n].copy_(self.rank(r, n), non_blocking=True)
+
+    @staticmethod
+    def _pieces(manifest: Manifest, chunk: int) -> list[tuple[int, int, int]]:
+        """(rank, begin, end) in the order both sides walk them: piece by piece, ranks inside."""
+        out = []
+        for begin in range(0, max(manifest.rank_bytes), chunk):
+            for r, n in enumerate(manifest.rank_bytes):
+                if begin < n:
+                    out.append((r, begin, min(begin + chunk, n)))
+        return out
+
+    def put_stream(self, manifest: Manifest, bufs: Sequence[torch.Tensor], seq: int, chunk: int = 8 << 20) -> None:
+        """``put``, publishing each piece as it lands; returns when all have landed."""
+        self.publish(self.launch(manifest, bufs, chunk), seq)
+
+    def launch(self, manifest: Manifest, bufs: Sequence[torch.Tensor], chunk: int = 8 << 20) -> list:
+        """Queue ``put_stream``'s copies on the current streams; ``publish`` the result (from
+        any thread) to tell the target as each piece lands."""
+        marks = []
+        for r, begin, end in self._pieces(manifest, chunk):
+            host = self.rank(r, manifest.rank_bytes[r])
+            host[begin:end].copy_(bufs[r][begin:end], non_blocking=True)
+            if bufs[r].is_cuda:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(bufs[r].device))
+            else:
+                event = None
+            marks.append((r, end, event))
+        return marks
+
+    def publish(self, marks: list, seq: int) -> None:
+        for r, end, event in marks:
+            if event is not None:
+                event.synchronize()
+            self._ready[r] = (seq << 40) + end
+
+    def get_stream(
+        self, manifest: Manifest, bufs: Sequence[torch.Tensor], seq: int, chunk: int = 8 << 20,
+        timeout: float = 5.0,
+    ) -> None:
+        """``get`` of move ``seq``, each piece queued as soon as the source has published it."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        for r, begin, end in self._pieces(manifest, chunk):
+            want = (seq << 40) + end
+            while int(self._ready[r]) < want:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"move {seq}: rank {r} stalled at {int(self._ready[r]) & ((1 << 40) - 1)} B")
+            host = self.rank(r, manifest.rank_bytes[r])
+            bufs[r][begin:end].copy_(host[begin:end], non_blocking=True)
 
 
 # ----------------------------------------------------------------------------- IPC transport
@@ -370,17 +435,20 @@ class IpcImport:
     """The target's side of ``IpcExport``: the source's buffers opened on this process's
     devices (rank ``r`` on its own rank-``r`` device), copied from with one DMA per rank."""
 
-    def __init__(self, fast: Any, handles: Sequence[bytes]) -> None:
+    def __init__(self, fast: Any, handles: Sequence[bytes], devices: Sequence[torch.device] | None = None) -> None:
         self.hip = Hip()
         self._ptrs: list[int] = []
-        self.devices = [_device(m) for m in ranks(fast)]
+        self.devices = list(devices) if devices is not None else [_device(m) for m in ranks(fast)]
         for raw, dev in zip(handles, self.devices, strict=True):
             handle = Hip.IpcHandle()
             ctypes.memmove(ctypes.addressof(handle), raw, 64)
             with torch.cuda.device(dev):
                 ptr = ctypes.c_void_p()
-                # hipIpcMemLazyEnablePeerAccess
-                self.hip.check(self.hip.lib.hipIpcOpenMemHandle(ctypes.byref(ptr), handle, 1), "hipIpcOpenMemHandle")
+                # hipIpcMemLazyEnablePeerAccess, then no flags
+                code = self.hip.lib.hipIpcOpenMemHandle(ctypes.byref(ptr), handle, 1)
+                if code != 0:
+                    code = self.hip.lib.hipIpcOpenMemHandle(ctypes.byref(ptr), handle, 0)
+                self.hip.check(code, f"hipIpcOpenMemHandle on {dev}")
             self._ptrs.append(ptr.value)
 
     def pull(self, manifest: Manifest, bufs: Sequence[torch.Tensor]) -> None:

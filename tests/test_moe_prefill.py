@@ -199,7 +199,7 @@ def _pair_buffers(x, idx, gate_up, down, cfg):
 @pytest.mark.parametrize("inter", [128, 256])
 @pytest.mark.parametrize("n", [5, 17, 300])
 @pytest.mark.parametrize("mode", ["uniform", "skewed", "sparse"])
-@pytest.mark.parametrize("scfg", [None, "64,2,4,1", "128,4,4,2", "256,2,8,2,16,2", "128,8,4,2,16,0"])
+@pytest.mark.parametrize("scfg", [None, "64,2,4,1", "128,4,4,2", "256,2,8,1,16,2", "128,8,4,2,16,0"])
 def test_down_stream_bitwise(monkeypatch, inter, n, mode, scfg):
     """Plan 60: ``_down_stream_kernel`` writes the pair buffer of ``_down_kernel`` bit for
     bit (the same BLOCK_K dots in the same order), with empty experts (sparse), one expert

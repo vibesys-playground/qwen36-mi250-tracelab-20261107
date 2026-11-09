@@ -407,11 +407,14 @@ class StreamConfig(NamedTuple):
 
 
 # Plan 60: the N-streaming down projection per ``BUCKETS`` entry (same bounds, same BLOCK_M and
-# BLOCK_K, so one tile table and the same dots). Placeholders until the step 0 sweep.
+# BLOCK_K, so one tile table and the same dots). The fastest per bucket in the step 0 sweep (job
+# j282, GCD 0 of a TP2 pair, real routing of all 41 MoE layers, replay-like text; every config
+# bitwise equal): 61 tokens 0.978x today's down, 561 0.892x, 1,650 0.761x, 2,300 0.752x. The plan's
+# kill rule (<= 0.85x at 561 and <= 0.75x at 1,650) failed, so the flag defaults off.
 STREAM_BUCKETS: tuple[StreamConfig, ...] = (
-    StreamConfig(256, 2, 4, 2, 16, 2),
-    StreamConfig(128, 4, 4, 2),
-    StreamConfig(128, 4, 4, 2, 16, 0),
+    StreamConfig(256, 1, 4, 1, 0, 2),
+    StreamConfig(128, 4, 8, 1),
+    StreamConfig(128, 8, 8, 2, 16, 0),
 )
 
 

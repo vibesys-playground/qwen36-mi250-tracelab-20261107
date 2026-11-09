@@ -22,6 +22,15 @@
    the whole MoE block (``prefill_kernels.moe``) with it is checked bitwise against today's.
    Kill (plan 60): best / today > 0.75 at 1,650 or > 0.85 at 561 (replay) -> park.
 
+Result (job j282, commit 3243d58, head 0f17705's kernels; replay / natural, ms per pass on GCD 0):
+    N      today    stream   ratio    experts touched (mean of 41 layers, replay / natural)
+    61     4.945    4.836    0.978    119 / 132   BN256/G1/w4/s1/wpe2
+    561    10.665   9.515    0.892    178 / 219   BN128/G4/w8/s1
+    1650   16.900   12.860   0.761    203 / 244   BN128/G8/w8/s2/nk16
+    2300   20.205   15.188   0.752    212 / 250   BN128/G16/w8/s2/nk16
+  All 88 configs per case bitwise equal to today's pair buffer, and the MoE block bitwise.
+  Kill fired (0.892 > 0.85 at 561, 0.761 > 0.75 at 1,650): parked, flag off.
+
 Every line starting with RESULT is JSON. Numbers are evidence for the lead, not the metric.
 """
 

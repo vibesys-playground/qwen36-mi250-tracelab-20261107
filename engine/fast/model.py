@@ -40,7 +40,7 @@ from torch.nn import functional as F
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 
 from engine import gdn
-from engine.fast import fla_pin, kernels, mfma, moe_prefill, prefill_kernels
+from engine.fast import fla_pin, flash_prefill, kernels, mfma, moe_prefill, prefill_kernels
 
 PAGE = 64
 # Above this many tokens a prefill chunk's experts run through Transformers' experts module
@@ -330,6 +330,9 @@ class FastModel:
             # Prefill passes through ``prefill_kernels`` (ENGINE_PREFILL_FUSED): paged
             # attention, residual add + RMSNorm, the MoE block around the grouped experts.
             "prefill_fused": self.use_triton and prefill_kernels.enabled(),
+            # Plan 40 (ENGINE_PREFILL_MERGED): a prefill pass's input projections of a layer
+            # as one GEMM over its packed weight (``prefill_kernels.project``).
+            "prefill_merged": prefill_kernels.merged_enabled(),
         }
         # fla's autotuned prefill kernels: one fixed config each, the same in every process
         # (``fla_pin``; timing picks differ between processes and so would greedy outputs).
@@ -706,6 +709,15 @@ class FastModel:
         bucketed convolutions up to ``chunk`` tokens."""
         if self.triton_kernels["moe_prefill"]:
             self._warm_moe_prefill(chunk)
+        if self.triton_kernels["prefill_fused"] and prefill_kernels._FLASH:
+            # Plan 35: the flash attention tiles compile per (tile, split or not), not per
+            # shape; compile them all here rather than on a request's first use of each.
+            group = self.config.num_attention_heads // self.config.num_key_value_heads
+            warmed = set()
+            for k_pool, v_pool in self.kv.values():
+                if k_pool.device not in warmed:
+                    warmed.add(k_pool.device)
+                    flash_prefill.warm(k_pool, v_pool, k_pool.shape[1] * group)
         seen = set()
         for i, (conv, _) in self.gdn_state.items():
             weight = self.layers[i].linear_attn.conv1d.weight
@@ -734,10 +746,14 @@ class FastModel:
             seen.add(key)
             num, _, hidden = gate_up.shape
             shapes = {}
-            tokens = DECODE_EXPERT_TOKENS + 1
-            while tokens <= 2 * max(chunk, DECODE_EXPERT_TOKENS + 1):
+            limit = 2 * max(chunk, DECODE_EXPERT_TOKENS + 1)
+            counts = [DECODE_EXPERT_TOKENS + 1]
+            while counts[-1] * 2 <= limit:
+                counts.append(counts[-1] * 2)
+            # Every bucket ``config`` can pick, even one narrower than a doubling.
+            counts += [t for t in moe_prefill.bucket_tokens(self.top_k, num, limit) if t > DECODE_EXPERT_TOKENS]
+            for tokens in counts:
                 shapes.setdefault(moe_prefill.config(tokens * self.top_k, num), tokens)
-                tokens *= 2
             for tokens in shapes.values():
                 x = torch.zeros((tokens, hidden), dtype=gate_up.dtype, device=gate_up.device)
                 ids = torch.arange(tokens * self.top_k, device=gate_up.device) % num
@@ -916,7 +932,15 @@ class FastModel:
             and rows <= self.fused.max_rows
         )
 
-    def _gdn_project(self, m: torch.nn.Module, x: torch.Tensor):
+    def _gdn_project(self, m: torch.nn.Module, x: torch.Tensor, prefill: bool = False):
+        """(qkv, z, b, a). In a prefill pass with ``prefill_merged``, one GEMM over the
+        packed ``in_proj_qkv|z|b|a`` rows; the four are then column views (row stride N)."""
+        if prefill and self.triton_kernels["prefill_merged"]:
+            parts = prefill_kernels.project(
+                x, (m.in_proj_qkv.weight, m.in_proj_z.weight, m.in_proj_b.weight, m.in_proj_a.weight)
+            )
+            if parts is not None:
+                return parts
         return (
             F.linear(x, m.in_proj_qkv.weight),
             F.linear(x, m.in_proj_z.weight),
@@ -998,15 +1022,20 @@ class FastModel:
         ).to(qkv.dtype)
         return self._gdn_gate(m, core, z)
 
-    def _qkv(self, i: int, x: torch.Tensor, positions: torch.Tensor):
+    def _qkv(self, i: int, x: torch.Tensor, positions: torch.Tensor, prefill: bool = False):
         m = self._attn_module(i)
         tokens = x.shape[0]
-        qg = F.linear(x, m.q_proj.weight).view(tokens, -1, m.head_dim * 2)
+        parts = None
+        if prefill and self.triton_kernels["prefill_merged"]:
+            parts = prefill_kernels.project(x, (m.q_proj.weight, m.k_proj.weight, m.v_proj.weight))
+        if parts is None:
+            parts = (F.linear(x, m.q_proj.weight), F.linear(x, m.k_proj.weight), F.linear(x, m.v_proj.weight))
+        qg = parts[0].view(tokens, -1, m.head_dim * 2)
         q, gate = torch.chunk(qg, 2, dim=-1)
         gate = gate.reshape(tokens, -1)
         q = _rms(q, m.q_norm.weight, m.q_norm.eps)
-        k = _rms(F.linear(x, m.k_proj.weight).view(tokens, -1, m.head_dim), m.k_norm.weight, m.k_norm.eps)
-        v = F.linear(x, m.v_proj.weight).view(tokens, -1, m.head_dim)
+        k = _rms(parts[1].view(tokens, -1, m.head_dim), m.k_norm.weight, m.k_norm.eps)
+        v = parts[2].view(tokens, -1, m.head_dim)
         freqs = positions.float()[:, None] * self.inv_freq[x.device][None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
         cos, sin = emb.cos().to(x.dtype), emb.sin().to(x.dtype)
@@ -1048,7 +1077,7 @@ class FastModel:
             and self.triton_kernels["moe_prefill"]
             and prefill_kernels.moe_supported(x, mlp, self.top_k)
         ):
-            return prefill_kernels.moe(x, mlp, self.top_k)
+            return prefill_kernels.moe(x, mlp, self.top_k, merged=self.triton_kernels["prefill_merged"])
         shared = mlp.shared_expert
         shared_out = F.linear(
             F.silu(F.linear(x, shared.gate_proj.weight)) * F.linear(x, shared.up_proj.weight),
@@ -1247,7 +1276,7 @@ class FastModel:
         m = self.layers[i].linear_attn
         conv_state, rec_state = self.gdn_state[i]
         tokens = x.shape[0]
-        qkv, z, b, a = self._gdn_project(m, x)
+        qkv, z, b, a = self._gdn_project(m, x, prefill=True)
         conv = conv_state.index_select(0, st.grow)[0]
         mixed = prefill_kernels.gdn_conv_(qkv, conv, m.conv1d.weight, meta=st.meta)
         conv_state.index_copy_(0, st.grow, conv[None])
@@ -1275,7 +1304,7 @@ class FastModel:
 
     def _pg_attn(self, i: int, x: torch.Tensor, st: SimpleNamespace) -> torch.Tensor:
         """``_attn_prefill`` (fused) at device positions: padding rows' KV to the dummy page."""
-        m, q, k, v, gate = self._qkv(i, x, st.positions)
+        m, q, k, v, gate = self._qkv(i, x, st.positions, prefill=True)
         k_pool, v_pool = self.kv[i]
         k_pool[st.page, :, st.offset] = k
         v_pool[st.page, :, st.offset] = v
@@ -1306,7 +1335,7 @@ class FastModel:
         conv_state, rec_state = self.gdn_state[i]
         if self.triton_kernels["prefill_fused"] and prefill_kernels.gdn_supported(m, conv_state):
             return self._gdn_prefill_fused(i, x, slot)
-        qkv, z, b, a = self._gdn_project(m, x)
+        qkv, z, b, a = self._gdn_project(m, x, prefill=True)
         window = torch.cat((conv_state[slot], qkv.transpose(0, 1)), dim=-1)  # [conv_dim, kernel+T]
         kernel = m.conv_kernel_size
         conv_state[slot].copy_(window[:, -kernel:])
@@ -1332,7 +1361,7 @@ class FastModel:
         m = self.layers[i].linear_attn
         conv_state, rec_state = self.gdn_state[i]
         tokens = x.shape[0]
-        qkv, z, b, a = self._gdn_project(m, x)
+        qkv, z, b, a = self._gdn_project(m, x, prefill=True)
         mixed = prefill_kernels.gdn_conv_(qkv, conv_state[slot], m.conv1d.weight)
         q, k, v = torch.split(mixed, [m.key_dim, m.key_dim, m.value_dim], dim=-1)
         q = q.reshape(tokens, -1, m.head_k_dim)
@@ -1359,7 +1388,7 @@ class FastModel:
     def _attn_prefill(
         self, i: int, x: torch.Tensor, slot: int, positions: torch.Tensor, start: int
     ) -> torch.Tensor:
-        m, q, k, v, gate = self._qkv(i, x, positions)
+        m, q, k, v, gate = self._qkv(i, x, positions, prefill=True)
         count = x.shape[0]
         k_pool, v_pool = self.kv[i]
         table = torch.tensor(self.slot_pages[slot], dtype=torch.long, device=x.device)
@@ -1465,7 +1494,7 @@ class FastModel:
             return out
         conv_state, rec_state = self.gdn_state[i]
         xm = x.index_select(0, p.multi_rows)
-        qkv, z, b, a = self._gdn_project(m, xm)
+        qkv, z, b, a = self._gdn_project(m, xm, prefill=True)
         kernel = m.conv_kernel_size
         weight = m.conv1d.weight
         mixed_parts = []
@@ -1517,7 +1546,7 @@ class FastModel:
         return out
 
     def _attn_prefill_packed(self, i: int, x: torch.Tensor, p: _PackOnDevice) -> torch.Tensor:
-        m, q, k, v, gate = self._qkv(i, x, p.positions)
+        m, q, k, v, gate = self._qkv(i, x, p.positions, prefill=True)
         k_pool, v_pool = self.kv[i]
         k_pool[p.pages, :, p.offsets] = k
         v_pool[p.pages, :, p.offsets] = v

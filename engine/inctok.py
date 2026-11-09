@@ -10,17 +10,26 @@ encodes only the rest.
 Why a cut is safe (for the checkpoint's tokenizer, checked at construction):
 the tokenizer splits off added tokens, normalizes with NFC, splits the text
 into pre-tokens with one regex (left to right, no look-behind), byte-maps and
-BPE-merges each pre-token on its own, and adds no special tokens. In that
-regex no pre-token runs from a line feed into a following non-whitespace
-character (every alternative that can match ``\\n`` ends at a line break or
-holds only whitespace, and the letter, number and punctuation alternatives
-cannot start with one), so a position ``c`` with ``text[c - 1] == "\\n"`` and
-an ASCII non-whitespace ``text[c]`` is a pre-token boundary of any text with
-that prefix, and matching the pre-tokens before ``c`` reads no character past
-``c``. NFC does not compose across an ASCII starter, no added token contains a
-line feed (so none spans ``c``), and none strips whitespace to its left, so
-the cut is also a boundary for added-token splitting. Hence for ``c`` inside
-the cached prompt, ``encode(new) == ids_of(prompt[:c]) + encode(new[c:])``.
+BPE-merges each pre-token on its own, and adds no special tokens. A cut ``c``
+is taken only between two ASCII characters of one of two kinds:
+
+- ``text[c - 1] == "\\n"`` and ``text[c]`` not whitespace: every alternative
+  of the regex that can match a line feed ends at a line break or holds only
+  whitespace, and the letter, number and punctuation alternatives cannot
+  start with one, so no pre-token runs across ``c``;
+- ``text[c - 1]`` not whitespace and ``text[c] == " "``: no alternative
+  continues from a non-whitespace character into a space (letter runs,
+  punctuation runs, digits and contractions hold no space; a space is only
+  ever an optional first character), and the whitespace alternatives cannot
+  start before ``c``.
+
+Either way ``c`` is a pre-token boundary of any text with that prefix, the
+pre-tokens after it are matched afresh from ``c`` (no look-behind), and
+matching those before it reads no character past ``c``. NFC does not compose
+across an ASCII starter; no added token contains whitespace (so none spans
+``c``) or strips whitespace next to it, so the cut is also a boundary of the
+added-token split. Hence for ``c`` inside the cached prompt,
+``encode(new) == ids_of(prompt[:c]) + encode(new[c:])``.
 A tokenizer whose configuration does not match these conditions gets the full
 encode always; ``ENGINE_TOKENIZE_CHECK=1`` compares every incremental result
 with the full encode and raises on any difference.
@@ -33,6 +42,9 @@ import os
 import threading
 from collections import OrderedDict
 from typing import Any
+
+# Cuts kept per cached prompt (the last ones: a later prompt is cut at the last one inside).
+_KEEP_CUTS = 64
 
 # The Qwen2/Qwen3 family's pre-tokenizer pattern (with and without combining marks).
 _SAFE_PATTERNS = (
@@ -78,7 +90,12 @@ def safe_config(backend: Any) -> str | None:
         return "model is not BPE"
     for added in spec.get("added_tokens") or []:
         content = added.get("content", "")
-        if "\n" in content or "\r" in content or added.get("lstrip"):
+        if (
+            any(ch.isspace() for ch in content)
+            or added.get("lstrip")
+            or added.get("rstrip")
+            or added.get("single_word")
+        ):
             return f"added token {content!r} may span a cut"
     return None
 
@@ -120,11 +137,15 @@ class PromptEncoder:
     def _cuts(text: str, base: int, offsets: list[tuple[int, int]], first_token: int) -> list[tuple[int, int]]:
         """Safe cuts (char position, token index) among the tokens of ``text[base:]``."""
         cuts = []
+        n = len(text)
         for index, (start, _) in enumerate(offsets):
             c = base + start
-            if c > 0 and text[c - 1] == "\n" and c < len(text):
-                ch = text[c]
-                if ch < "\x7f" and not ch.isspace():
+            if 0 < c < n:
+                before, ch = text[c - 1], text[c]
+                if before == "\n":
+                    if ch < "\x7f" and not ch.isspace():
+                        cuts.append((c, first_token + index))
+                elif ch == " " and before < "\x7f" and not before.isspace():
                     cuts.append((c, first_token + index))
         return cuts
 
@@ -162,7 +183,7 @@ class PromptEncoder:
         if cut is None:
             enc = self._backend.encode(text, add_special_tokens=False)
             ids = tuple(enc.ids)
-            cuts = tuple(self._cuts(text, 0, enc.offsets, 0))
+            cuts = tuple(self._cuts(text, 0, enc.offsets, 0)[-_KEEP_CUTS:])
             self.misses += 1
         else:
             c, k, old_ids, old_cuts = cut
@@ -171,6 +192,7 @@ class PromptEncoder:
             cuts = tuple(x for x in old_cuts if x[0] <= c) + tuple(
                 x for x in self._cuts(text, c, enc.offsets, k) if x[0] > c
             )
+            cuts = cuts[-_KEEP_CUTS:]
             self.hits += 1
             self.reused_tokens += k
         if self.check:

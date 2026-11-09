@@ -118,3 +118,20 @@ def test_synthetic_corpus_long(tok):
         assert enc.encode(text) == tuple(tok.encode(text))
         text += " sorted(set(x)) for x in items:\n" + "".join(lines[200 + 60 * step : 260 + 60 * step])
     assert enc.hits >= 11
+
+
+def test_random_character_soup(tok):
+    """Short random texts over characters that stress the cut rules (spaces, tabs, line
+    breaks, combining marks, no-break spaces, apostrophes, added tokens), grown in rounds."""
+    enc = _encoder(tok)
+    rng = random.Random(7)
+    alphabet = ["a", "b", " ", "  ", "\t", ".", "(", ")", "_", "1", "2", "\n", "é", "中",
+                "'", "́", " ", "<think>", "x y", "\r\n", "  \n", "'s ", " '"]
+    checked = 0
+    for _ in range(300):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 200)))
+        for _ in range(5):
+            assert enc.encode(text) == tuple(tok.encode(text)), repr(text)
+            checked += 1
+            text += "".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 40)))
+    assert enc.hits > checked // 2

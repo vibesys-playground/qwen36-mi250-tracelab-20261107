@@ -234,6 +234,7 @@ class _FastEntry:
     snap: Any  # engine.fast.model.Snapshot
     nbytes: int
     tail: bool
+    spec: Any = None  # a tail's speculative acceptance counts (plan 67, ``speculative.carry_state``)
 
 
 class FastPrefixCache:
@@ -266,6 +267,7 @@ class FastPrefixCache:
         self.bytes = 0
         self.tail_hits = 0
         self.evictions = 0
+        self.last_spec: Any = None  # the ``spec`` of the tail the last ``lookup`` handed over
         fast.pool.on_pressure = self.evict_one
 
     _usable = PrefixCache._usable
@@ -282,12 +284,14 @@ class FastPrefixCache:
             key=len,
             default=None,
         )
+        self.last_spec = None
         if best is None:
             return 0, None, False
         entry = self._entries[best]
         if entry.tail:
             self._remove(best)
             self.tail_hits += 1
+            self.last_spec = entry.spec
             return len(best), entry.snap, True
         self._entries.move_to_end(best)
         return len(best), entry.snap, False
@@ -302,8 +306,9 @@ class FastPrefixCache:
         snap = self._fast.snapshot(slot, len(key))
         self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=False))
 
-    def store_tail(self, key: tuple[int, ...], slot: int) -> None:
-        """Move ``slot``'s state, which covers exactly ``key``, into a session tail.
+    def store_tail(self, key: tuple[int, ...], slot: int, spec: Any = None) -> None:
+        """Move ``slot``'s state, which covers exactly ``key``, into a session tail (with the
+        request's acceptance counts ``spec``, plan 67).
 
         The slot keeps no pages afterwards (it is about to be reset). With an
         entry already at ``key``, that entry becomes the tail and the slot's
@@ -313,12 +318,13 @@ class FastPrefixCache:
             self._release(older)  # superseded: the new tail extends it
         if key in self._entries:
             self._entries[key].tail = True
+            self._entries[key].spec = spec
             self._entries.move_to_end(key)
             return
         if not self._admits(key):
             return
         snap = self._fast.detach(slot, len(key))
-        self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=True))
+        self._insert(key, _FastEntry(snap, self._fast.snapshot_bytes(snap), tail=True, spec=spec))
 
     def _admits(self, key: tuple[int, ...]) -> bool:
         return bool(key) and len(key) <= self._max_tokens and self._max_entries > 0
@@ -457,7 +463,7 @@ class Generation:
             if slot is not None and self._prompt and self._picked:
                 key = self._prompt + tuple(self._picked[:-1])
                 if len(key) == self.length:
-                    g.keep_tail_fast(key, slot)
+                    g.keep_tail_fast(key, slot, speculative.carry_state(self))
             self._ended_slot = None
             g.finished(self)
             return
@@ -753,6 +759,11 @@ class Generator:
             "spec_ahead": dict(getattr(self, "spec_ahead", {})),
             "spec_k_tokens": dict(getattr(self, "spec_k_tokens", {})),
             "spec_k_changes": getattr(self, "spec_k_changes", 0),
+            # plan 67: need-capped steps by "requests:k", served step price by "bucket:k"
+            "spec_k_capped": dict(getattr(self, "spec_k_capped", {})),
+            "spec_cost_served": {f"{s}:{k}": round(v, 3)
+                                 for (s, k), v in sorted(getattr(self, "_spec_cost", {}).items())},
+            "spec_cost_n": {f"{s}:{k}": v for (s, k), v in sorted(getattr(self, "_spec_cost_n", {}).items())},
             "prefilled_tokens": self.prefilled_tokens,
             "cached_tokens": self.cached_tokens,
             "prefix_cache_tail_hits": pc.tail_hits,
@@ -788,7 +799,7 @@ class Generator:
             generation._ended_slot = generation.slot
             generation.slot = None
 
-    def keep_tail_fast(self, key: tuple[int, ...], slot: int) -> None:
+    def keep_tail_fast(self, key: tuple[int, ...], slot: int, spec: Any = None) -> None:
         """Keep a finished request's slot state, covering exactly ``key``, for the next round.
 
         ``slot`` must not have been reset yet (it is reset only when reclaimed,
@@ -797,7 +808,7 @@ class Generator:
         if slot in self._free_slots:
             return
         with torch.inference_mode():
-            self._prefix_cache.store_tail(key, slot)
+            self._prefix_cache.store_tail(key, slot, spec)
 
     def _start_fast(self, prompt: tuple[int, ...], sampling: Sampling, max_tokens: int) -> Generation:
         self._reclaim()
@@ -834,6 +845,8 @@ class Generator:
         )
         if self.fast.mtp is not None:
             generation.draft = int(self.fast.last_drafts[0])
+            if tail:  # resumed from its session's tail: start from the session's counts (plan 67)
+                speculative.inherit(generation, self._prefix_cache.last_spec)
         return generation
 
     def _prefill_fast(self, prompt: tuple[int, ...], start: int, slot: int) -> torch.Tensor:
@@ -961,6 +974,7 @@ class _Pending:
     reused: int
     spans: list[tuple[int, int, bool]]
     at: int = 0
+    spec: Any = None  # the session tail's acceptance counts (plan 67)
 
 
 class PackedPrefill:
@@ -1019,7 +1033,8 @@ class PackedPrefill:
         g.cached_tokens += reused
         g.prefilled_tokens += len(prompt) - reused
         self._pending.append(
-            _Pending(ticket, prompt, sampling, max_tokens, slot, reused, g._chunks(prompt, reused))
+            _Pending(ticket, prompt, sampling, max_tokens, slot, reused, g._chunks(prompt, reused),
+                     spec=g._prefix_cache.last_spec if tail else None)
         )
         return ticket
 
@@ -1075,6 +1090,7 @@ class PackedPrefill:
                 )
                 if drafts is not None:
                     generation.draft = drafts[row]
+                    speculative.inherit(generation, entry.spec)
                 done.append((entry.ticket, generation))
         self._pending = [e for e in self._pending if e.at < len(e.spans)]
         return done

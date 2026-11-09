@@ -119,8 +119,22 @@ def chain_enabled(generator: Generator) -> bool:
 
 KS = (1, 3, 4, 5, 7)
 KBASE = 3  # deeper k needs the per-depth case and the margin (plan 58)
-PRIOR = (3.2, 4.0)  # (accepted, checked) pseudo-counts: a per-draft acceptance of 0.8
-DECAY = 0.95
+_OFF = ("0", "false", "off", "no")
+# Plan 67 (``ENGINE_SPEC_CARRY``): a request resumed from its session's tail starts from the
+# session's own decayed acceptance counts (model state, carried with the tail; nothing is read
+# from the text), the counts decay slower so a well-predicted request's rate is not capped near
+# 0.967, and each (slot bucket, k) is priced at the measured GPU time of the served steps
+# (``ENGINE_SPEC_SERVED_COST``, an EMA seeded from ``COST``; hardware timing only).
+CARRY = os.environ.get("ENGINE_SPEC_CARRY", "0").strip().lower() not in _OFF
+SERVED_COST = CARRY and os.environ.get("ENGINE_SPEC_SERVED_COST", "1").strip().lower() not in _OFF
+# (accepted, checked) pseudo-counts: a per-draft acceptance of 0.8
+PRIOR = (0.8, 1.0) if CARRY else (3.2, 4.0)
+DECAY = 0.985 if CARRY else 0.95
+COST_ALPHA = 0.05  # EMA weight of one served step's GPU time
+# With the slow decay, a request whose text turns hard would keep its carried rates for many
+# steps: a fast-decayed acceptance (about the last 3 steps, not carried) caps every position's
+# rate in the deep estimate, so it falls back to k <= 3 within a few steps.
+RECENT_DECAY = 0.7
 MARGIN = float(os.environ.get("ENGINE_SPEC_DEEP_MARGIN", "0.05"))
 # Slot buckets that may run k > 3 (default: every bucket with its own cost row).
 DEEP_SIZES = {int(x) for x in os.environ.get("ENGINE_SPEC_DEEP_SIZES", "").split(",") if x.strip()}
@@ -159,9 +173,53 @@ def _row(size: int) -> int | None:
     return below[-1] if below else sizes[0]
 
 
-def cost(size: int, k: int) -> float:
+def cost(size: int, k: int, generator: Any = None) -> float:
+    """ms per step of bucket ``size`` with k drafts: the served EMA (plan 67) when there is one,
+    else the table."""
+    served = getattr(generator, "_spec_cost", None) if generator is not None else None
+    if served and (size, k) in served:
+        return served[(size, k)]
     row = _row(size)
     return _cost().get((row, k), 1.0) if row is not None else 1.0
+
+
+def learn_cost(generator: Generator, handle: dict) -> None:
+    """Fold one served step's GPU time (input load to picks copied, rank 0's stream) into its
+    (bucket, k) price; samples outside 0.5-2x the table are dropped (a stall, not the step)."""
+    ms = handle.get("gpu_ms")
+    if ms is None:
+        return
+    size, k = handle["size"], handle["groups"] - 1
+    seed = cost(size, k)
+    if not 0.5 * seed <= ms <= 2.0 * seed:
+        return
+    served = generator.__dict__.setdefault("_spec_cost", {})
+    n = generator.__dict__.setdefault("_spec_cost_n", {})
+    cur = served.get((size, k), seed)
+    served[(size, k)] = cur + COST_ALPHA * (ms - cur)
+    n[(size, k)] = n.get((size, k), 0) + 1
+
+
+def carry_state(g: Generation) -> dict | None:
+    """The request's acceptance counts, to hand to the round that resumes its session tail."""
+    if not CARRY or not getattr(g, "speculates", False):
+        return None
+    d = g.__dict__
+    return {
+        "checked": g.spec_checked, "accepted": g.spec_accepted,
+        "depth_checked": list(d.get("spec_depth_checked") or []),
+        "depth_accepted": list(d.get("spec_depth_accepted") or []),
+    }
+
+
+def inherit(g: Generation, state: dict | None) -> None:
+    """Start ``g`` from its session's carried counts (``carry_state``)."""
+    if not CARRY or not state or not g.speculates:
+        return
+    g.spec_checked, g.spec_accepted = state["checked"], state["accepted"]
+    if state["depth_checked"]:
+        g.spec_depth_checked = list(state["depth_checked"])
+        g.spec_depth_accepted = list(state["depth_accepted"])
 
 
 def depths(size: int) -> list[int]:
@@ -199,6 +257,11 @@ def expected_tokens(g: Generation, k: int) -> float:
     chk = g.__dict__.get("spec_depth_checked") or [0.0] * max(KS)
     acc = g.__dict__.get("spec_depth_accepted") or [0.0] * max(KS)
     rate = [(acc[j] + PRIOR[0]) / (chk[j] + PRIOR[1]) for j in range(len(chk))]
+    if CARRY:
+        rc = g.__dict__.get("spec_recent_checked", 0.0)
+        if rc >= 1.0:
+            recent = g.__dict__.get("spec_recent_accepted", 0.0) / rc
+            rate = [min(r, recent) for r in rate]
     seen = [j for j in range(len(chk)) if chk[j] >= 1.0]
     deeper = [rate[j] for j in seen if j >= 1]
     floor = min(deeper) if deeper else (rate[0] if seen else PRIOR[0] / PRIOR[1])
@@ -224,7 +287,7 @@ def choose_k(generator: Generator, generations: list[Generation]) -> int:
         return allowed[0]
 
     def gain(k: int) -> float:
-        return sum(sum(p ** i for i in range(k + 1)) for p in rates) / cost(size, k)
+        return sum(sum(p ** i for i in range(k + 1)) for p in rates) / cost(size, k, generator)
 
     base = [k for k in allowed if k <= KBASE]
     k0 = max(base, key=gain) if base else allowed[0]
@@ -233,13 +296,15 @@ def choose_k(generator: Generator, generations: list[Generation]) -> int:
         return k0
 
     def gain_d(k: int) -> float:
-        return sum(expected_tokens(g, k) for g in spec) / cost(size, k)
+        return sum(expected_tokens(g, k) for g in spec) / cost(size, k, generator)
 
     # A step of k can only hand the next step k real drafts (the head's chain is k long), so a
     # deeper k than the batch's last one runs its extra positions on padding once: going up
     # needs the margin, and a batch already running deep stays at its k unless another deep k
     # beats it by the margin or k <= 3 beats it outright (going down costs nothing).
     have = min(len(g.drafts) if g.drafts and g.drafts[0] == g.draft else 1 for g in spec)
+    if CARRY and have <= 1:
+        return k0  # the step after prefill has one real draft: a deep k would run on padding
     best = max(deep, key=gain_d)
     if have in deep:
         if gain_d(have) < gain_d(KBASE):
@@ -303,6 +368,10 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
     if last is not None and last[0] == ids and last[1] != k:
         generator.spec_k_changes = getattr(generator, "spec_k_changes", 0) + 1
     generator._spec_last = (ids, k)
+    # plan 67: steps in which a request had too few tokens left for k = 5 to pay (need-capped)
+    if any(g.speculates and g._max_tokens - g._count - len(g.queue) - 1 < 5 for g in generations):
+        capped = generator.__dict__.setdefault("spec_k_capped", {})
+        capped[key] = capped.get(key, 0) + 1
     for i, g in enumerate(generations):
         g.flipped = False
         g.advanced = 0
@@ -330,6 +399,10 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             generator.mtp_accepted += acc[i]
             g.spec_checked = g.spec_checked * DECAY + checked
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
+            if CARRY:
+                d = g.__dict__
+                d["spec_recent_checked"] = d.get("spec_recent_checked", 0.0) * RECENT_DECAY + checked
+                d["spec_recent_accepted"] = d.get("spec_recent_accepted", 0.0) * RECENT_DECAY + acc[i]
             # positions past the real drafts held padding: they say nothing about acceptance
             _depth_book(g, min(k, getattr(g, "spec_real", k)), acc[i])
 
@@ -448,6 +521,8 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
         looptimers.add("choosek", looptimers.now() - t0)
     result = fast.chain_collect(handle)
     _learn(generator, handle)
+    if SERVED_COST:
+        learn_cost(generator, handle)
     if nxt_handle is not None and nxt_handle.get("b2b"):
         nxt_handle["t_start"] = handle["t_done"]
     if timed:

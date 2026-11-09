@@ -55,9 +55,15 @@ from typing import Any
 import torch
 from torch.nn import functional as F
 
-from engine import cpu_place, looptimers
+from engine import cpu_place, looptimers, speculative
 from engine.fast import kernels, mfma
 from engine.fast.model import DECODE_EXPERT_TOKENS, PAGE, FastModel, Snapshot, _PackPlan, _rms
+
+
+def _step_timing() -> bool:
+    """Timed CUDA events around each chained step: loop timers or the served step cost (plan 67)."""
+    return looptimers.ENABLED or speculative.SERVED_COST
+
 
 triton, tl = kernels.triton, kernels.tl
 
@@ -1540,7 +1546,7 @@ class TPModel:
         buf = self._chain_pinned()
         with torch.cuda.device(dev):
             buf[:n].copy_(out, non_blocking=True)
-            event = torch.cuda.Event(enable_timing=looptimers.ENABLED)
+            event = torch.cuda.Event(enable_timing=_step_timing())
             event.record(torch.cuda.current_stream(dev))
         handle["buf"], handle["n"], handle["event"] = buf, n, event
 
@@ -1554,7 +1560,7 @@ class TPModel:
         )
 
     def _timed_event(self, name: str, handle: dict) -> None:
-        if looptimers.ENABLED:
+        if _step_timing():
             dev = self.devices_tp[0]
             ev = torch.cuda.Event(enable_timing=True)
             ev.record(torch.cuda.current_stream(dev))
@@ -1635,6 +1641,9 @@ class TPModel:
             t0 = looptimers.now()
         handle["event"].synchronize()
         handle["t_done"] = time.perf_counter()
+        if "ev_launch" in handle and _step_timing():
+            # GPU time of the step on rank 0's stream: inputs loaded to picks copied (plan 67)
+            handle["gpu_ms"] = handle["ev_launch"].elapsed_time(handle["event"])
         if timed:
             t1 = looptimers.now()
             looptimers.add("wait", t1 - t0)

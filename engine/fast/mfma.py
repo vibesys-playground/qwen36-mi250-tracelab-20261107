@@ -39,6 +39,20 @@ GEMV = CHAIN or os.environ.get("ENGINE_MFMA_GEMV", "0") == "1"
 KMAX = int(os.environ.get("ENGINE_SPEC_KMAX", "3"))
 RING = KMAX + 1
 BM = 16  # the fixed row tile
+# Plan 37: the MoE router top-k inside the router|shared GEMV's K-sum kernel, so no
+# ``fused._topk_kernel`` launch per layer (on by default; ENGINE_TOPK_EPI=0 restores the
+# separate launch). R extra programs of the K-sum launch, one per row, each re-sum that row's
+# E router columns from the same fp32 K parts in the same order and run the top-k on those
+# values in registers (no cross-program dependency). The softmax/top-k math is
+# ``_topk_vals``, the body of ``fused._topk``, in one wave (num_warps=1 as ``_topk_kernel``),
+# so experts, order and weights are bitwise equal.
+# Step 0 (j183, TP2 GCD 2,3, served verify_chain B=2): bitwise over 1000 graph replays x 3
+# layers x R 1-32; 9.155 -> 8.809 ms (k=1), 13.648 -> 13.311 ms (k=3). A last-program variant
+# (atomic tile counter, one wave doing every row's top-k) was slower (9.594, 14.385): dropped.
+# Step 1 (j192, on f4b2962): bitwise again (1000 replays x 3 layers x R 1-32); chain_gate
+# 9.285 -> 9.002 ms (k=1), 13.75 -> 13.427 ms (k=3); served A/B 0/1/0/1 302/302 requests
+# identical across all four processes; 0 Triton compiles after /health.
+TOPK_EPI = os.environ.get("ENGINE_TOPK_EPI", "1") == "1"
 
 # Tiles per weight shape (N, K): outputs per tile, K chunk, warps, K split. Never by row count.
 # in_proj and lm_head from j143's sweep (TP2 shard); the small shapes split K so a launch has
@@ -116,6 +130,53 @@ if triton is not None:
         for p in tl.static_range(1, KSPLIT):
             s += tl.load(part_ptr + (p * BM + r) * N + n, mask=m, other=0.0)
         tl.store(out_ptr + r * stride_out + n, s.to(tl.bfloat16), mask=m)
+
+    @triton.jit
+    def _topk_vals(p, ee, E: tl.constexpr, TOPK: tl.constexpr, TOPKP: tl.constexpr):
+        """fp32 softmax over E values (BF16 logits as fp32), top-k, renormalized, rounded to
+        BF16: ``fused._topk``'s math on values already loaded (``ee = tl.arange(0, E)``)."""
+        p = tl.exp(p - tl.max(p, axis=0))
+        p = p / tl.sum(p, axis=0)
+        kk = tl.arange(0, TOPKP)
+        sel_w = tl.zeros([TOPKP], dtype=tl.float32)
+        sel_i = tl.zeros([TOPKP], dtype=tl.int32)
+        for j in tl.static_range(TOPK):
+            mx = tl.max(p, axis=0)
+            i = tl.min(tl.where(p == mx, ee, E), axis=0)
+            sel_w = tl.where(kk == j, mx, sel_w)
+            sel_i = tl.where(kk == j, i, sel_i)
+            p = tl.where(ee == i, -1.0, p)
+        sel_w = sel_w / tl.sum(sel_w, axis=0)
+        return sel_i, sel_w.to(tl.bfloat16).to(tl.float32)
+
+    @triton.jit(do_not_specialize=["R", "N"])
+    def _ksum_router_kernel(part_ptr, out_ptr, idx_ptr, wt_ptr, R, N, stride_out,
+                            KSPLIT: tl.constexpr, BM: tl.constexpr, BLOCK: tl.constexpr,
+                            E: tl.constexpr, TOPK: tl.constexpr, TOPKP: tl.constexpr):
+        """``_ksum_kernel`` (programs < cdiv(R N, BLOCK)) plus, in R extra programs, each
+        row's router top-k (``TOPK_EPI``). One wave per program (num_warps=1)."""
+        pid = tl.program_id(0)
+        nmain = tl.cdiv(R * N, BLOCK)
+        if pid < nmain:
+            i = pid * BLOCK + tl.arange(0, BLOCK)
+            r = i // N
+            n = i % N
+            m = r < R
+            s = tl.load(part_ptr + r * N + n, mask=m, other=0.0)
+            for p in tl.static_range(1, KSPLIT):
+                s += tl.load(part_ptr + (p * BM + r) * N + n, mask=m, other=0.0)
+            tl.store(out_ptr + r * stride_out + n, s.to(tl.bfloat16), mask=m)
+        else:
+            ee = tl.arange(0, E)
+            kk = tl.arange(0, TOPKP)
+            row = pid - nmain
+            s = tl.load(part_ptr + row * N + ee)
+            for p in tl.static_range(1, KSPLIT):
+                s += tl.load(part_ptr + (p * BM + row) * N + ee)
+            v = s.to(tl.bfloat16).to(tl.float32)
+            sel_i, sel_w = _topk_vals(v, ee, E, TOPK, TOPKP)
+            tl.store(idx_ptr + row * TOPK + kk, sel_i, mask=kk < TOPK)
+            tl.store(wt_ptr + row * TOPK + kk, sel_w, mask=kk < TOPK)
 
     @triton.jit
     def _gdn_conv_chain_kernel(
@@ -249,6 +310,36 @@ def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None,
             m = (r1 - r0) * n
             _ksum_kernel[(triton.cdiv(m, 1024),)](part, orr, r1 - r0, n, orr.stride(0),
                                                   KSPLIT=ksplit, BM=BM, BLOCK=1024, num_warps=4)
+    return out
+
+
+def gemv_topk(x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor, wt: torch.Tensor,
+              experts: int, top_k: int) -> torch.Tensor | None:
+    """The router|shared GEMV ``bf16(x @ w.T)`` (``gemv``'s tiles and bits) with each row's
+    router top-k written to ``idx``/``wt`` (``fused._topk_kernel``'s values) by R extra
+    programs of the K-sum kernel. None when the shape runs without a K split (no K-sum
+    kernel): the caller runs the GEMV and top-k as before."""
+    rows, k = x.shape
+    n = w.shape[0]
+    assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
+    bn, bk, warps, ksplit = tiles_for(n, k)
+    if ksplit == 1 or experts & (experts - 1) or n < experts:
+        return None
+    out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
+    part = torch.empty((ksplit * BM * n,), dtype=torch.float32, device=x.device)
+    block = 256
+    for r0 in range(0, rows, BM):
+        r1 = min(rows, r0 + BM)
+        xr, orr = x[r0:r1], out[r0:r1]
+        _mfma_gemv_kernel[(triton.cdiv(n, bn) * ksplit,)](
+            xr, w, orr, part, r1 - r0, n, orr.stride(0), K=k, BM=BM, BN=bn, BK=bk, KSPLIT=ksplit,
+            DOT_F32=kernels.INTERPRET, num_warps=warps,
+        )
+        _ksum_router_kernel[(triton.cdiv((r1 - r0) * n, block) + (r1 - r0),)](
+            part, orr, idx[r0:r1], wt[r0:r1], r1 - r0, n, orr.stride(0), KSPLIT=ksplit,
+            BM=BM, BLOCK=block, E=experts, TOPK=top_k, TOPKP=triton.next_power_of_2(top_k),
+            num_warps=1,
+        )
     return out
 
 

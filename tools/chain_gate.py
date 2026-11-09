@@ -79,6 +79,8 @@ def main() -> None:
     parser.add_argument("--slots", default="2", help="slot counts for sections 2-4, e.g. 1,2")
     parser.add_argument("--drafts", choices=("repeat", "corpus"), default="repeat",
                         help="step-time drafts: the last pick repeated, or the prompt's continuation")
+    parser.add_argument("--adaptive", action="store_true",
+                        help="section 3 also runs the chooser (ENGINE_SPEC_K unset): parity and its k")
     parser.add_argument("--link-save-ms", type=float, default=0.35,
                         help="estimate: ms saved per draft link by cheaper drafts (plan 47)")
     args = parser.parse_args()
@@ -261,7 +263,7 @@ def main() -> None:
 
     fast.verify_chain = logged
     for nslots in SLOTS:
-        for kname in [str(k) for k in KS]:
+        for kname in [str(k) for k in KS] + ([""] if args.adaptive else []):
             os.environ["ENGINE_SPEC_K"] = kname
             for name in groups:
                 tot_tokens = tot_steps = 0
@@ -319,13 +321,13 @@ def main() -> None:
                         else:
                             at = next((i for i, (a, b) in enumerate(zip(spec[r], want[r])) if a != b),
                                       min(len(spec[r]), len(want[r])))
-                            out("parity_diverges", k=kname, slots=nslots, set=name, prompt=idx[r], at=at)
+                            out("parity_diverges", k=kname or "adaptive", slots=nslots, set=name, prompt=idx[r], at=at)
                 e = tot_tokens / max(1, tot_steps)
                 accept[key] = {"E": e, "rate": accepted / max(1, proposed)}
                 p_j = [round(depth_a.get(key + (j,), 0) / depth_n[key + (j,)], 4)
                        for j in range(1, 8) if depth_n.get(key + (j,))]
-                out("accept", k=kname, slots=nslots, set=name, identical=f"{same}/{2 * args.pairs}",
-                    p_j=p_j, depth_n=[depth_n.get(key + (j,), 0) for j in range(1, int(kname) + 1)],
+                out("accept", k=kname or "adaptive", slots=nslots, set=name, identical=f"{same}/{2 * args.pairs}",
+                    p_j=p_j, depth_n=[depth_n.get(key + (j,), 0) for j in range(1, max(KS) + 1) if depth_n.get(key + (j,))],
                     slot_steps=tot_steps, tokens_per_slot_step=round(e, 3),
                     drafts_checked=proposed, drafts_accepted=accepted,
                     per_draft_rate=round(accepted / max(1, proposed), 4))
@@ -335,7 +337,7 @@ def main() -> None:
                 for (kk, rows_), ws in sorted(by.items()):
                     if len(ws) >= 5:
                         ws.sort()
-                        out("gen_step", k=kname, set=name, draft_k=kk, slots=rows_, n=len(ws),
+                        out("gen_step", k=kname or "adaptive", set=name, draft_k=kk, slots=rows_, n=len(ws),
                             ms_p50=round(statistics.median(ws), 3), ms_p90=round(ws[int(0.9 * (len(ws) - 1))], 3))
     os.environ["ENGINE_SPEC_K"] = ""
     fast.verify_chain = real_verify_chain

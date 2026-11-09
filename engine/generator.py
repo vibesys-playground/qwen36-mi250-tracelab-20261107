@@ -576,7 +576,10 @@ class Generator:
 
             head = speculative.load_head(lm, model, revision)
             fast_options = {
-                "slots": int(os.environ.get("ENGINE_SLOTS", "32")),
+                # 14 (plan 58): with the ring of KMAX + 1 = 8 GDN states per slot row, 14 slots
+                # leave the KV pool no smaller than 32 slots with a ring of 4 (j268); a replica
+                # runs at most a few sessions at once (session tails live outside the slots).
+                "slots": int(os.environ.get("ENGINE_SLOTS", "14")),
                 # A verify step writes its draft one position past the last token.
                 "max_len": options["max_model_len"] + (1 if head is not None else 0),
                 "mtp": head,
@@ -598,10 +601,13 @@ class Generator:
                 chain = head is not None and getattr(fast, "chain", False)
                 fast.capture_all(decode=head is None, verify=not chain)
                 if chain and fast.use_graphs:
-                    # Plan 31: the chained verify's graphs, k + 1 = 8, 4, 2 rows per slot.
-                    for groups in (8, 4, 2):
+                    # Plan 31 / 58: the chained verify's graphs, k + 1 rows per slot for every
+                    # (bucket, k) the chooser may run (``speculative.depths``), before /health.
+                    plan = {s: speculative.depths(s) for s in fast.buckets}
+                    for groups in sorted({k + 1 for ks in plan.values() for k in ks}, reverse=True):
                         for size in sorted(fast.buckets, reverse=True):
-                            if groups <= mfma.RING and groups * size <= 64 and fast.graph_error is None:
+                            if (groups - 1 in plan[size] and groups <= mfma.RING and groups * size <= 64
+                                    and fast.graph_error is None):
                                 fast.capture(size, False, groups)
                     if hasattr(fast, "warm_chain_next") and fast.graph_error is None:
                         fast.warm_chain_next()  # plan 42's run-ahead input kernel
@@ -742,6 +748,8 @@ class Generator:
             "mtp_verify_steps": self.verify_steps,
             "mtp_proposed": self.mtp_proposed,
             "mtp_accepted": self.mtp_accepted,
+            # chained verify steps by "requests in the step:k" (plan 58)
+            "spec_k_hist": dict(getattr(self, "spec_k_hist", {})),
             "prefilled_tokens": self.prefilled_tokens,
             "cached_tokens": self.cached_tokens,
             "prefix_cache_tail_hits": pc.tail_hits,

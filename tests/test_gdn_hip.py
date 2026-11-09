@@ -89,7 +89,7 @@ def test_chain_equals_decode_steps(n, groups):
     # one slot alone (another column split) gives the same bits as inside the batch
     if n > 1:
         c3, r3 = conv.clone(), rec.clone()
-        s0 = states.view(groups, n)[:, :1].reshape(-1)
+        s0 = states.view(groups, n)[:, :1].reshape(-1).contiguous()
         p0 = proj.view(groups, n, -1)[:, 0].contiguous()
         core0 = gdn_hip.layer_core(m, c3, r3, p0, s0, groups)
         torch.cuda.synchronize()

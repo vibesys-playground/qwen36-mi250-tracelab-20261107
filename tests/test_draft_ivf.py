@@ -97,12 +97,12 @@ def test_served_draft_graph_and_fallback() -> None:
     y = (torch.randn((8, 2048), device="cuda")).to(torch.bfloat16)
     probe = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=0.0)
     # the reference: IVF pick and gap per row
-    s = draft_ivf.cluster_scores(y, probe.index)
+    s = draft_ivf.cluster_scores(y, probe.indices[0])
     order = torch.sort(s, dim=1, descending=True, stable=True).indices
     nxt = s.gather(1, order[:, 8:9])[:, 0]
     logits = (y.float() @ w.float().T).to(torch.bfloat16).float()
     full = logits.argmax(1)
-    _, ivf = draft_ivf.reference_draft(y, w, probe.index, 8)
+    _, ivf = draft_ivf.reference_draft(y, w, probe.indices[0], 8)
     top = logits.gather(1, ivf[:, None])[:, 0]
     gaps = top - nxt
     sg = torch.sort(gaps).values

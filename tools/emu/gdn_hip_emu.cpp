@@ -12,8 +12,9 @@
 
 using Kern = std::function<void()>;
 
-static void launch(int gx, int gy, int nt, const Kern& k) {
-    gridDim.x = gx; gridDim.y = gy; blockDim.x = nt;
+static void launch(int gx, int gy, int nt, const Kern& k, int gz = 1) {
+    gridDim.x = gx; gridDim.y = gy; gridDim.z = gz; blockDim.x = nt;
+    for (int bz = 0; bz < gz; ++bz)
     for (int by = 0; by < gy; ++by)
         for (int bx = 0; bx < gx; ++bx) {
             std::barrier<> blk(nt);
@@ -24,7 +25,7 @@ static void launch(int gx, int gy, int nt, const Kern& k) {
             g_emu.xch.assign(nt, 0);
             std::vector<std::thread> th;
             for (int t = 0; t < nt; ++t)
-                th.emplace_back([&, t] { threadIdx.x = t; blockIdx.x = bx; blockIdx.y = by; k(); });
+                th.emplace_back([&, t] { threadIdx.x = t; blockIdx.x = bx; blockIdx.y = by; blockIdx.z = bz; k(); });
             for (auto& x : th) x.join();
             for (auto* w : waves) delete w;
         }
@@ -151,7 +152,7 @@ static Ref reference(const Case& c, double eps) {
     return R;
 }
 
-template <int LPC, int CPL, int HPW, int CONV, int G>
+template <int LPC, int CPL, int HPW, int CONV, int G, int VS = 1>
 static int run(const char* name, int N, unsigned seed) {
     Case c = make(N, G, seed);
     const double eps = 1e-6;
@@ -160,14 +161,21 @@ static int run(const char* name, int N, unsigned seed) {
         for (int row = 0; row < N * G; ++row)
             for (int ch = 0; ch < CONV_DIM; ++ch) c.proj[(size_t)row * c.width + ch] = R.convout[(size_t)row * CONV_DIM + ch];
     }
-    constexpr int NT = (DV / ((64 / LPC) * CPL)) * HPW * 64;
+    constexpr int NT = (DV / VS / ((64 / LPC) * CPL)) * HPW * 64;
+    std::vector<float> obuf((size_t)N * G * VALUE_DIM, 0.0f);
     launch(N, V_HEADS / HPW, NT, [&] {
-        gdn_chain_impl<LPC, CPL, HPW, CONV, G, 1>(c.conv.data(), c.rec.data(), c.slots.data(), c.proj.data(),
+        gdn_chain_impl<LPC, CPL, HPW, CONV, VS, G, 1>(c.conv.data(), c.rec.data(), c.slots.data(), c.proj.data(),
                                                   c.cw.data(), c.alog.data(), c.dtb.data(), c.nw.data(),
-                                                  c.core.data(), c.prof.data(), N, c.width, (i64)CONV_DIM * 4,
+                                                  c.core.data(), obuf.data(), c.prof.data(), N, c.width, (i64)CONV_DIM * 4,
                                                   (i64)V_HEADS * DK * DV, (float)eps, 1.0f / std::sqrt((float)DK));
-    });
-    if (CONV && HPW < RATIO)
+    }, VS);
+    if (VS > 1) {
+        const int blocks = (N * G * V_HEADS + 3) / 4 + N * ((2 * KEY_DIM + 255) / 256);
+        launch(blocks, 1, 256, [&] {
+            gdn_post_impl<G>(obuf.data(), c.proj.data(), c.nw.data(), c.core.data(), c.conv.data(), c.slots.data(),
+                             N, c.width, (i64)CONV_DIM * 4, (float)eps);
+        });
+    } else if (CONV && HPW < RATIO)
         launch(N, (2 * KEY_DIM + 255) / 256, 256, [&] {
             gdn_qk_ring_impl<G>(c.conv.data(), c.slots.data(), c.proj.data(), N, c.width, (i64)CONV_DIM * 4);
         });
@@ -209,6 +217,11 @@ int main() {
     bad += run<8, 4, 1, 0, 2>("L8x4 sep", 2, 7);
     bad += run<8, 4, 2, 1, 4>("L8x4 f2", 2, 8);
     bad += run<4, 4, 2, 1, 4>("L4x4 f2", 1, 9);
+    bad += run<4, 4, 1, 1, 4, 2>("L4x4 v2", 2, 10);
+    bad += run<2, 1, 1, 1, 4, 4>("L2 v4", 2, 11);
+    bad += run<16, 4, 1, 1, 2, 8>("L16x4 v8", 1, 12);
+    bad += run<8, 4, 1, 1, 4, 2>("L8x4 v2", 2, 13);
+    bad += run<4, 1, 1, 1, 2, 4>("L4 v4", 2, 14);
     std::printf("%s\n", bad ? "EMU FAIL" : "EMU OK");
     return bad;
 }

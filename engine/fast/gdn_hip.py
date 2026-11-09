@@ -9,7 +9,9 @@ Layouts (``LAYOUTS``: name -> (LPC lanes per column group, CPL columns per lane)
   conv of q|k|v), then the HIP chain (CONV=0, one head per block);
 - ``f1``: conv in the HIP chain's prologue, one head per block (CONV=1, HPW=1), then the tiny
   ``gdn_qk_ring`` kernel writes the q / k conv ring rows (shared by the k-head's two blocks);
-- ``f2``: conv in the prologue, one block per k-head (both v-heads, HPW=2): one launch.
+- ``f2``: conv in the prologue, one block per k-head (both v-heads, HPW=2): one launch;
+- ``v2`` / ``v4`` / ``v8``: as ``f1`` with each head's value columns split over 2 / 4 / 8 blocks
+  (VS); the pre-norm o goes to a buffer and ``gdn_post`` runs the gated norm and the q / k ring.
 """
 
 from __future__ import annotations
@@ -24,16 +26,29 @@ from engine.fast import hipmega_rtc as rtc
 
 SRC = Path(__file__).parent / "hip" / "gdn_chain.hip"
 LAYOUTS = {"L4": (4, 1), "L16x4": (16, 4), "L2": (2, 1), "L8x4": (8, 4), "L4x4": (4, 4)}
-MODES = {"sep": (0, 1), "f1": (1, 1), "f2": (1, 2)}  # mode -> (CONV, HPW)
+MODES = {"sep": (0, 1, 1), "f1": (1, 1, 1), "f2": (1, 2, 1), "v2": (1, 1, 2), "v4": (1, 1, 4),
+         "v8": (1, 1, 8)}  # mode -> (CONV, HPW, VS)
 ARGS = ("u16* conv, float* rec, const i64* slots, const u16* proj, const float* cw, "
-        "const float* alog, const float* dtb, const float* nw, u16* core, i64* prof, i64 N, "
-        "i64 stride_in, i64 stride_cslot, i64 stride_slot, float eps, float scale")
-CALL = "conv, rec, slots, proj, cw, alog, dtb, nw, core, prof, N, stride_in, stride_cslot, stride_slot, eps, scale"
+        "const float* alog, const float* dtb, const float* nw, u16* core, float* obuf, i64* prof, "
+        "i64 N, i64 stride_in, i64 stride_cslot, i64 stride_slot, float eps, float scale")
+CALL = ("conv, rec, slots, proj, cw, alog, dtb, nw, core, obuf, prof, N, stride_in, stride_cslot, "
+        "stride_slot, eps, scale")
 
 
-def threads(layout: str, hpw: int, dv: int = 128) -> int:
+def threads(layout: str, hpw: int, vs: int = 1, dv: int = 128) -> int:
     lpc, cpl = LAYOUTS[layout]
-    return dv // ((64 // lpc) * cpl) * hpw * 64
+    return dv // vs // ((64 // lpc) * cpl) * hpw * 64
+
+
+def valid(layout: str, mode: str, dv: int = 128) -> bool:
+    lpc, cpl = LAYOUTS[layout]
+    _, hpw, vs = MODES[mode]
+    cw = (64 // lpc) * cpl
+    return (dv // vs) % cw == 0 and 64 <= threads(layout, hpw, vs, dv) <= 1024
+
+
+def modes(layout: str, dv: int = 128) -> list[str]:
+    return [m for m in MODES if valid(layout, m, dv)]
 
 
 def kname(layout: str, mode: str, g: int, prof: int = 0) -> str:
@@ -44,14 +59,19 @@ def source(layout: str, groups=(2, 4), prof_groups=(4,), dv: int = 128) -> str:
     lpc, cpl = LAYOUTS[layout]
     out = [SRC.read_text(), "\n// ---- generated entry points\n"]
     for g in groups:
-        for mode, (conv, hpw) in MODES.items():
+        for mode in modes(layout, dv):
+            conv, hpw, vs = MODES[mode]
             for p in (0, 1) if g in prof_groups else (0,):
-                nt = threads(layout, hpw, dv)
+                nt = threads(layout, hpw, vs, dv)
                 out.append(f'extern "C" __global__ void __launch_bounds__({nt}) {kname(layout, mode, g, p)}({ARGS}) '
-                           f"{{ gdn_chain_impl<{lpc}, {cpl}, {hpw}, {conv}, {g}, {p}>({CALL}); }}\n")
+                           f"{{ gdn_chain_impl<{lpc}, {cpl}, {hpw}, {conv}, {vs}, {g}, {p}>({CALL}); }}\n")
         out.append(f'extern "C" __global__ void __launch_bounds__(256) gdn_qk_ring_g{g}(u16* conv, const i64* slots, '
                    f"const u16* proj, i64 N, i64 stride_in, i64 stride_cslot) "
                    f"{{ gdn_qk_ring_impl<{g}>(conv, slots, proj, N, stride_in, stride_cslot); }}\n")
+        out.append(f'extern "C" __global__ void __launch_bounds__(256) gdn_post_g{g}(const float* obuf, const u16* proj, '
+                   f"const float* nw, u16* core, u16* conv, const i64* slots, i64 N, i64 stride_in, "
+                   f"i64 stride_cslot, float eps) "
+                   f"{{ gdn_post_impl<{g}>(obuf, proj, nw, core, conv, slots, N, stride_in, stride_cslot, eps); }}\n")
     return "".join(out)
 
 
@@ -78,18 +98,19 @@ def prepack(L) -> None:
 class GdnHip:
     """One layout's compiled kernels on one device."""
 
-    def __init__(self, layout: str, code: bytes, dev: torch.device) -> None:
+    def __init__(self, layout: str, code: bytes, dev: torch.device, max_rows: int = 16,
+                 value_dim: int = 2048) -> None:
         self.layout, self.dev = layout, dev
         self.mod = rtc.Module(code, dev)
-        self.prof = torch.zeros(4096, dtype=torch.int64, device=dev)
+        self.prof = torch.zeros(8192, dtype=torch.int64, device=dev)
+        self.obuf = torch.zeros((max_rows, value_dim), dtype=torch.float32, device=dev)
 
     def chain(self, L, proj, states, core, n: int, groups: int, mode: str, prof: int = 0) -> None:
-        conv, hpw = MODES[mode]
+        _, hpw, vs = MODES[mode]
         prepack(L)
-        heads = L.num_v_heads
         fn = self.mod.fn(kname(self.layout, mode, groups, prof))
-        fn.launch((n, heads // hpw, 1), threads(self.layout, hpw, L.head_v_dim), [
-            L.conv, L.rec, states, proj, L.cw32, L.alog32, L.dtb32, L.nw32, core, self.prof,
+        fn.launch((n, L.num_v_heads // hpw, vs), threads(self.layout, hpw, vs, L.head_v_dim), [
+            L.conv, L.rec, states, proj, L.cw32, L.alog32, L.dtb32, L.nw32, core, self.obuf, self.prof,
             n, proj.stride(0), L.conv.stride(0), L.rec.stride(0),
             ctypes.c_float(L.eps), ctypes.c_float(L.head_k_dim ** -0.5)])
 
@@ -97,6 +118,13 @@ class GdnHip:
         fn = self.mod.fn(f"gdn_qk_ring_g{groups}")
         fn.launch((n, (2 * L.key_dim + 255) // 256, 1), 256,
                   [L.conv, states, proj, n, proj.stride(0), L.conv.stride(0)])
+
+    def post(self, L, proj, states, core, n: int, groups: int) -> None:
+        vecs = n * groups * L.num_v_heads
+        blocks = (vecs + 3) // 4 + n * ((2 * L.key_dim + 255) // 256)
+        self.mod.fn(f"gdn_post_g{groups}").launch(
+            blocks, 256, [self.obuf, proj, L.nw32, core, L.conv, states, n, proj.stride(0),
+                          L.conv.stride(0), ctypes.c_float(L.eps)])
 
     def step(self, L, proj, states, core, n: int, groups: int, mode: str, prof: int = 0) -> None:
         """One GDN layer's conv + chain + norm for ``n`` slots x ``groups`` rows (rows
@@ -112,3 +140,5 @@ class GdnHip:
         self.chain(L, proj, states, core, n, groups, mode, prof)
         if mode == "f1":
             self.qk_ring(L, proj, states, n, groups)
+        elif MODES[mode][2] > 1:
+            self.post(L, proj, states, core, n, groups)

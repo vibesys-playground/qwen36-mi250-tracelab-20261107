@@ -19,8 +19,9 @@ per slot, 8 slots + dummy; ring entry 0 is the slot's own state row (in place, a
 4. timing: each variant's 30 layers in ONE captured graph, ms per 30 layers (median of 7 x 20
    replays); ceilings ``stream128w8`` (today's launch shape) / ``stream32w4`` and 30 empty
    launches from plan 48's kernels.
-5. per-phase time (s_memrealtime, 100 MHz; s_memtime cycles) of each layout's f2 / f1 kernel at
-   n=2, G=4: prologue (conv, gates, norms), chain, epilogue; median and max over blocks.
+5. per-phase time (s_memtime cycles; s_memrealtime ticks) of each layout / mode's chain kernel
+   at n=2, G=4: prologue (state loads, conv, gates, norms), chain, epilogue; median and max over
+   blocks (j244: ~67 cycles per realtime tick, i.e. a 25 MHz realtime clock at ~1.7 GHz).
 Prints ``RESULT`` lines and the plan's pass / kill rule. A hint for the plan, not the metric.
 """
 
@@ -50,7 +51,7 @@ HIPS: dict[str, gdn_hip.GdnHip] = {}
 
 
 def variants() -> list[str]:
-    return [f"{lay}_{mode}" for lay in HIPS for mode in gdn_hip.MODES]
+    return [f"{lay}_{mode}" for lay in HIPS for mode in gdn_hip.modes(lay)]
 
 
 def run(name, L, proj, states, core, n, G):
@@ -283,11 +284,11 @@ def phases(layers, dev, dims, n=2, G=4):
     hv = dims["num_v_heads"] * dims["head_v_dim"]
     core = torch.empty((n * G, hv), dtype=torch.bfloat16, device=dev)
     for lay, h in HIPS.items():
-        for mode in ("f2", "f1", "sep"):
+        for mode in gdn_hip.modes(lay):
             try:
                 proj = vb.rand_proj(n * G, L.width, gen, dev)
-                hpw = gdn_hip.MODES[mode][1]
-                blocks = n * dims["num_v_heads"] // hpw
+                _, hpw, vs = gdn_hip.MODES[mode]
+                blocks = n * dims["num_v_heads"] // hpw * vs
                 vals = []
                 for _ in range(5):
                     h.prof.zero_()
@@ -297,11 +298,11 @@ def phases(layers, dev, dims, n=2, G=4):
                 p = torch.stack(vals[1:]).view(-1, 8).double()
                 med = p.median(0).values
                 mx = p.max(0).values
-                us = lambda t: t * 0.01  # noqa: E731  100 MHz ticks -> us
-                log(f"RESULT phase n={n} G={G} {lay}_{mode} blocks={blocks} "
-                    f"prologue_us={us(med[0]):.2f} chain_us={us(med[1]):.2f} epilogue_us={us(med[2]):.2f} "
-                    f"total_us={us(med[3]):.2f} (max {us(mx[3]):.2f}) cycles prologue={med[4]:.0f} "
-                    f"chain={med[5]:.0f} chain_per_row={med[5] / G:.0f} epilogue={med[6]:.0f} total={med[7]:.0f}")
+                log(f"RESULT phase n={n} G={G} {lay}_{mode} blocks={blocks} cycles(s_memtime) median: "
+                    f"prologue={med[4]:.0f} chain={med[5]:.0f} chain_per_row={med[5] / G:.0f} "
+                    f"epilogue={med[6]:.0f} total={med[7]:.0f} (max over blocks {mx[7]:.0f}); "
+                    f"s_memrealtime ticks: prologue={med[0]:.0f} chain={med[1]:.0f} epilogue={med[2]:.0f} "
+                    f"total={med[3]:.0f} (max {mx[3]:.0f}) cycles_per_tick={med[7] / max(med[3], 1):.1f}")
             except Exception:  # noqa: BLE001
                 log(f"RESULT phase {lay}_{mode} error:\n{traceback.format_exc()}")
 
@@ -340,7 +341,8 @@ def main() -> None:
                 m = k.split("_")
                 occ = ""
                 if k.startswith("gdn_L"):
-                    nt = gdn_hip.threads(m[1], gdn_hip.MODES[m[2]][1], dims["head_v_dim"])
+                    _, hpw, vs = gdn_hip.MODES[m[2]]
+                    nt = gdn_hip.threads(m[1], hpw, vs, dims["head_v_dim"])
                     occ = f" threads={nt} blocks_per_CU={HIPS[lay].mod.fn(k).occupancy(nt)}"
                 log(f"RESULT compile {k} vgprs={v.get('VGPRs')} agprs={v.get('AGPRs')} "
                     f"spill={v.get('VGPRs Spill')} sgprs={v.get('SGPRs')} "

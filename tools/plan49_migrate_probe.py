@@ -655,7 +655,8 @@ def orchestrate(args) -> int:
         peer_log = b.recv(120)
         rows = summarize_stall(st)
         for row in rows:
-            result(kind="stall", tokens=st["tokens"], mb_total=round(st["bytes"] / 1e6, 2), bg=args.bg, **row)
+            result(kind="stall", transport=row.pop("kind"), tokens=st["tokens"],
+                   mb_total=round(st["bytes"] / 1e6, 2), bg=args.bg, **row)
         result(kind="stall_imports", imports=peer_log["imports"])
 
         summary = {"kind": "summary", "identical_all": identical, "continuations": compared,
@@ -665,7 +666,7 @@ def orchestrate(args) -> int:
             summary[f"export_ms_{kind}_{L}"] = round(statistics.median(r["export_ms"] for r in rs), 3)
             summary[f"mb_{kind}_{L}"] = rs[0]["mb_total"]
         for kind in stall_kinds:
-            sel = [r for r in rows if r["kind"] == kind and "error" not in r]
+            sel = [r for r in rows if r["transport"] == kind and "error" not in r]
             if sel:
                 summary[f"stall_ms_{kind}_8k"] = round(statistics.median(r["stall_ms"] for r in sel), 3)
                 summary[f"move_ms_{kind}_8k"] = round(statistics.median(r["move_ms"] for r in sel), 3)

@@ -234,7 +234,16 @@ def choose_k(generator: Generator, generations: list[Generation]) -> int:
     def gain_d(k: int) -> float:
         return sum(expected_tokens(g, k) for g in spec) / cost(size, k)
 
+    # A step of k can only hand the next step k real drafts (the head's chain is k long), so a
+    # deeper k than the batch's last one runs its extra positions on padding once: going up
+    # needs the margin, and a batch already running deep stays at its k unless another deep k
+    # beats it by the margin or k <= 3 beats it outright (going down costs nothing).
+    have = min(len(g.drafts) if g.drafts and g.drafts[0] == g.draft else 1 for g in spec)
     best = max(deep, key=gain_d)
+    if have in deep:
+        if gain_d(have) < gain_d(KBASE):
+            return k0
+        return best if gain_d(best) >= (1.0 + MARGIN) * gain_d(have) else have
     return best if gain_d(best) >= (1.0 + MARGIN) * gain_d(KBASE) else k0
 
 
@@ -272,6 +281,7 @@ def _drafts(generations: list[Generation], k: int) -> list[list[int]]:
     drafts = []
     for g in generations:
         ds = list(g.drafts) if g.drafts and g.drafts[0] == g.draft else [g.draft]
+        g.spec_real = min(k, len(ds))  # drafts past these are padding (plan 58)
         ds = (ds + [ds[-1]] * k)[:k]
         drafts.append(ds if g.speculates else [0] * k)
     return drafts
@@ -310,7 +320,8 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             generator.mtp_accepted += acc[i]
             g.spec_checked = g.spec_checked * DECAY + checked
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
-            _depth_book(g, k, acc[i])
+            # positions past the real drafts held padding: they say nothing about acceptance
+            _depth_book(g, min(k, getattr(g, "spec_real", k)), acc[i])
 
 
 MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.5")) / 1e3
@@ -387,6 +398,8 @@ def chain_step(generator: Generator, generations: list[Generation], ahead_ok: bo
         return
     if ahead is not None:
         k, handle = ahead.k, ahead.handle
+        for g in generations:
+            g.spec_real = k  # built on the GPU from the step before's k drafts: all real
     else:
         k = choose_k(generator, generations)
         gather = not all(g.speculates for g in generations)

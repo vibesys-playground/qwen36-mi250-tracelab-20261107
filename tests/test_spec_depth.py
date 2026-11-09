@@ -101,7 +101,8 @@ def test_depth_book_counts():
     assert g.spec_depth_checked[:5] == [1.0, 1.0, 1.0, 0.0, 0.0]
     assert g.spec_depth_accepted[:5] == [1.0, 1.0, 0.0, 0.0, 0.0]
     S._depth_book(g, 3, 3)
-    assert g.spec_depth_checked[:4] == [1.95, 1.95, 1.95, 0.0]
+    d = 1.0 * S.DECAY + 1.0
+    assert g.spec_depth_checked[:4] == [d, d, d, 0.0]
 
 
 def test_running_deep_stays_unless_beaten():

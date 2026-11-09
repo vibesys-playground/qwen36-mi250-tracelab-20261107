@@ -87,6 +87,18 @@ getattr(tunable, "write_file_on_exit", lambda v: None)(False)  # gone in torch 2
 tunable.enable(True)
 tunable.tuning_enable(True)
 tunable.record_untuned_enable(False)
+
+
+def dump(path):
+    # The results so far as a TunableOp results CSV (validators, then op,params,solution,ms rows),
+    # from get_validators / get_results: torch 2.10 has no tunable.write_file.
+    v = tunable.get_validators()
+    v = v.items() if isinstance(v, dict) else v
+    out = [f"Validator,{k},{val}" for k, val in v]
+    out += [",".join(str(c) for c in r) for r in tunable.get_results()]
+    open(path, "w").write("".join(x + "\n" for x in out))
+
+
 t = time.perf_counter()
 lines = [l for l in open(part).read().splitlines() if l.strip()]
 one = part + ".one"
@@ -98,7 +110,7 @@ for line in lines:
     open(one, "w").write(line + "\n")
     s = time.perf_counter()
     tunable.tune_gemm_in_file(one)
-    tunable.write_file(res)  # after every shape: a timeout keeps what was tuned
+    dump(res)  # after every shape: a timeout keeps what was tuned
     done += 1
     print(f"tuned {line.split(',')[1]} in {time.perf_counter() - s:.1f}s", flush=True)
 print(f"RESULT tune_part {part} shapes={done}/{len(lines)} solutions={len(tunable.get_results())} "

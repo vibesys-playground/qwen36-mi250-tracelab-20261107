@@ -225,7 +225,7 @@ __device__ __forceinline__ void gdn_chain_impl(
         const float* src = rec + first * stride_slot + hoff + (i64)row0 * DV + col0;
 #pragma unroll
         for (int i = 0; i < R; ++i) {
-            if (CPL == 4) {
+            if constexpr (CPL == 4) {
                 const float4 v4 = *(const float4*)(src + (i64)i * DV);
                 S[i][0] = v4.x; S[i][1] = v4.y; S[i][2] = v4.z; S[i][3] = v4.w;
             } else {
@@ -282,7 +282,7 @@ __device__ __forceinline__ void gdn_chain_impl(
         }
 #pragma unroll
         for (int i = 0; i < R; ++i) {
-            if (CPL == 4) {
+            if constexpr (CPL == 4) {
                 float4 v4;
                 v4.x = S[i][0]; v4.y = S[i][1]; v4.z = S[i][2]; v4.w = S[i][3];
                 *(float4*)(out + (i64)i * DV) = v4;

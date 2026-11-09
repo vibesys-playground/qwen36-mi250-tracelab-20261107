@@ -34,6 +34,11 @@ Each kernel's cost is its time plus the idle gap before it on its GCD (the graph
 launch overhead: removing the node removes both). Kill (plan 29): items 1-5 (incl. 4b, not
 5b) < 800 us per GCD per verify B=2 step.
 
+Plan 37: ``--configs`` also takes ``chain:B:k`` (the chained verify, ``verify_chain`` with k
+drafts per slot, B (k + 1) rows, ``ENGINE_SPEC_CHAIN=1``), and ``--parity`` adds chain B=2
+k=1, 3 hashes; the flags printed include ``ENGINE_TOPK_EPI``. The router top-k fused into the
+K-sum kernel (``_ksum_router_kernel``) is listed under its own name in ``2_topk``.
+
 Prints ``RESULT`` lines. A hint for the plan, not the task's metric.
 """
 
@@ -79,7 +84,7 @@ def family(name: str) -> str:
         return "allreduce"
     if "_add_rms_kernel" in n:
         return "1_add_rms"
-    if "_topk_kernel" in n:
+    if "_topk_kernel" in n or "_ksum_router_kernel" in n:
         return "2_topk"
     if "_gemv_kernel" in n:
         return "gemv"
@@ -305,13 +310,18 @@ def main() -> None:
     slots = [0, 1, 2, 3]
     lasts = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
 
-    def call(kind: str, b: int):
+    def call(kind: str, b: int, k: int = 0):
+        if kind == "chain":
+            return lambda: fast.verify_chain(lasts[:b], [[0] * k] * b, slots[:b], [plen] * b)
         if kind == "decode":
             return lambda: fast.decode(lasts[:b], slots[:b], [plen] * b)
         return lambda: fast.verify(lasts[:b], [0] * b, slots[:b], [plen] * b)
 
-    def replay(kind: str, size: int):
-        segs = [(m.vsegments if kind == "verify" else m.segments)[0] for m in ranks]
+    def replay(kind: str, size: int, k: int = 0):
+        if kind == "chain":
+            segs = [m.chain_segments(k + 1)[0] for m in ranks]
+        else:
+            segs = [(m.vsegments if kind == "verify" else m.segments)[0] for m in ranks]
 
         def run():
             for seg in segs:
@@ -345,19 +355,23 @@ def main() -> None:
 
     summary = {}
     for spec in args.configs.split(","):
-        kind, b = spec.split(":")
+        kind, b, *kk = spec.split(":")
         b = int(b)
+        k = int(kk[0]) if kk else 0
         size = fast.bucket(b)
+        if kind == "chain":
+            kind = f"chain{k}"
+        base = "chain" if kind.startswith("chain") else kind
         try:
-            full = median_ms(call(kind, b), args.iters)  # also captures the graph
+            full = median_ms(call(base, b, k), args.iters)  # also captures the graph
             if fast.graph_error is not None:
                 out(f"RESULT {kind} B={b} graph_error={fast.graph_error}")
                 continue
-            bare = median_ms(replay(kind, size), args.iters)
+            bare = median_ms(replay(base, size, k), args.iters)
             out(f"RESULT wall {kind} B={b} bucket={size} call_ms={full:.3f} graph_replay_ms={bare:.3f}")
 
             # 2. graph replays under the profiler
-            run = replay(kind, size)
+            run = replay(base, size, k)
             run()
             sync()
             with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
@@ -373,13 +387,13 @@ def main() -> None:
             for m in ranks:
                 m.use_graphs = False
             try:
-                call(kind, b)()
+                call(base, b, k)()
                 sync()
                 for obj, attr, _, wrapped in patches:
                     setattr(obj, attr, wrapped)
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                     with record_function(LABEL + "probe_eager"):
-                        call(kind, b)()
+                        call(base, b, k)()
                         sync()
             finally:
                 for obj, attr, orig, _ in patches:
@@ -484,7 +498,20 @@ def glue_parity(fast, ranks, prefill, ids, plen, steps, torch, sync) -> None:
     def digest(t) -> str:
         return hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
-    flags = f"topk={int(FZ.GLUE_TOPK)} nozero={int(FZ.GLUE_NOZERO)} arrms={int(TP.GLUE_ARRMS)}"
+    from engine.fast import mfma as MF
+
+    flags = (f"topk={int(FZ.GLUE_TOPK)} nozero={int(FZ.GLUE_NOZERO)} arrms={int(TP.GLUE_ARRMS)} "
+             f"topk_epi={MF.TOPK_EPI}")
+    if MF.CHAIN:
+        for k in (1, 3):
+            if k > MF.KMAX:
+                continue
+            slots = [0, 1]
+            cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]
+            drafts = [[(c + 17 * (j + 1)) % 1000 for j in range(k)] for c in cur]
+            logits, picks, acc, nxt = fast.verify_chain(cur, drafts, slots, [plen] * 2)
+            out(f"RESULT parity_hash chain k={k} B=2 {flags} graphs={fast.graph_error is None} "
+                f"logits={digest(logits.float().cpu())} picks={picks} acc={acc} next={nxt}")
     for b in (2, 4):
         slots = list(range(b))
         cur = [int(torch.argmax(prefill(s, ids[9973 * s: 9973 * s + plen]))) for s in slots]

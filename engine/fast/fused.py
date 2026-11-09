@@ -879,7 +879,6 @@ class FusedDecode:
         mlp = self._layer(i).mlp
         rows, hidden = h.shape
         w3 = self.w_moe[i]
-        r = self._gemv(h, w3)
         ex = mlp.experts
         gu, dn = ex.gate_up_proj, ex.down_proj
         experts, two_i, _ = gu.shape
@@ -896,9 +895,14 @@ class FusedDecode:
         idx = torch.empty((rows, top_k), dtype=torch.int32, device=h.device)
         wt = torch.empty((rows, top_k), dtype=torch.float32, device=h.device)
         fuse_topk = GLUE_TOPK
-        if not fuse_topk:
-            _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
-                                  TOPKP=_pow2(top_k), num_warps=1)
+        r = None
+        if mfma.TOPK_EPI and mfma.GEMV and not fuse_topk:  # plan 37: top-k in the K-sum
+            r = mfma.gemv_topk(h, w3, idx, wt, experts, top_k)
+        if r is None:
+            r = self._gemv(h, w3)
+            if not fuse_topk:
+                _topk_kernel[(rows,)](r, idx, wt, w3.shape[0], E=experts, TOPK=top_k,
+                                      TOPKP=_pow2(top_k), num_warps=1)
         act = torch.empty((rows * top_k, inter), dtype=h.dtype, device=h.device)
         items = rows * top_k * triton.cdiv(inter, bn)
         _moe_up_kernel[(items if order else min(items, grid * cus),)](

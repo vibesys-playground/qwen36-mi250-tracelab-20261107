@@ -31,6 +31,10 @@ def main() -> None:
     parser.add_argument("--ref", default="/tmp/tp_ref.pt")
     parser.add_argument("--steps", type=int, default=96)
     parser.add_argument("--chunk", type=int, default=2048)
+    parser.add_argument("--lengths", default=None,
+                        help="LO:HI:N: N synthetic prompts evenly spaced LO..HI tokens instead of the default 8")
+    parser.add_argument("--one-pass", action="store_true",
+                        help="prefill each prompt in one pass (the server's ENGINE_PREFILL_ONE_PASS_MAX path)")
     parser.add_argument("--dump-fla", default=None, help="write fla's autotune picks (JSON) here")
     args = parser.parse_args()
     os.environ.setdefault("HIP_VISIBLE_DEVICES", "0,1")
@@ -51,6 +55,8 @@ def main() -> None:
 
     def prefill(slot: int, prompt: list[int]) -> torch.Tensor:
         fast.reset(slot)
+        if args.one_pass:
+            return fast.prefill(slot, prompt, 0)
         body = len(prompt) - 1
         position = 0
         while position < body:
@@ -62,7 +68,8 @@ def main() -> None:
     if args.mode in ("ref", "repeat"):
         ids: list[int] = []
         i = 0
-        while len(ids) < 9973 * 4 + 20000:
+        spread = [int(x) for x in args.lengths.split(":")] if args.lengths else None
+        while len(ids) < 9973 * (spread[2] if spread else 4) + 20000:
             for line in (f"def case_{i}(items):", f"    return sorted(set(items))  # {i} 5f0c2a9e"):
                 ids.extend(tok.encode(line, add_special_tokens=False))
             i += 1
@@ -70,7 +77,10 @@ def main() -> None:
             rows = [r for r in csv.DictReader(f) if int(r["round_idx"]) == 0]
         rows.sort(key=lambda r: int(r["session_id"]))
         prompts = [ids[9973 * k : 9973 * k + int(r["input_len"])] for k, r in enumerate(rows[:4])]
-        for text in (
+        if spread:
+            lo, hi, n = spread
+            prompts = [ids[9973 * k : 9973 * k + lo + round(k * (hi - lo) / max(1, n - 1))] for k in range(n)]
+        for text in () if spread else (
             "Write a Python function that parses an ISO-8601 timestamp into a timezone-aware datetime.",
             "Implement a thread-safe LRU cache class in Python and explain the design.",
             "Explain the difference between TCP and UDP to a new backend engineer.",
@@ -88,7 +98,7 @@ def main() -> None:
         saved = None
     # ``repeat``: the reference and the check in this one process (greedy repeatability).
     for mode in (["ref", "check"] if args.mode == "repeat" else [args.mode]):
-        groups = [list(range(0, 4)), list(range(4, 8))]
+        groups = [list(range(i, min(i + 4, len(prompts)))) for i in range(0, len(prompts), 4)]
         record = {"prompts": prompts, "inputs": {}, "picks": {}, "margins": {}}
         agree = total = 0
         close_misses = []

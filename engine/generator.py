@@ -972,8 +972,10 @@ class PackedPrefill:
     prefix snapshot, exactly as ``Generator.start``; its prompt is split into
     the chunks ``start`` would run (``Generator._chunks``), with the same
     snapshots at the same boundaries. Each ``step`` runs the next chunk of every
-    pending request that fits ``ENGINE_PREFILL_PACK_TOKENS`` tokens (default
-    8192; the oldest request always fits) as one ``FastModel.prefill_packed``
+    pending request that fits ``ENGINE_PREFILL_PACK_TOKENS`` tokens (the oldest
+    request always fits; default 8192, or 1 (one segment per pass) when the
+    model has captured prefill graphs: a single segment replays a graph, a
+    packed pass runs eagerly, plan 66) as one ``FastModel.prefill_packed``
     pass and returns the requests it finished. Requests may be added between
     steps, so a caller can interleave passes with decode steps and admit new
     arrivals into the next pass. A failed pass fails only its own requests.
@@ -981,7 +983,8 @@ class PackedPrefill:
 
     def __init__(self, generator: Generator) -> None:
         self._g = generator
-        self._budget = int(os.environ.get("ENGINE_PREFILL_PACK_TOKENS", "8192"))
+        budget = os.environ.get("ENGINE_PREFILL_PACK_TOKENS")
+        self._budget = int(budget) if budget else None
         self._pending: list[_Pending] = []
         self._failed: list[tuple[int, Exception]] = []
         self._tickets = 0
@@ -1033,10 +1036,13 @@ class PackedPrefill:
     def step(self) -> list[tuple[int, Generation | Exception]]:
         """Run one packed pass; the requests whose prefill it finished (or failed)."""
         g = self._g
+        budget = self._budget
+        if budget is None:
+            budget = 1 if getattr(g.fast, "pg", None) else 8192
         batch, used = [], 0
         for entry in self._pending:
             begin, end, _ = entry.spans[entry.at]
-            if batch and used + (end - begin) > self._budget:
+            if batch and used + (end - begin) > budget:
                 continue
             batch.append(entry)
             used += end - begin

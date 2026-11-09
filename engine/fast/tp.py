@@ -66,12 +66,14 @@ CHUNK = 64  # 32-bit words per CTA of the in-graph all-reduce
 # largest bucket replay one captured graph per rank and size (``TPModel.capture_prefill``),
 # their all-reduces in the graph too, so the all-reduce buffer must hold a pass's hidden state.
 PREFILL_GRAPH = os.environ.get("ENGINE_PREFILL_GRAPH", "1") == "1"
-# Padded pass sizes (rows); a pass of n tokens (DECODE_EXPERT_TOKENS < n <= the largest, 2,048
-# = the server's prefill chunk) runs the smallest size >= n; longer or packed passes run eagerly.
+# Padded pass sizes (rows); a pass of n tokens (DECODE_EXPERT_TOKENS < n <= the largest) runs the
+# smallest size >= n; longer or packed passes run eagerly. Plan 66: every 64 rows from 1,600 to
+# 4,096 (= CAPACITY's rows and ENGINE_PREFILL_ONE_PASS_MAX), so a first round of up to 4,096 new
+# tokens replays a graph padded by < 64 rows instead of 2,048-padding or running eagerly.
 PG_BUCKETS = tuple(sorted(int(b) for b in os.environ.get(
     "ENGINE_PREFILL_GRAPH_BUCKETS",
     "64,80,96,112,128,160,192,224,256,288,320,384,448,512,576,640,704,768,896,1024,1152,1280,"
-    "1408,1536,1792,2048",
+    "1408,1536," + ",".join(str(n) for n in range(1600, 4097, 64)),
 ).split(",")))
 # Words per parity buffer: 64 rows x 2048 BF16 (a verify step of bucket 32); with prefill graphs
 # 2^22 (4,096 rows), which costs 2 x (2 x 2^22 x 8 B) = 128 MiB of fine-grained memory per GCD

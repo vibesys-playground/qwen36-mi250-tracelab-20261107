@@ -1784,6 +1784,8 @@ class FastModel:
                                                     positions[:b], groups)
                 if ivf is None:
                     d = out[rows + b: rows + 2 * b]
+                elif ivf.fast:  # plan 71: the draft written in place (no copy launch)
+                    d = ivf.draft(h, self, first=True, out=out[rows + b: rows + 2 * b])
                 else:
                     d = ivf.draft(h, self, first=True)
                     out[rows + b: rows + 2 * b].copy_(d)
@@ -1791,11 +1793,15 @@ class FastModel:
                     z = self._fused_layer(self.mtp_index, self._mtp_in(h, d, True), slots[:b],
                                           posn[j - 1], meta)
                     h = self._mtp_norm(z)
+                    dst = out[rows + (j + 1) * b: rows + (j + 2) * b]
                     if ivf is None:
                         d = self._argmax(self.fused.gemv(h, self.lm_head))
+                    elif ivf.fast:
+                        d = ivf.draft(h, self, out=dst)
+                        continue
                     else:
                         d = ivf.draft(h, self)
-                    out[rows + (j + 1) * b: rows + (j + 2) * b].copy_(d)
+                    dst.copy_(d)
                 self._chain_out = out
                 return logits
             tokens = meta.tokens[:rows].view(groups, b)

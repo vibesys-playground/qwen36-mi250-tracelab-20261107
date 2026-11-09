@@ -51,6 +51,18 @@ GAP = float(os.environ.get("ENGINE_DRAFT_IVF_GAP", "17.875"))
 # Measuring only: also run the full draft and count the drafts that differ from it (one extra
 # GEMV and all-reduce per draft).
 AUDIT = os.environ.get("ENGINE_DRAFT_IVF_AUDIT", "0") == "1"
+# Plan 71: the same search and fallback in fewer, cheaper launches (``Served._search_fast``):
+# one top-P launch for both vocabulary parts (grid rows x parts), one gather launch for both
+# parts, one launch for the shortlist max + gap flag of every row (it also clears the flag on
+# a step's first link: no memset), the predicated full-pass GEMV on a persistent grid (with
+# the flag at 0 its programs exit after one load each, ~1 per CU instead of one per tile), and
+# the draft written straight into the chain's output. Same selection, ties, flag and bits.
+FAST = os.environ.get("ENGINE_DRAFT_IVF_FAST", "0") == "1"
+# The top-P select of the fast path: "radix" (today's 16-step radix, both parts in one launch)
+# or "hist" (two 8-bit histogram passes). Both give the same P indices and next score.
+TOPP = os.environ.get("ENGINE_DRAFT_IVF_TOPP", "radix")
+# Programs per CU of the predicated full-pass GEMV (fast path); 0: one per tile (today's grid).
+PRED_GRID = int(os.environ.get("ENGINE_DRAFT_IVF_PRED_GRID", "2"))
 
 
 def usable(w: torch.Tensor) -> bool:
@@ -498,6 +510,159 @@ if triton is not None:
             a3 = tl.load(both_ptr + r * 4 + 3, mask=ok, other=0.0)
             tl.store(ids_ptr + r, tl.where(a0 >= a2, a1, a3).to(tl.int64), mask=ok)
 
+    # ---------------------------------------------------------------- plan 71: the fast path
+
+    @triton.jit(do_not_specialize=["S", "OUT_PART", "NXT_PART"])
+    def _topp2_kernel(s_ptr, out_ptr, nxt_ptr, S, OUT_PART, NXT_PART, C: tl.constexpr,
+                      P: tl.constexpr, HIST: tl.constexpr):
+        """``_radix_topp_kernel`` for vocabulary part ``program_id(1)`` (its C scores at column
+        ``part * C`` of row r; out/nxt at ``part * OUT_PART`` / ``part * NXT_PART``): both
+        parts in one launch. The threshold is the P-th largest order key, found by the
+        16-step radix (HIST False) or by two 8-bit histogram passes (HIST True); the same
+        key, so the same compaction and the same bits."""
+        r = tl.program_id(0)
+        part = tl.program_id(1)
+        i = tl.arange(0, C)
+        b = tl.load(s_ptr + r * S + part * C + i)
+        bi = b.to(tl.int16, bitcast=True).to(tl.int32)
+        key = tl.where(bi >= 0, bi + 32768, ~bi)
+        if HIST:
+            bins = tl.arange(0, 256)
+            hi = key >> 8
+            h1 = tl.histogram(hi, 256)
+            ge1 = C - tl.cumsum(h1, axis=0) + h1  # keys whose high byte is >= the bin
+            bh = tl.max(tl.where(ge1 >= P, bins, -1), axis=0)
+            need = P - tl.sum(tl.where(bins > bh, h1, 0), axis=0)
+            bins2 = tl.arange(0, 512)
+            h2 = tl.histogram(tl.where(hi == bh, key & 255, 256), 512)  # others in bin 256
+            h2 = tl.where(bins2 < 256, h2, 0)
+            ge2 = tl.sum(h2, axis=0) - tl.cumsum(h2, axis=0) + h2
+            bl = tl.max(tl.where((ge2 >= need) & (bins2 < 256), bins2, -1), axis=0)
+            t = bh * 256 + bl
+        else:
+            t = tl.zeros([], dtype=tl.int32)
+            for j in tl.static_range(16):
+                cand = t | (1 << (15 - j))
+                cnt = tl.sum((key >= cand).to(tl.int32), axis=0)
+                t = tl.where(cnt >= P, cand, t)
+        gt = key > t
+        ngt = tl.sum(gt.to(tl.int32), axis=0)
+        eq = key == t
+        ceq = tl.cumsum(eq.to(tl.int32), axis=0)
+        sel = gt | (eq & (ceq <= P - ngt))
+        pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
+        tl.store(out_ptr + part * OUT_PART + r * P + pos, i.to(tl.int64), mask=sel)
+        rest = tl.where(sel, float("-inf"), b.to(tl.float32))
+        tl.store(nxt_ptr + part * NXT_PART + r, tl.max(rest, axis=0))
+
+    @triton.jit(do_not_specialize=["P", "SEL_PART", "OUT_PART", "IDS_PART", "OFF_PART"])
+    def _ivf_gather2_kernel(y_ptr, w_ptr, wdelta, ids_ptr, off_ptr, sel_ptr, outv_ptr, outi_ptr, P,
+                            SEL_PART, OUT_PART, IDS_PART, OFF_PART, K: tl.constexpr, CH: tl.constexpr,
+                            BR: tl.constexpr, BK: tl.constexpr):
+        """``_ivf_gather_kernel`` (PERM) for both parts in one launch: program (r, part * P + p,
+        j). Part 1's weights start ``wdelta`` elements after part 0's (two tensors), its ids,
+        offsets, selection and output slots ``*_PART`` entries after part 0's."""
+        r = tl.program_id(0)
+        q = tl.program_id(1)
+        j = tl.program_id(2)
+        part = q // P
+        p = q - part * P
+        c = tl.load(sel_ptr + part * SEL_PART + r * P + p)
+        start = tl.load(off_ptr + part * OFF_PART + c)
+        end = tl.load(off_ptr + part * OFF_PART + c + 1)
+        rows = start + j * BR + tl.arange(0, BR)
+        ok = rows < end
+        src = tl.load(ids_ptr + part * IDS_PART + rows, mask=ok, other=0)
+        wp = w_ptr + part.to(tl.int64) * wdelta
+        acc = tl.zeros([BR], dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            cols = k0 + tl.arange(0, BK)
+            w = tl.load(wp + src[:, None].to(tl.int64) * K + cols[None, :], mask=ok[:, None],
+                        other=0.0).to(tl.float32)
+            x = tl.load(y_ptr + r * K + cols).to(tl.float32)
+            acc += tl.sum(w * x[None, :], axis=1)
+        v = acc.to(tl.bfloat16).to(tl.float32)
+        v = tl.where(ok, v, float("-inf"))
+        m = tl.max(v, axis=0)
+        ids = tl.load(ids_ptr + part * IDS_PART + rows, mask=ok, other=2147483647)
+        best = tl.min(tl.where(v == m, ids, 2147483647), axis=0)
+        slot = part * OUT_PART + (r * P + p) * CH + j
+        tl.store(outv_ptr + slot, m)
+        tl.store(outi_ptr + slot, best)
+
+    @triton.jit(do_not_specialize=["R", "M", "PART_ROWS", "OFF1", "gap"])
+    def _ivf_local_flag_kernel(outv_ptr, outi_ptr, nxt_ptr, loc_ptr, ids_ptr, flag_ptr, stats_ptr, R,
+                               M, PART_ROWS, OFF1, gap, NP: tl.constexpr, RB: tl.constexpr,
+                               BM: tl.constexpr, FIRST: tl.constexpr):
+        """``_ivf_local_kernel`` for every row (a [RB, BM] tile) then ``_ivf_flag_kernel``, in
+        one program. FIRST: the step's first link (the flag starts at 0, as after its memset)."""
+        rr = tl.arange(0, RB)
+        okr = rr < R
+        lanes = tl.arange(0, BM)
+        top = tl.full([RB], float("-inf"), tl.float32)
+        tid = tl.zeros([RB], dtype=tl.int32)
+        nxt = tl.full([RB], float("-inf"), tl.float32)
+        for part in tl.static_range(NP):
+            base = part * PART_ROWS * M + rr * M
+            best = tl.full([RB, BM], float("-inf"), tl.float32)
+            bid = tl.full([RB, BM], 2147483647, tl.int32)
+            for m0 in range(0, M, BM):
+                i = m0 + lanes
+                ok = okr[:, None] & (i < M)[None, :]
+                v = tl.load(outv_ptr + base[:, None] + i[None, :], mask=ok, other=float("-inf"))
+                d = tl.load(outi_ptr + base[:, None] + i[None, :], mask=ok, other=2147483647)
+                upd = (v > best) | ((v == best) & (d < bid))
+                best = tl.where(upd, v, best)
+                bid = tl.where(upd, d, bid)
+            m = tl.max(best, axis=1)
+            idx = tl.min(tl.where(best == m[:, None], bid, 2147483647), axis=1)
+            idx = tl.where(okr, idx, 0) + part * OFF1
+            if part == 0:
+                top = m
+                tid = idx
+            else:  # a later part wins only when strictly larger (ties to the lower id)
+                tid = tl.where(m > top, idx, tid)
+                top = tl.maximum(m, top)
+            nxt = tl.maximum(nxt, tl.load(nxt_ptr + part * PART_ROWS + rr, mask=okr, other=0.0))
+        tl.store(loc_ptr + rr * 3, top, mask=okr)
+        tl.store(loc_ptr + rr * 3 + 1, tid.to(tl.float32), mask=okr)
+        tl.store(loc_ptr + rr * 3 + 2, nxt, mask=okr)
+        tl.store(ids_ptr + rr, tid.to(tl.int64), mask=okr)
+        if FIRST:
+            f = tl.max(((top - nxt < gap) & okr).to(tl.int32), axis=0)
+            tl.store(flag_ptr, f)
+        else:
+            f = tl.load(flag_ptr)
+            if f == 0:
+                f = tl.max(((top - nxt < gap) & okr).to(tl.int32), axis=0)
+                tl.store(flag_ptr, f)
+        tl.atomic_add(stats_ptr, R.to(tl.int64))
+        tl.atomic_add(stats_ptr + 1, (R * f).to(tl.int64))
+
+    @triton.jit(do_not_specialize=["R", "N", "TILES"])
+    def _pred_gemv_p_kernel(flag_ptr, x_ptr, w_ptr, out_ptr, R, N, stride_out, TILES, K: tl.constexpr,
+                            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DOT_F32: tl.constexpr):
+        """``_pred_gemv_kernel`` on a persistent grid: program i runs tiles i, i + grid, ...
+        (each tile's math unchanged), only when flag[0] != 0."""
+        if tl.load(flag_ptr) != 0:
+            rm = tl.arange(0, BM)
+            mok = rm < R
+            for nb in range(tl.program_id(0), TILES, tl.num_programs(0)):
+                rn = nb * BN + tl.arange(0, BN)
+                nok = rn < N
+                acc = tl.zeros([BM, BN], dtype=tl.float32)
+                for k0 in range(0, K, BK):
+                    rk = k0 + tl.arange(0, BK)
+                    a = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=mok[:, None], other=0.0)
+                    b = tl.load(w_ptr + rn[None, :].to(tl.int64) * K + rk[:, None], mask=nok[None, :],
+                                other=0.0)
+                    if DOT_F32:
+                        acc = tl.dot(a.to(tl.float32), b.to(tl.float32), acc)
+                    else:
+                        acc = tl.dot(a, b, acc)
+                m = mok[:, None] & nok[None, :]
+                tl.store(out_ptr + rm[:, None] * stride_out + rn[None, :], acc.to(tl.bfloat16), mask=m)
+
 
 def _to(index: Index, dev: torch.device) -> Index:
     """``index`` copied to ``dev`` (the same bits)."""
@@ -563,6 +728,22 @@ class Served:
             # drafts, drafts on the full pass, audited drafts, audited drafts unlike the full one
             self.stats = torch.zeros((4,), dtype=torch.int64, device=dev)
             self.rb = max(16, triton.next_power_of_2(max_rows))
+            # plan 71 (fast path): the parts' ids and offsets back to back, part 1's weights as
+            # an element offset from part 0's
+            self.fast = FAST
+            self.topp_hist = TOPP == "hist"
+            self.pred_grid = PRED_GRID
+            self.cus = torch.cuda.get_device_properties(dev).multi_processor_count if w.is_cuda else 4
+            self.ids_cat = torch.zeros((np_ * self.part_rows,), dtype=torch.int32, device=dev)
+            for part, ids in enumerate(self.ids):
+                self.ids_cat[part * self.part_rows: part * self.part_rows + ids.numel()].copy_(ids)
+            self.off_cat = torch.cat(self.offsets).contiguous()
+            self.wdelta = 0
+            if np_ == 2:
+                es = weights[0].element_size()
+                delta = weights[1].data_ptr() - weights[0].data_ptr()
+                assert delta % es == 0 and weights[0].is_contiguous() and weights[1].is_contiguous()
+                self.wdelta = delta // es
             self._warm()
             self.stats.zero_()
             if w.is_cuda:
@@ -590,6 +771,28 @@ class Served:
                                    num_warps=4)
         _ivf_flag_kernel[(1,)](self.loc, self.flag, self.stats, rows, self.gap, RB=self.rb, num_warps=1)
 
+    def _search_fast(self, y: torch.Tensor, ids: torch.Tensor, first: bool = False) -> None:
+        """``_search`` in four launches (plan 71): centroid GEMV, both parts' top-P, both parts'
+        gather, every row's shortlist max and the flag (cleared first on a step's first link).
+        Same ``sel``, ``nxt``, ``loc``, ``ids``, flag and counters."""
+        from engine.fast import mfma
+
+        rows = y.shape[0]
+        np_, c, p = self.np, self.c, self.p
+        s = mfma.gemv(y, self.cent)  # [rows, NP * C]
+        mr = self.max_rows
+        _topp2_kernel[(rows, np_)](s, self.sel, self.nxt, np_ * c, mr * p, mr, C=c, P=p,
+                                   HIST=self.topp_hist, num_warps=4)
+        _ivf_gather2_kernel[(rows, np_ * p, self.ch)](
+            y, self.weights[0], self.wdelta, self.ids_cat, self.off_cat, self.sel, self.outv, self.outi, p,
+            mr * p, mr * self.m, self.part_rows, c + 1, K=self.w.shape[1], CH=self.ch, BR=self.BR, BK=self.BK,
+            num_warps=4)
+        rb = max(2, triton.next_power_of_2(rows))
+        _ivf_local_flag_kernel[(1,)](
+            self.outv, self.outi, self.nxt, self.loc, ids, self.flag, self.stats, rows, self.m, mr,
+            self.part_rows, self.gap, NP=np_, RB=rb, BM=min(1024, max(16, 4096 // rb), triton.next_power_of_2(self.m)),
+            FIRST=first, num_warps=4)
+
     def _full_pack(self, y: torch.Tensor, rank: int, offset: int, solo: bool) -> torch.Tensor:
         """When the flag is set: this rank's ``[rows, 4]`` argmax pack of its shard."""
         from engine.fast import kernels, mfma
@@ -598,8 +801,17 @@ class Served:
         n = self.w.shape[0]
         bn, bk, warps, _ = self.tiles_w
         logits = torch.empty((rows, n), dtype=y.dtype, device=y.device)
+        tiles = triton.cdiv(n, bn)
+        grid = tiles
+        if self.fast and self.pred_grid > 0 and y.is_cuda:
+            grid = min(tiles, self.pred_grid * self.cus)
         for r0 in range(0, rows, mfma.BM):
             r1 = min(rows, r0 + mfma.BM)
+            if grid < tiles:
+                _pred_gemv_p_kernel[(grid,)](
+                    self.flag, y[r0:r1], self.w, logits[r0:r1], r1 - r0, n, n, tiles, K=k, BM=mfma.BM, BN=bn,
+                    BK=bk, DOT_F32=kernels.INTERPRET, num_warps=warps)
+                continue
             _pred_gemv_kernel[(triton.cdiv(n, bn),)](
                 self.flag, y[r0:r1], self.w, logits[r0:r1], r1 - r0, n, n, K=k, BM=mfma.BM, BN=bn, BK=bk,
                 DOT_F32=kernels.INTERPRET, num_warps=warps)
@@ -612,28 +824,48 @@ class Served:
         """Compile every kernel variant before any capture (both ranks', alone, both flags)."""
         y = torch.zeros((1, self.w.shape[1]), dtype=self.w.dtype, device=self.w.device)
         ids = torch.empty((1,), dtype=torch.int64, device=self.w.device)
+        fast = self.fast
         for f in (0, 1):
             self.flag.fill_(f)
             self._search(y, ids)
             for rank in (0, 1):
                 for solo in (False, True):
-                    pack = self._full_pack(y, rank, 0, solo)
+                    for self.fast in (False, True) if fast else (False,):
+                        pack = self._full_pack(y, rank, 0, solo)
                     _ivf_final_kernel[(1,)](self.flag, pack, ids, 1, RB=self.rb, num_warps=1)
+        self.fast = fast
+        if fast:  # every row-tile size of the one-program shortlist/flag kernel, both FIRST
+            rb = 2
+            while True:
+                rows = min(rb, self.max_rows)
+                yy = torch.zeros((rows, self.w.shape[1]), dtype=self.w.dtype, device=self.w.device)
+                ii = torch.empty((rows,), dtype=torch.int64, device=self.w.device)
+                for first in (False, True):
+                    self._search_fast(yy, ii, first)
+                if rb >= self.max_rows:
+                    break
+                rb *= 2
         self.flag.zero_()
         if self.w.is_cuda:
             torch.cuda.synchronize(self.w.device)
 
-    def draft(self, y: torch.Tensor, model, first: bool = False) -> torch.Tensor:
+    def draft(self, y: torch.Tensor, model, first: bool = False, out: torch.Tensor | None = None
+              ) -> torch.Tensor:
         """Each row's draft token (int64 [rows]) from the head's normed output ``y`` (the same
-        bits on both ranks). ``first``: the step's first link (clears the fallback flag)."""
+        bits on both ranks). ``first``: the step's first link (clears the fallback flag).
+        ``out``: a contiguous int64 [rows] to write the drafts into (returned)."""
         y = y.contiguous()
         rows = y.shape[0]
         tp, rank, offset = model.tp, model.rank, model.vocab_offset
         solo = tp is None or tp.solo
-        if first:
-            self.flag.zero_()
-        ids = torch.empty((rows,), dtype=torch.int64, device=y.device)
-        self._search(y, ids)
+        ids = out if out is not None else torch.empty((rows,), dtype=torch.int64, device=y.device)
+        assert ids.shape == (rows,) and ids.dtype == torch.int64 and ids.is_contiguous()
+        if self.fast:
+            self._search_fast(y, ids, first)
+        else:
+            if first:
+                self.flag.zero_()
+            self._search(y, ids)
         pack = self._full_pack(y, rank, offset, solo)
         if not solo:
             pack = tp.allreduce_pred(rank, pack, self.flag)  # both ranks run it, or neither

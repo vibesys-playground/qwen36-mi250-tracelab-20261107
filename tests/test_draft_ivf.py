@@ -137,6 +137,74 @@ def test_served_draft_graph_and_fallback() -> None:
             assert torch.equal(a, want) and torch.equal(b, want), (gap, a, b, want)
 
 
+def test_fast_search_matches_today() -> None:
+    """Plan 71: ``Served._search_fast`` (both top-P algorithms) leaves the same selection, next
+    score, shortlist maxima, drafts, flag and counters as ``_search``, at 1-8 rows, the flag
+    starting at 0 or 1, first link or not, with tied scores (all-zero rows) included; and the
+    whole draft through the fast path equals today's in a captured graph."""
+    if DEV != "cuda" or draft_ivf.triton is None:
+        return
+    from types import SimpleNamespace
+
+    from engine.fast import mfma
+
+    torch.manual_seed(5)
+    w = (torch.randn((40_000, 2048), device="cuda") * 0.05).to(torch.bfloat16)
+    ys = (torch.randn((64, 2048), device="cuda")).to(torch.bfloat16)
+    ys[:4] = 0
+    served = draft_ivf.Served(w, max_rows=8, p=8, clusters=1024, gap=0.5)
+    fast0 = served.fast
+    for hist in (False, True):
+        served.topp_hist = hist
+        served.fast = True
+        served._warm()
+        for rows in (1, 2, 3, 8):
+            for a in range(0, 64 - rows + 1, rows):
+                y = ys[a:a + rows].contiguous()
+                for f0, first in ((0, False), (1, False), (1, True)):
+                    snaps = []
+                    for which in ("old", "fast"):
+                        served.flag.fill_(f0)
+                        served.sel.zero_()
+                        served.nxt.zero_()
+                        served.loc.zero_()
+                        st0 = served.stats.clone()
+                        ids = torch.full((rows,), -7, dtype=torch.int64, device="cuda")
+                        if which == "old":
+                            if first:
+                                served.flag.zero_()
+                            served._search(y, ids)
+                        else:
+                            served._search_fast(y, ids, first)
+                        snaps.append((served.sel[:, :rows].clone(), served.nxt[:, :rows].clone(),
+                                      served.loc[:rows].clone(), ids.clone(), served.flag.clone(),
+                                      served.stats - st0))
+                    for x, z in zip(*snaps, strict=True):
+                        assert torch.equal(x, z), (hist, rows, a, f0, first)
+    served.topp_hist = draft_ivf.TOPP == "hist"
+    model = SimpleNamespace(tp=None, rank=0, vocab_offset=0, lm_head=w,
+                            fused=SimpleNamespace(gemv=lambda a, b: mfma.gemv(a, b)),
+                            _argmax=lambda lg: lg.argmax(-1))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    outs = {}
+    for fast in (False, True):
+        served.fast = fast
+        for gap in (-1e9, 1e9, 0.5):
+            served.gap = gap
+            graph = torch.cuda.CUDAGraph()
+            buf = torch.zeros((8,), dtype=torch.int64, device="cuda")
+            with torch.cuda.graph(graph, stream=stream):
+                a = served.draft(ys[8:16], model, first=True)
+                b = served.draft(ys[16:24], model, out=buf)
+            graph.replay()
+            torch.cuda.synchronize()
+            outs[(fast, gap)] = (a.clone(), b.clone())
+    served.fast = fast0
+    for gap in (-1e9, 1e9, 0.5):
+        assert all(torch.equal(x, z) for x, z in zip(outs[(False, gap)], outs[(True, gap)], strict=True)), gap
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

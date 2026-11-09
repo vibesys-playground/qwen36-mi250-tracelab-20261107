@@ -655,8 +655,8 @@ def orchestrate(args) -> int:
         peer_log = b.recv(120)
         rows = summarize_stall(st)
         for row in rows:
-            result(kind="stall", transport=row.pop("kind"), tokens=st["tokens"],
-                   mb_total=round(st["bytes"] / 1e6, 2), bg=args.bg, **row)
+            row["transport"] = row.pop("kind")
+            result(kind="stall", tokens=st["tokens"], mb_total=round(st["bytes"] / 1e6, 2), bg=args.bg, **row)
         result(kind="stall_imports", imports=peer_log["imports"])
 
         summary = {"kind": "summary", "identical_all": identical, "continuations": compared,

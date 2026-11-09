@@ -255,6 +255,69 @@ if triton is not None:
         out = out_ptr + pairs.to(tl.int64)[:, None] * H + cols[None, :]
         tl.store(out, _bf16(acc, WIDEN).to(tl.bfloat16), mask=row_ok[:, None])
 
+    @triton.jit(do_not_specialize=["MAX_TILES"])
+    def _down_stream_kernel(
+        act_ptr,
+        w_ptr,
+        order_ptr,
+        table_ptr,
+        out_ptr,
+        stride_we,
+        stride_wn,
+        MAX_TILES,
+        H: tl.constexpr,
+        I: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP: tl.constexpr,
+        WIDEN: tl.constexpr,
+    ):
+        """``_down_kernel`` with each program streaming N (plan 60): grid (tiles,
+        H / (GROUP * BLOCK_N)). A program loads its act tile [BLOCK_M, I] once (I = BLOCK_K or
+        2 * BLOCK_K, as two halves) and its rows' pair indices once, then loops over GROUP
+        consecutive BLOCK_N column blocks of the expert's W_down (one contiguous stream, which
+        the compiler can software-pipeline). Each block is today's math: the same BLOCK_K dots
+        in the same order from a zero accumulator, rounded to BF16 and stored at the pairs'
+        rows, so the output is bitwise ``_down_kernel``'s."""
+        t = tl.program_id(0)
+        nb = tl.program_id(1)
+        if t >= tl.load(table_ptr + 3 * MAX_TILES):
+            return
+        e = tl.load(table_ptr + t)
+        row0 = tl.load(table_ptr + MAX_TILES + t)
+        row_end = tl.load(table_ptr + 2 * MAX_TILES + t)
+        rows = row0 + tl.arange(0, BLOCK_M)
+        row_ok = rows < row_end
+        ks = tl.arange(0, BLOCK_K)
+        a_ptrs = act_ptr + rows.to(tl.int64)[:, None] * I + ks[None, :]
+        a0 = tl.load(a_ptrs, mask=row_ok[:, None], other=0.0)
+        if I > BLOCK_K:
+            a1 = tl.load(a_ptrs + BLOCK_K, mask=row_ok[:, None], other=0.0)
+        else:
+            a1 = a0
+        if WIDEN:
+            a0, a1 = a0.to(tl.float32), a1.to(tl.float32)
+        pairs = tl.load(order_ptr + rows, mask=row_ok, other=0)
+        out_rows = out_ptr + pairs.to(tl.int64)[:, None] * H
+        ns = tl.arange(0, BLOCK_N)
+        w_base = w_ptr + e.to(tl.int64) * stride_we + ks[:, None]
+        col0 = nb * (GROUP * BLOCK_N)
+        for g in range(GROUP):
+            cols = col0 + g * BLOCK_N + ns
+            w_ptrs = w_base + cols[None, :] * stride_wn
+            w0 = tl.load(w_ptrs)
+            if WIDEN:
+                w0 = w0.to(tl.float32)
+            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            acc = tl.dot(a0, w0, acc)
+            if I > BLOCK_K:
+                w1 = tl.load(w_ptrs + BLOCK_K)
+                if WIDEN:
+                    w1 = w1.to(tl.float32)
+                acc = tl.dot(a1, w1, acc)
+            tl.store(out_rows + cols[None, :], _bf16(acc, WIDEN).to(tl.bfloat16), mask=row_ok[:, None])
+
 
 class KernelConfig(NamedTuple):
     """One GEMM kernel's launch: BLOCK_N, BLOCK_K, warps, stages, and the AMD knobs
@@ -331,6 +394,82 @@ def launch_options(k: KernelConfig) -> dict:
     return opts
 
 
+class StreamConfig(NamedTuple):
+    """``_down_stream_kernel``'s launch: BLOCK_N, GROUP (column blocks per program), warps,
+    stages and the AMD knobs (0: the compiler's choice). BLOCK_K is the bucket's down BK."""
+
+    bn: int
+    group: int
+    warps: int
+    stages: int
+    nonkdim: int = 0
+    waves: int = 0
+
+
+# Plan 60: the N-streaming down projection per ``BUCKETS`` entry (same bounds, same BLOCK_M and
+# BLOCK_K, so one tile table and the same dots). Placeholders until the step 0 sweep.
+STREAM_BUCKETS: tuple[StreamConfig, ...] = (
+    StreamConfig(256, 2, 4, 2, 16, 2),
+    StreamConfig(128, 4, 4, 2),
+    StreamConfig(128, 4, 4, 2, 16, 0),
+)
+
+
+def down_stream_enabled() -> bool:
+    """``ENGINE_MOE_DOWN_STREAM`` (plan 60; 0 for ``_down_kernel``): the prefill down
+    projection through ``_down_stream_kernel`` (bitwise the same output)."""
+    return os.environ.get("ENGINE_MOE_DOWN_STREAM", "0") != "0"
+
+
+_DOWN_STREAM = down_stream_enabled()
+
+
+def stream_config(pairs: int, experts: int) -> StreamConfig:
+    """The bucket's ``StreamConfig`` (as ``config``, from the shape alone).
+    ``ENGINE_MOE_DOWN_STREAM_CFG`` = "BN,GROUP,warps,stages[,nonkdim,waves]" overrides it."""
+    override = os.environ.get("ENGINE_MOE_DOWN_STREAM_CFG")
+    if override:
+        values = tuple(int(v) for v in override.split(","))
+        if len(values) not in (4, 6):
+            raise ValueError("ENGINE_MOE_DOWN_STREAM_CFG needs BN,GROUP,warps,stages[,nonkdim,waves]")
+        return StreamConfig(*values)
+    rows = pairs / max(1, experts)
+    for (bound, _), cfg in zip(BUCKETS, STREAM_BUCKETS):
+        if rows <= bound:
+            return cfg
+    return STREAM_BUCKETS[-1]
+
+
+def launch_down(act: torch.Tensor, down: torch.Tensor, order: torch.Tensor, table: torch.Tensor,
+                out: torch.Tensor, max_tiles: int, cfg: Config, pairs: int,
+                stream: bool | None = None) -> None:
+    """The down projection of the grouped experts into ``out`` [pairs, hidden] (BF16, at each
+    pair's row): ``_down_stream_kernel`` when enabled and the shapes fit it (inter = BK or
+    2 * BK, hidden a multiple of GROUP * BN), else ``_down_kernel``. Launched on the current
+    device; the same output either way."""
+    experts, hidden, inter = down.shape
+    bm = cfg.bm
+    bk = min(cfg.down.bk, inter)
+    if _DOWN_STREAM if stream is None else stream:
+        s = stream_config(pairs, experts)
+        bn = min(s.bn, hidden)
+        group = max(1, min(s.group, hidden // bn))
+        if inter in (bk, 2 * bk) and hidden % (group * bn) == 0:
+            opts = launch_options(KernelConfig(bn, bk, s.warps, s.stages, s.nonkdim, s.waves))
+            _down_stream_kernel[(max_tiles, hidden // (group * bn))](
+                act, down, order, table, out, down.stride(0), down.stride(1), max_tiles,
+                H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP=group, WIDEN=_WIDEN,
+                **opts,
+            )
+            return
+    bn = min(cfg.down.bn, hidden)
+    _down_kernel[(max_tiles, triton.cdiv(hidden, bn))](
+        act, down, order, table, out, down.stride(0), down.stride(1), max_tiles,
+        H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, WIDEN=_WIDEN,
+        **launch_options(cfg.down),
+    )
+
+
 TILE_BLOCK = 32  # tiles per step of ``_tiles_kernel``
 
 
@@ -395,7 +534,6 @@ def moe_prefill(
     cfg = config(pairs, experts)
     bm = cfg.bm
     bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
-    bn2, bk2 = min(cfg.down.bn, hidden), min(cfg.down.bk, inter)
     dev = x.device
     x = x.contiguous()
     ids = top_k_index.reshape(-1)
@@ -414,11 +552,7 @@ def moe_prefill(
             H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
             **launch_options(cfg.gate_up),
         )
-        _down_kernel[(max_tiles, triton.cdiv(hidden, bn2))](
-            act, down, order, table, out, down.stride(0), down.stride(1), max_tiles,
-            H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN,
-            **launch_options(cfg.down),
-        )
+        launch_down(act, down, order, table, out, max_tiles, cfg, pairs)
     # The routing weight in fp32 (exact on two BF16 values), the top_k rows summed in fp32.
     weighted = out.float() * top_k_weights.reshape(-1, 1).float()
     return weighted.view(tokens, top_k, hidden).sum(dim=1).to(x.dtype)

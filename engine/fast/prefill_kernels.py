@@ -715,7 +715,6 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int, merged: bool = False)
     cfg = moe_prefill.config(pairs, experts)
     bm = cfg.bm
     bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
-    bn2, bk2 = min(cfg.down.bn, hidden), min(cfg.down.bk, inter)
     meta = torch.empty((2, experts), dtype=torch.int32, device=dev)
     starts, cursor = meta[0], meta[1]
     max_tiles = triton.cdiv(pairs, bm) + experts
@@ -733,11 +732,7 @@ def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int, merged: bool = False)
             H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
             **moe_prefill.launch_options(cfg.gate_up),
         )
-        moe_prefill._down_kernel[(max_tiles, triton.cdiv(hidden, bn2))](
-            act_r, down, order, table, out_r, down.stride(0), down.stride(1), max_tiles,
-            H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN,
-            **moe_prefill.launch_options(cfg.down),
-        )
+        moe_prefill.launch_down(act_r, down, order, table, out_r, max_tiles, cfg, pairs)
         _moe_combine_kernel[(tokens, triton.cdiv(hidden, block))](
             out_r, top_w.reshape(-1), sg, shared_out.contiguous(), y, sg.stride(0), H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
         )

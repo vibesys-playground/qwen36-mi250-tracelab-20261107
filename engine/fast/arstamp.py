@@ -4,7 +4,7 @@ How long does one GCD of a TP2 pair wait for the other at the in-graph LL all-re
 (``tp._ll_allreduce_kernel``) on the served path, and why? With the flag on:
 
 - the all-reduce kernel is compiled with ``STAMP``: program 0 reads the GPU's constant
-  100 MHz clock (``s_memrealtime``) at entry, when its spin for the peer's words ends and at
+  25 MHz clock (``s_memrealtime``) at entry, when its spin for the peer's words ends and at
   its end, and the shader clock (``s_memtime``) at entry, and stores them at index ``e`` (its
   own epoch: a per-rank count of all-reduce calls) of this rank's ring; the last program
   stores its entry, spin end and end at the index an atomic counter gives (the same count);
@@ -86,7 +86,7 @@ if triton is not None:
 
     @triton.jit
     def realtime():
-        """The GPU's constant-rate clock (100 MHz on gfx90a), as a scalar int64."""
+        """The GPU's constant-rate clock (25 MHz on MI250: j261), as a scalar int64."""
         return tl.inline_asm_elementwise("s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)", "=s", [],
                                           dtype=tl.int64, is_pure=False, pack=1)
 
@@ -125,7 +125,7 @@ class Stamps:
         self.hring = [torch.zeros((HRING, HFIELDS), dtype=torch.int64, device=d) for d in self.devices]
         self.hctr = [torch.zeros(1, dtype=torch.int32, device=d) for d in self.devices]
         self.layer_types: list[str] = []
-        self.rt_hz = 100e6
+        self.rt_hz = 25e6
         self.calibration: dict[str, Any] = {}
         self.host: dict[int, list] = {}  # tag -> [n, rank-0 replay s, rank-1 replay s, stamp s]
         self._lock = threading.Lock()
@@ -168,6 +168,13 @@ class Stamps:
         rates = []
         for rank, dev in enumerate(self.devices):
             with torch.cuda.device(dev):
+                # Compile both kinds first: j261 timed rank 0's first tail-kind compile into
+                # the host interval and read 20 MHz for a 25 MHz clock.
+                self.stamp(rank, 1, 0)
+                self.stamp(rank, 2, 0)
+                torch.cuda.synchronize(dev)
+                self.hring[rank].zero_()
+                self.hctr[rank].zero_()
                 self.stamp(rank, 1, 0)
                 torch.cuda.synchronize(dev)
                 h0 = time.perf_counter()

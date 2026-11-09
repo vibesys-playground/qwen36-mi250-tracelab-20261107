@@ -205,7 +205,7 @@ def _book(generator: Generator, generations: list[Generation], k: int, logits, p
             g.spec_accepted = g.spec_accepted * DECAY + acc[i]
 
 
-MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.2")) / 1e3
+MARGIN_S = float(os.environ.get("ENGINE_RUNAHEAD_MARGIN_MS", "1.5")) / 1e3
 EST_ALPHA = 0.2
 
 

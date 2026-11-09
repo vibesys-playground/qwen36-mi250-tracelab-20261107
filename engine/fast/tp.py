@@ -160,6 +160,39 @@ if triton is not None:
         tl.store(epoch_ptr + p, e)
 
 
+    @triton.jit(do_not_specialize=["NW"])
+    def _ll_allreduce_pred_kernel(
+        x_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr, flag_ptr, NW, CAP,
+        CHUNK: tl.constexpr, MAXIT: tl.constexpr,
+    ):
+        """``_ll_allreduce_kernel`` for fp32 without a residual, run only when ``flag[0] != 0``
+        (plan 47's predicated draft fallback). Both ranks read the same flag (computed from an
+        all-reduced value), so both run or both skip, and a skipped call leaves the epochs as
+        they were on both sides."""
+        if tl.load(flag_ptr) != 0:
+            p = tl.program_id(0)
+            e = tl.load(epoch_ptr + p) + 1
+            buf = (e % 2).to(tl.int64) * CAP
+            offs = p * CHUNK + tl.arange(0, CHUNK)
+            m = offs < NW
+            xi = tl.load(x_ptr + offs, mask=m, other=0)
+            word = (e.to(tl.int64) << 32) | (xi.to(tl.int64) & 0xFFFFFFFF)
+            tl.store(recv_peer + buf + offs, word, mask=m, cache_modifier=".wt")
+            src = recv_local + buf + offs
+            w = tl.load(src, mask=m, other=0, volatile=True, cache_modifier=".cv")
+            pending = tl.sum((((w >> 32).to(tl.int32) != e) & m).to(tl.int32), axis=0)
+            it = pending * 0
+            while (pending > 0) & (it < MAXIT):
+                w = tl.load(src, mask=m, other=0, volatile=True, cache_modifier=".cv")
+                pending = tl.sum((((w >> 32).to(tl.int32) != e) & m).to(tl.int32), axis=0)
+                it += 1
+            if pending > 0:
+                tl.atomic_add(err_ptr, 1)
+            yi = (w & 0xFFFFFFFF).to(tl.int32)
+            s = xi.to(tl.float32, bitcast=True) + yi.to(tl.float32, bitcast=True)
+            tl.store(out_ptr + offs, s.to(tl.int32, bitcast=True), mask=m)
+            tl.store(epoch_ptr + p, e)
+
     @triton.jit(do_not_specialize=["eps"])
     def _ll_ar_rms_kernel(
         x_ptr, res_ptr, w_ptr, sum_ptr, out_ptr, recv_local, recv_peer, epoch_ptr, err_ptr,
@@ -335,6 +368,8 @@ class _LL:
             for dtype, residual in ((torch.bfloat16, False), (torch.bfloat16, True), (torch.float32, False)):
                 x = torch.zeros((1, 256), dtype=dtype, device=dev)
                 self._launch(rank, x, x if residual else None, loop=True)
+            one = torch.ones(1, dtype=torch.int32, device=dev)
+            self._launch_pred(rank, torch.zeros((1, 4), dtype=torch.float32, device=dev), one, loop=True)
             torch.cuda.synchronize(dev)
 
     def _fine(self, dev: torch.device, nbytes: int) -> _Raw:
@@ -371,6 +406,24 @@ class _LL:
                 out.view(-1).view(torch.int32), local, peer, epoch, self.err[rank], nw, CAPACITY,
                 CHUNK=CHUNK, BF16=x.dtype == torch.bfloat16, RES=residual is not None,
                 MAXIT=MAXIT, num_warps=1,
+            )
+        return out
+
+    def _launch_pred(self, rank: int, x: torch.Tensor, flag: torch.Tensor, loop: bool = False) -> torch.Tensor:
+        """fp32 ``x_self + x_peer`` only when ``flag[0] != 0`` (``_ll_allreduce_pred_kernel``);
+        otherwise the output is left unwritten."""
+        x = x.contiguous()
+        nw = x.numel()
+        if x.dtype != torch.float32 or nw > CAPACITY:
+            raise ValueError(f"predicated all-reduce of {tuple(x.shape)} {x.dtype} is not supported")
+        out = torch.empty_like(x)
+        local = (self.loop if loop else self.recv)[rank]
+        peer = local if loop else self.recv[1 - rank]
+        epoch = (self.loop_epoch if loop else self.epoch)[rank]
+        with torch.cuda.device(x.device):
+            _ll_allreduce_pred_kernel[(triton.cdiv(nw, CHUNK),)](
+                x.view(-1).view(torch.int32), out.view(-1).view(torch.int32), local, peer, epoch,
+                self.err[rank], flag, nw, CAPACITY, CHUNK=CHUNK, MAXIT=MAXIT, num_warps=1,
             )
         return out
 
@@ -490,6 +543,17 @@ class Group:
                 and self.ll is not None and self.ll.rms_fits(x)):
             return self.ll._launch_rms(rank, x, residual, weight, eps)
         return kernels.add_rms(residual, self.allreduce(rank, x), weight, eps)
+
+    def allreduce_pred(self, rank: int, x: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+        """``allreduce`` of fp32 ``x`` that, in a captured graph, runs only when ``flag[0] !=
+        0`` (the same flag on both ranks). Eagerly it always runs."""
+        if self.solo:
+            return x
+        if x.is_cuda and torch.cuda.is_current_stream_capturing():
+            if self.ll is None:
+                raise RuntimeError("no in-graph all-reduce on this platform")
+            return self.ll._launch_pred(rank, x, flag)
+        return self.allreduce(rank, x)
 
     def argmax(self, rank: int, logits: torch.Tensor, offset: int) -> torch.Tensor:
         """The greedy pick per row over both ranks' vocabulary shards (``logits`` is this

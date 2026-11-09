@@ -1233,6 +1233,15 @@ class FastModel:
         M = size differ from M = count (accumulation order), the same for every pass of a size.
         Returns this rank's fp32 logits of the last real row and, with the MTP head, its draft.
         """
+        st, x, h = self._pg_begin(buf, size)
+        x, h = self._pg_layers(0, len(self.layers), st, x, h)
+        return self._pg_end(st, h)
+
+    # ``_pg_body`` in three parts, so a pass can also be captured as a chain of graphs cut at
+    # layer boundaries (``engine.split_prefill``): the same operations in the same order.
+
+    def _pg_begin(self, buf: torch.Tensor, size: int) -> tuple[SimpleNamespace, torch.Tensor, torch.Tensor]:
+        """The pass's device-side bookkeeping from ``buf``, the embedding and layer 0's norm."""
         dev = self.embed.device
         m0 = 2 * size
         ids, nxt = buf[:size], buf[size:m0]
@@ -1248,10 +1257,17 @@ class FastModel:
             meta=meta, keep=keep, grow=grow, table=table, positions=positions,
             page=torch.where(keep, table[positions // PAGE], scratch),
             offset=torch.where(keep, positions % PAGE, rows % PAGE),
+            rows=rows, nxt=nxt, pick=pick, last=last,
         )
         x = F.embedding(ids, self.embed)
         h = prefill_kernels.reduce_rms(x, None, None, self.layers[0].input_layernorm.weight, self.eps)[1]
-        for i, layer in enumerate(self.layers):
+        return st, x, h
+
+    def _pg_layers(self, lo: int, hi: int, st: SimpleNamespace, x: torch.Tensor,
+                   h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Layers ``lo`` .. ``hi`` - 1 of the pass: (residual, the next layer's normed input)."""
+        for i in range(lo, hi):
+            layer = self.layers[i]
             if self.layer_types[i] == "linear_attention":
                 h = self._pg_gdn(i, h, st)
             else:
@@ -1259,7 +1275,11 @@ class FastModel:
             x, h = self._reduce_rms(h, x, layer.post_attention_layernorm.weight)
             nxt_w = self.layers[i + 1].input_layernorm.weight if i + 1 < len(self.layers) else self.final_norm
             x, h = self._reduce_rms(self._moe(layer.mlp, h), x, nxt_w)
-        hidden = h
+        return x, h
+
+    def _pg_end(self, st: SimpleNamespace, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The last real row's logits and, with the MTP head, its draft."""
+        last, rows, pick, nxt = st.last, st.rows, st.pick, st.nxt
         logits = F.linear(hidden.index_select(0, last), self.lm_head).float()
         drafts = None
         if self.mtp is not None:

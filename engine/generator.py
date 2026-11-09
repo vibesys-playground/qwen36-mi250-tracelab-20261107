@@ -84,6 +84,27 @@ def use_tensor_parallel() -> bool:
     return tp.size() == 2 and torch.cuda.is_available() and torch.cuda.device_count() == 2
 
 
+def capture_fast(fast: Any, head: Any) -> None:
+    """Capture a fast-path model's graphs at load: with the MTP head every step is a verify
+    step, so those (or plan 31's chained verify), not plain decode."""
+    from engine.fast import mfma
+
+    chain = head is not None and getattr(fast, "chain", False)
+    fast.capture_all(decode=head is None, verify=not chain)
+    if chain and fast.use_graphs:
+        # Plan 31: the chained verify's graphs, k + 1 = 8, 4, 2 rows per slot.
+        for groups in (8, 4, 2):
+            for size in sorted(fast.buckets, reverse=True):
+                if groups <= mfma.RING and groups * size <= 64 and fast.graph_error is None:
+                    fast.capture(size, False, groups)
+    print(
+        f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
+        f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "
+        f"mtp={head is not None} tp={len(getattr(fast, 'devices_tp', [None]))}",
+        flush=True,
+    )
+
+
 @dataclass(frozen=True)
 class Step:
     """One generated token. ``emit`` is false for an end-of-sequence token that ends the output."""
@@ -592,23 +613,7 @@ class Generator:
             except FastPathUnavailable as exc:
                 print(f"engine: fast path unavailable ({exc}); using Transformers", flush=True)
             else:
-                # With the MTP head every step is a verify step: capture those, not plain decode.
-                from engine.fast import mfma
-
-                chain = head is not None and getattr(fast, "chain", False)
-                fast.capture_all(decode=head is None, verify=not chain)
-                if chain and fast.use_graphs:
-                    # Plan 31: the chained verify's graphs, k + 1 = 8, 4, 2 rows per slot.
-                    for groups in (8, 4, 2):
-                        for size in sorted(fast.buckets, reverse=True):
-                            if groups <= mfma.RING and groups * size <= 64 and fast.graph_error is None:
-                                fast.capture(size, False, groups)
-                print(
-                    f"engine: fast path, triton={fast.use_triton} graphs={fast.use_graphs} "
-                    f"graph_error={fast.graph_error} kv_pages={fast.pool.pages} "
-                    f"mtp={head is not None} tp={2 if use_tensor_parallel() else 1}",
-                    flush=True,
-                )
+                capture_fast(fast, head)
         generator = cls(lm, tokenizer, eos_ids, fast=fast, **options)
         gdn.ready(generator, kernels)
         return generator

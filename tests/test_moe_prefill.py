@@ -122,7 +122,8 @@ def test_config_buckets_by_token_count(monkeypatch):
 @pytest.mark.skipif(_device() is None, reason="needs Triton (GPU or TRITON_INTERPRET=1)")
 @pytest.mark.parametrize("bm", [16, 64])
 @pytest.mark.parametrize("mode", ["uniform", "skewed", "sparse"])
-def test_tile_table(bm, mode):
+@pytest.mark.parametrize("one", [False, True])
+def test_tile_table(bm, mode, one):
     dev = _device()
     e, k, n = 16, 4, 75
     g = torch.Generator().manual_seed(bm)
@@ -133,9 +134,7 @@ def test_tile_table(bm, mode):
     meta = torch.full((2, e), -1, dtype=torch.int32, device=dev)
     table = torch.full((3 * max_tiles + 1,), -7, dtype=torch.int32, device=dev)
     with kernels.on_device(meta):
-        mp._tiles_kernel[(-(-max_tiles // mp.TILE_BLOCK),)](
-            counts.to(dev), meta[0], meta[1], table, max_tiles, E=e, BLOCK_M=bm, BLOCK_T=mp.TILE_BLOCK,
-        )
+        mp.build_tiles(counts.to(dev), meta[0], meta[1], table, max_tiles, bm, one=one)
     starts = torch.cumsum(counts, 0) - counts
     want = []
     for ex_, (c, s) in enumerate(zip(counts.tolist(), starts.tolist())):
@@ -146,3 +145,25 @@ def test_tile_table(bm, mode):
     assert int(table[3 * max_tiles]) == len(want)
     got = [(int(table[t]), int(table[max_tiles + t]), int(table[2 * max_tiles + t])) for t in range(len(want))]
     assert got == want
+
+
+@pytest.mark.skipif(_device() is None, reason="needs Triton (GPU or TRITON_INTERPRET=1)")
+@pytest.mark.parametrize("tokens,bm", [(61, 16), (561, 64), (1650, 64)])
+@pytest.mark.parametrize("mode", ["uniform", "skewed", "sparse"])
+def test_tile_table_one_program_bitwise(tokens, bm, mode):
+    """Plan 56: ``_tiles_one_kernel`` writes the same buffers as ``_tiles_kernel`` (Qwen3.6:
+    256 experts, top 8), bit for bit, including the untouched entries past the tile count."""
+    dev = _device()
+    e, k = 256, 8
+    g = torch.Generator().manual_seed(tokens)
+    idx, _ = _routing(tokens, e, k, mode, g)
+    counts = torch.bincount(idx.reshape(-1), minlength=e).to(torch.int32).to(dev)
+    max_tiles = -(-(tokens * k) // bm) + e
+    out = []
+    for one in (False, True):
+        meta = torch.full((2, e), -1, dtype=torch.int32, device=dev)
+        table = torch.full((3 * max_tiles + 1,), -7, dtype=torch.int32, device=dev)
+        with kernels.on_device(meta):
+            mp.build_tiles(counts, meta[0], meta[1], table, max_tiles, bm, one=one)
+        out.append((meta.cpu(), table.cpu()))
+    assert torch.equal(out[0][0], out[1][0]) and torch.equal(out[0][1], out[1][1])

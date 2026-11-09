@@ -126,6 +126,34 @@ if triton is not None:
         tl.store(table_ptr + 2 * MAX_TILES + t, row_start + count, mask=ok)
 
     @triton.jit(do_not_specialize=["MAX_TILES"])
+    def _tiles_one_kernel(
+        counts_ptr, starts_ptr, cursor_ptr, table_ptr, MAX_TILES, E: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        """``_tiles_kernel``'s table from one program (plan 56): the prefix sums once, then
+        each expert writes its own tiles' entries (tile tstart[e] + j, j < n[e]), in max(n)
+        steps of E-wide stores, with no [tiles, E] compare. The entries [0, total) and the
+        count are the same integers; entries past the count are not written by either."""
+        e = tl.arange(0, E)
+        c = tl.load(counts_ptr + e)
+        st = tl.cumsum(c, axis=0) - c
+        n = (c + BLOCK_M - 1) // BLOCK_M
+        tend = tl.cumsum(n, axis=0)
+        tstart = tend - n
+        tl.store(starts_ptr + e, st)
+        tl.store(cursor_ptr + e, st)
+        tl.store(table_ptr + 3 * MAX_TILES, tl.sum(n, axis=0))
+        end = st + c
+        steps = tl.max(n, axis=0)
+        j = 0
+        while j < steps:
+            ok = j < n
+            t = tstart + j
+            tl.store(table_ptr + t, e, mask=ok)
+            tl.store(table_ptr + MAX_TILES + t, st + j * BLOCK_M, mask=ok)
+            tl.store(table_ptr + 2 * MAX_TILES + t, end, mask=ok)
+            j += 1
+
+    @triton.jit(do_not_specialize=["MAX_TILES"])
     def _gate_up_kernel(
         x_ptr,
         w_ptr,
@@ -306,6 +334,30 @@ def launch_options(k: KernelConfig) -> dict:
 TILE_BLOCK = 32  # tiles per step of ``_tiles_kernel``
 
 
+def tiles_one_enabled() -> bool:
+    """``ENGINE_MOE_TILES_ONE`` (plan 56, default on; 0 for ``_tiles_kernel``): the tile table
+    from one program, ``_tiles_one_kernel`` (the same table)."""
+    return os.environ.get("ENGINE_MOE_TILES_ONE", "1") != "0"
+
+
+_TILES_ONE = tiles_one_enabled()
+
+
+def build_tiles(counts: torch.Tensor, starts: torch.Tensor, cursor: torch.Tensor, table: torch.Tensor,
+                max_tiles: int, bm: int, one: bool | None = None) -> None:
+    """The tile table ``table`` [3 * max_tiles + 1] and each expert's first sorted row
+    (``starts`` and its copy ``cursor``) from the per-expert pair ``counts`` (see
+    ``_tiles_kernel``); launched on the current device."""
+    experts = counts.shape[0]
+    if _TILES_ONE if one is None else one:
+        _tiles_one_kernel[(1,)](counts, starts, cursor, table, max_tiles, E=experts, BLOCK_M=bm,
+                                num_warps=4)
+    else:
+        _tiles_kernel[(triton.cdiv(max_tiles, TILE_BLOCK),)](
+            counts, starts, cursor, table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=TILE_BLOCK,
+        )
+
+
 def _aligned(dim: int) -> bool:
     """Every block size (a power of two up to 128, clamped to ``dim``) divides ``dim``."""
     return dim >= 16 and (dim % 128 == 0 or dim & (dim - 1) == 0)
@@ -356,7 +408,7 @@ def moe_prefill(
     act = torch.empty((pairs, inter), dtype=torch.bfloat16, device=dev)
     out = torch.empty((pairs, hidden), dtype=torch.bfloat16, device=dev)
     with on_device(x):
-        _tiles_kernel[(triton.cdiv(max_tiles, TILE_BLOCK),)](counts, meta[0], meta[1], table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=TILE_BLOCK)
+        build_tiles(counts, meta[0], meta[1], table, max_tiles, bm)
         _gate_up_kernel[(max_tiles, triton.cdiv(inter, bn1))](
             x, gate_up, order, table, act, gate_up.stride(0), gate_up.stride(1), max_tiles,
             H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,

@@ -209,6 +209,7 @@ class _PackOnDevice:
     pad_index: torch.Tensor | None  # multi row j -> its index in [segments x longest]
     cu_seqlens: torch.Tensor | None  # [longer segments + 1] row offsets in the multi rows
     longest: int
+    rope: tuple[torch.Tensor, torch.Tensor] | None = None  # plan 56: cos/sin of ``positions``, once per pass
 
 
 class _PackPlan:
@@ -340,6 +341,9 @@ class FastModel:
             # Plan 40 (ENGINE_PREFILL_MERGED): a prefill pass's input projections of a layer
             # as one GEMM over its packed weight (``prefill_kernels.project``).
             "prefill_merged": prefill_kernels.merged_enabled(),
+            # Plan 56 (ENGINE_PREFILL_QK_FUSED): a prefill pass's attention Q/K prologue (q/k
+            # norm, RoPE, q/gate split, K/V page write) as one launch per layer, cos/sin once.
+            "qk_fused": self.use_triton and prefill_kernels.enabled() and prefill_kernels.qk_fused_enabled(),
             # Plan 40 part B (ENGINE_GDN_CHUNK): a prefill pass's GDN short conv and chunked
             # delta rule (with the q/k l2norm, decay, beta and padding) as three launches
             # (``gdn_chunk``) instead of the conv kernels and fla's chain; the recurrent state
@@ -1038,14 +1042,50 @@ class FastModel:
         ).to(qkv.dtype)
         return self._gdn_gate(m, core, z)
 
-    def _qkv(self, i: int, x: torch.Tensor, positions: torch.Tensor, prefill: bool = False):
-        m = self._attn_module(i)
-        tokens = x.shape[0]
+    def _qkv_parts(self, m, x: torch.Tensor, prefill: bool):
         parts = None
         if prefill and self.triton_kernels["prefill_merged"]:
             parts = prefill_kernels.project(x, (m.q_proj.weight, m.k_proj.weight, m.v_proj.weight))
         if parts is None:
             parts = (F.linear(x, m.q_proj.weight), F.linear(x, m.k_proj.weight), F.linear(x, m.v_proj.weight))
+        return parts
+
+    def _rope_tables(self, positions: torch.Tensor):
+        """Plan 56: the prefill pass's cos/sin (``_qkv``'s ops), once per pass; None when
+        the fused Q/K prologue is off."""
+        if not self.triton_kernels["qk_fused"]:
+            return None
+        return prefill_kernels.rope_tables(positions, self.inv_freq[positions.device], self.embed.dtype)
+
+    def _qkv_kv(self, i: int, x: torch.Tensor, positions: torch.Tensor, page: torch.Tensor,
+                offset: torch.Tensor, rope=None):
+        """``_qkv(prefill=True)`` and the K/V write at (``page``, ``offset``) per row; returns
+        (module, q, gate). With ``rope`` (``_rope_tables`` of ``positions``), through
+        ``prefill_kernels.qk_prologue`` (one launch) when it applies."""
+        m = self._attn_module(i)
+        k_pool, v_pool = self.kv[i]
+        if rope is not None:
+            qg, k, v = self._qkv_parts(m, x, True)
+            heads = qg.shape[-1] // (2 * m.head_dim)
+            if prefill_kernels.qk_supported(qg, k, v, heads, m.head_dim, rope[0], k_pool, v_pool):
+                q, gate = prefill_kernels.qk_prologue(
+                    qg, k, v, heads, m.q_norm.weight, m.k_norm.weight, m.q_norm.eps, m.k_norm.eps,
+                    rope[0], rope[1], k_pool, v_pool, page, offset,
+                )
+                return m, q, gate
+            m, q, k, v, gate = self._qkv_finish(m, (qg, k, v), positions, x)
+        else:
+            m, q, k, v, gate = self._qkv(i, x, positions, prefill=True)
+        k_pool[page, :, offset] = k
+        v_pool[page, :, offset] = v
+        return m, q, gate
+
+    def _qkv(self, i: int, x: torch.Tensor, positions: torch.Tensor, prefill: bool = False):
+        m = self._attn_module(i)
+        return self._qkv_finish(m, self._qkv_parts(m, x, prefill), positions, x)
+
+    def _qkv_finish(self, m, parts, positions: torch.Tensor, x: torch.Tensor):
+        tokens = x.shape[0]
         qg = parts[0].view(tokens, -1, m.head_dim * 2)
         q, gate = torch.chunk(qg, 2, dim=-1)
         gate = gate.reshape(tokens, -1)
@@ -1170,6 +1210,7 @@ class FastModel:
         dev = self.embed.device
         x = F.embedding(torch.tensor(list(ids), dtype=torch.long, device=dev), self.embed)
         h = None
+        ropes: dict[torch.device, tuple | None] = {}  # plan 56: cos/sin once per pass and device
         for i, layer in enumerate(self.layers):
             ldev = layer.input_layernorm.weight.device
             x = x.to(ldev)
@@ -1180,7 +1221,9 @@ class FastModel:
             if self.layer_types[i] == "linear_attention":
                 h = self._gdn_prefill(i, h, slot)
             else:
-                h = self._attn_prefill(i, h, slot, positions, start)
+                if ldev not in ropes:
+                    ropes[ldev] = self._rope_tables(positions)
+                h = self._attn_prefill(i, h, slot, positions, start, ropes[ldev])
             x, h = self._reduce_rms(h, x, layer.post_attention_layernorm.weight)
             nxt = self.layers[i + 1].input_layernorm.weight if i + 1 < len(self.layers) else self.final_norm
             x, h = self._reduce_rms(self._moe(layer.mlp, h), x, nxt if nxt.device == x.device else None)
@@ -1265,6 +1308,7 @@ class FastModel:
             page=torch.where(keep, table[positions // PAGE], scratch),
             offset=torch.where(keep, positions % PAGE, rows % PAGE),
         )
+        st.rope = self._rope_tables(positions)
         x = F.embedding(ids, self.embed)
         h = prefill_kernels.reduce_rms(x, None, None, self.layers[0].input_layernorm.weight, self.eps)[1]
         for i, layer in enumerate(self.layers):
@@ -1326,10 +1370,8 @@ class FastModel:
 
     def _pg_attn(self, i: int, x: torch.Tensor, st: SimpleNamespace) -> torch.Tensor:
         """``_attn_prefill`` (fused) at device positions: padding rows' KV to the dummy page."""
-        m, q, k, v, gate = self._qkv(i, x, st.positions, prefill=True)
+        m, q, gate = self._qkv_kv(i, x, st.positions, st.page, st.offset, st.rope)
         k_pool, v_pool = self.kv[i]
-        k_pool[st.page, :, st.offset] = k
-        v_pool[st.page, :, st.offset] = v
         out = prefill_kernels.prefill_attention(q, k_pool, v_pool, st.table, 0, gate, m.scaling, meta=st.meta)
         return F.linear(out, m.o_proj.weight)
 
@@ -1413,22 +1455,20 @@ class FastModel:
         return F.linear(out, m.out_proj.weight)
 
     def _attn_prefill(
-        self, i: int, x: torch.Tensor, slot: int, positions: torch.Tensor, start: int
+        self, i: int, x: torch.Tensor, slot: int, positions: torch.Tensor, start: int, rope=None
     ) -> torch.Tensor:
-        m, q, k, v, gate = self._qkv(i, x, positions, prefill=True)
         count = x.shape[0]
         k_pool, v_pool = self.kv[i]
         table = torch.tensor(self.slot_pages[slot], dtype=torch.long, device=x.device)
         page = table[positions // PAGE]
         offset = positions % PAGE
-        k_pool[page, :, offset] = k
-        v_pool[page, :, offset] = v
+        m, q, gate = self._qkv_kv(i, x, positions, page, offset, rope)
         if self.triton_kernels["prefill_fused"] and prefill_kernels.attention_supported(q, k_pool):
             out = prefill_kernels.prefill_attention(q, k_pool, v_pool, table, start, gate, m.scaling)
             return F.linear(out, m.o_proj.weight)
         total = start + count
         used = table[: math.ceil(total / PAGE)]
-        heads = k.shape[1]
+        heads = k_pool.shape[1]
         keys = k_pool[used].permute(1, 0, 2, 3).reshape(heads, -1, m.head_dim)[None, :, :total]
         values = v_pool[used].permute(1, 0, 2, 3).reshape(heads, -1, m.head_dim)[None, :, :total]
         query = q.transpose(0, 1).unsqueeze(0)  # [1, q_heads, T, dim]
@@ -1573,10 +1613,10 @@ class FastModel:
         return out
 
     def _attn_prefill_packed(self, i: int, x: torch.Tensor, p: _PackOnDevice) -> torch.Tensor:
-        m, q, k, v, gate = self._qkv(i, x, p.positions, prefill=True)
+        if p.rope is None:
+            p.rope = self._rope_tables(p.positions)
+        m, q, gate = self._qkv_kv(i, x, p.positions, p.pages, p.offsets, p.rope)
         k_pool, v_pool = self.kv[i]
-        k_pool[p.pages, :, p.offsets] = k
-        v_pool[p.pages, :, p.offsets] = v
         if self.triton_kernels["prefill_fused"] and prefill_kernels.attention_supported(q, k_pool):
             out = torch.empty((x.shape[0], q.shape[1] * q.shape[2]), dtype=q.dtype, device=q.device)
             for (lo, count, total), table in zip(p.spans, p.tables, strict=True):
@@ -1585,7 +1625,7 @@ class FastModel:
                     m.scaling, out=out[lo : lo + count],
                 )
             return F.linear(out, m.o_proj.weight)
-        heads = k.shape[1]
+        heads = k_pool.shape[1]
         q_heads = q.shape[1]
         outs = []
         for (lo, count, total), table in zip(p.spans, p.tables, strict=True):

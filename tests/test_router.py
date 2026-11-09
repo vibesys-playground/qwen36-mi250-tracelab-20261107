@@ -121,6 +121,41 @@ def test_in_flight_requests_count_as_load() -> None:
     assert affinity.load() == [1, 1]
 
 
+def test_the_idle_window_is_a_generic_three_seconds() -> None:
+    assert Affinity(2).idle_seconds == router.IDLE_SECONDS == 3.0
+
+
+def test_a_resting_session_counts_until_the_idle_window_ends() -> None:
+    affinity = Affinity(2, min_tokens=16)
+    a = _session(1, 100)
+    ra, t = affinity.route(a, now=0.0)
+    affinity.finish(t, ra, now=1.0)
+    assert affinity.load(now=3.9)[ra] == 1  # in a tool wait: still counts
+    rb, t = affinity.route(_session(2, 100), now=3.9)
+    assert rb != ra
+    affinity.finish(t, rb, now=4.0)
+    expected = [0, 0]
+    expected[rb] = 1
+    assert affinity.load(now=4.1) == expected  # a's window ended; b's has not
+    # a's next round keeps its replica whatever the window
+    assert affinity.route(a + _session(3, 20), now=30.0)[0] == ra
+
+
+def test_stats_reports_seconds_at_each_in_flight_count() -> None:
+    affinity = Affinity(2, min_tokens=16, idle_seconds=0)
+    assert affinity.stats(now=0.0)["share_over_2"] == 0.0
+    t1 = affinity.route(_session(1, 100), now=0.0)
+    t2 = affinity.route(_session(2, 100), now=1.0)
+    t3 = affinity.route(_session(3, 100), now=2.0)  # two on one replica
+    for r, t in (t1, t2, t3):
+        affinity.finish(t, r, now=4.0)
+    stats = affinity.stats(now=5.0)
+    hist = stats["inflight_seconds"]
+    assert sorted(hist, key=len) == [[2.0, 3.0], [1.0, 2.0, 2.0]]
+    assert stats["max_inflight"] == [len(h) - 1 for h in hist]
+    assert stats["share_over_2"] == 0.0 and stats["idle_seconds"] == 0
+
+
 def test_chat_history_matches_message_by_message() -> None:
     messages = [{"role": "system", "content": "x" * 400}, {"role": "user", "content": "hi"}]
     first = affinity_key("/v1/chat/completions", {"messages": messages})

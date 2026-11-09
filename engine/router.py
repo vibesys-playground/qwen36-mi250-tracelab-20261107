@@ -17,7 +17,13 @@ previous prompt (the earlier prompt plus the model output plus new input).
 request whose prompt starts with a remembered prompt goes to that prompt's
 replica, choosing the longest such prompt. A prompt that extends none goes to
 the least-loaded replica, counting in-flight requests and sessions that ended a
-round moments ago and are likely to continue. A prompt is compared as token
+round moments ago and are likely to continue. "Moments" is
+``ENGINE_SESSION_IDLE_SECONDS`` (3 s by default): a generic allowance for an
+agent's tool call or a client's think time between rounds, after which a
+session that sent nothing more no longer counts. A longer window keeps sessions
+that have ended counting as load, so new sessions avoid replicas that are in
+fact idle; a shorter one lets a session resting in a long tool wait be
+outnumbered. A prompt is compared as token
 ids, as text, or for chat as the sequence of its messages, so a chat session's
 growing history matches message by message. The replica holding a session holds
 its prefix-cache snapshots, so affinity is also what makes cached tokens real.
@@ -180,6 +186,11 @@ def _extends(key: Key, earlier: Key) -> bool:
     return key[: len(earlier)] == earlier
 
 
+# How long a session that ended a round still counts as load on its replica: a
+# generic allowance for a tool call or think time between rounds (not tuned to a workload).
+IDLE_SECONDS = 3.0
+
+
 @dataclass
 class Entry:
     """One routed prompt: the replica that served it and when its request ended."""
@@ -198,21 +209,56 @@ class Affinity:
     unrelated sessions onto its replica: a remembered prompt shorter than that
     attracts only an identical prompt. ``idle_seconds`` is how long a session
     that just finished a round still counts as load on its replica.
+
+    It also keeps, per replica, the seconds spent with each number of requests
+    in flight (from the first request on): ``stats()`` reports that histogram.
     """
 
     replicas: int
     max_entries: int = 4096
     min_tokens: int = 64
-    idle_seconds: float = 10.0
+    idle_seconds: float = IDLE_SECONDS
     _entries: OrderedDict[int, Entry] = field(default_factory=OrderedDict)
     _inflight: list[int] = field(default_factory=list)
     _new_sessions: list[int] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _next_id: int = 0
+    _seconds_at: list[list[float]] = field(default_factory=list)
+    _clock: float | None = None
 
     def __post_init__(self) -> None:
         self._inflight = [0] * self.replicas
         self._new_sessions = [0] * self.replicas
+        self._seconds_at = [[] for _ in range(self.replicas)]
+
+    def _advance(self, now: float) -> None:
+        """Add the time since the last change to each replica's current in-flight level."""
+        if self._clock is not None:
+            dt = max(now - self._clock, 0.0)
+            for r, level in enumerate(self._inflight):
+                hist = self._seconds_at[r]
+                if len(hist) <= level:
+                    hist.extend([0.0] * (level + 1 - len(hist)))
+                hist[level] += dt
+        self._clock = now
+
+    def stats(self, now: float | None = None) -> dict[str, Any]:
+        """Per replica, seconds at each in-flight count; the share of time above two."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._clock is not None:
+                self._advance(now)
+            hist = [[round(t, 3) for t in h] for h in self._seconds_at]
+            total = sum(sum(h) for h in self._seconds_at)
+            busy = sum(sum(h[1:]) for h in self._seconds_at)
+            over = sum(sum(h[3:]) for h in self._seconds_at)
+            return {
+                "inflight_seconds": hist,
+                "share_over_2": round(over / total, 4) if total else 0.0,
+                "share_over_2_of_busy": round(over / busy, 4) if busy else 0.0,
+                "max_inflight": [len(h) - 1 if h else 0 for h in self._seconds_at],
+                "idle_seconds": self.idle_seconds,
+            }
 
     def _match(self, key: Key) -> Entry | None:
         best: Entry | None = None
@@ -242,10 +288,11 @@ class Affinity:
                 load[entry.replica] += 1
         return load
 
-    def route(self, key: Key | None) -> tuple[int, int]:
+    def route(self, key: Key | None, now: float | None = None) -> tuple[int, int]:
         """(replica, ticket) for a request; pass the ticket to ``finish`` when it ends."""
         with self._lock:
-            now = time.monotonic()
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             match = self._match(key) if key is not None else None
             if match is not None:
                 replica = match.replica
@@ -265,12 +312,14 @@ class Affinity:
                     self._entries.popitem(last=False)
             return replica, ticket
 
-    def finish(self, ticket: int, replica: int) -> None:
+    def finish(self, ticket: int, replica: int, now: float | None = None) -> None:
         with self._lock:
+            now = time.monotonic() if now is None else now
+            self._advance(now)
             self._inflight[replica] -= 1
             entry = self._entries.get(ticket)
             if entry is not None:
-                entry.ended_at = time.monotonic()
+                entry.ended_at = now
 
 
 # ----------------------------------------------------------------------------- replicas
@@ -461,6 +510,7 @@ class _FrontHandler(BaseHTTPRequestHandler):
                 {"devices": list(r.devices), **s} for r, s in zip(replicas, states, strict=True)
             ]
             body["load"] = self.server.affinity.load()
+            body["router"] = self.server.affinity.stats()
             self._send_json(200, body)
             return
         try:
@@ -546,7 +596,7 @@ def serve(
     affinity = Affinity(
         len(replicas),
         min_tokens=env_int("ENGINE_AFFINITY_MIN_TOKENS") or 64,
-        idle_seconds=float(os.environ.get("ENGINE_SESSION_IDLE_SECONDS") or 10.0),
+        idle_seconds=float(os.environ.get("ENGINE_SESSION_IDLE_SECONDS") or IDLE_SECONDS),
     )
     front = _Front((host, port), replicas, affinity)
 

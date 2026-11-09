@@ -111,6 +111,11 @@ def driver(args: argparse.Namespace) -> None:
     ar_32_64 = [ar[kb]["p50_us"] for kb in (32, 64) if kb in ar]
     par = {r["what"]: r for r in res.get("parity", [])}
     tp4_par = par.get("tp4_vs_ref_lockstep")
+    floor = par.get("noise_floor_tp2_served_vs_tp2_lockstep")
+    if tp4_par and floor:
+        out("parity_vs_floor", tp4_agree=tp4_par["agree"], floor_agree=floor["agree"],
+            rows=tp4_par["rows"], tp4_mismatches=tp4_par["mismatches"],
+            floor_mismatches=floor["mismatches"])
     failed = []
     if rc_ref != 0 or rc_tp4 != 0:
         failed.append(f"part rc ref={rc_ref} tp4={rc_tp4}")
@@ -878,14 +883,22 @@ def part_tp4(args: argparse.Namespace) -> None:
     out("check", what="tp4_ar_timeouts", ok=fast.timeouts() == 0, timeouts=fast.timeouts())
 
     # The same steps without the all-reduces: each rank alone (wrong numbers, right kernels).
+    # Per-op first (j209: the solo capture below failed and fell back to tp.py's 2-rank eager path).
+    op_times(torch, r0, (8, 12, 16), plen, args.iters, "tp4")
+
     fast.clear_graphs()
     fast._solo_steps = True
     fast.group.solo = True
-    step_times(torch, fast, corpus, plen, (2, 3, 4), args.iters, "tp4", ar=False)
+    try:
+        for batch in (2, 4):
+            fast.capture(fast.bucket(batch), False, GROUPS)
+            if fast.graph_error is not None:
+                raise RuntimeError(fast.graph_error)
+        step_times(torch, fast, corpus, plen, (2, 4), args.iters, "tp4", ar=False)
+    except Exception as exc:  # noqa: BLE001 - informational only
+        out("noar_failed", error=f"{type(exc).__name__}: {str(exc)[:600]}")
     fast.group.solo = False
     fast._solo_steps = False
-
-    op_times(torch, r0, (8, 12, 16), plen, args.iters, "tp4")
 
 
 def main() -> None:

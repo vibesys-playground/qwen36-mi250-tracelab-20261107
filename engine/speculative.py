@@ -41,6 +41,17 @@ predicted tokens per millisecond: per request the expected tokens per step at it
 running per-draft acceptance (an exponentially decayed count of its accepted and rejected
 drafts, starting from a prior), over the step cost of k (``ENGINE_SPEC_COST``, ms per
 2-slot step). Nothing but the request's own measured acceptance feeds the choice.
+
+Run-ahead (plan 42, ``ENGINE_RUNAHEAD=1``, the default; tensor-parallel fast path): the next
+chained step is launched before the host reads the current one's picks, its inputs written on
+the GPU from the current step's outputs (``TPModel.chain_launch_next``), so the GPU does not
+idle while the host builds inputs and handles tokens. Only when that step surely runs for the
+same requests with the same k: every request greedy with ``ignore_eos``, no stop strings, and
+a token still needed after the current step's at most k + 1; no job, prefill or arrival
+waiting (asked again right before the launch). The launch waits until
+``ENGINE_RUNAHEAD_MARGIN_MS`` before the current step's learned end, so a request arriving
+meanwhile is prefilled after the current step. A batch change finishes the step launched
+ahead first (``drain``). The steps, their inputs and kernels are those of the serial order.
 """
 
 from __future__ import annotations

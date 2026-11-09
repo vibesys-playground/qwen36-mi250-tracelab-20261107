@@ -30,7 +30,7 @@ import torch
 from torch.nn import functional as F
 
 from engine.fast.kernels import INTERPRET, on_device, tl, triton
-from engine.fast import moe_prefill
+from engine.fast import flash_prefill, moe_prefill
 
 _WIDEN = INTERPRET  # see ``moe_prefill``: the interpreter's BF16 dot and rounding
 
@@ -38,6 +38,63 @@ _WIDEN = INTERPRET  # see ``moe_prefill``: the interpreter's BF16 dot and roundi
 def enabled() -> bool:
     """``ENGINE_PREFILL_FUSED`` (default on)."""
     return os.environ.get("ENGINE_PREFILL_FUSED", "1") != "0"
+
+
+def flash_enabled() -> bool:
+    """``ENGINE_PREFILL_FLASH`` (default on): ``prefill_attention`` runs the MFMA-tiled flash
+    kernel of ``engine.fast.flash_prefill`` (plan 35); 0 restores ``_prefill_attn_kernel``."""
+    return os.environ.get("ENGINE_PREFILL_FLASH", "1") != "0"
+
+
+_FLASH = flash_enabled()
+
+
+def merged_enabled() -> bool:
+    """``ENGINE_PREFILL_MERGED`` (plan 40, default on; 0 for one GEMM per projection): a
+    prefill pass runs a layer's input projections (GDN qkv|z|b|a, attention q|k|v, MoE
+    router|shared gate|shared up|shared-expert gate) as one GEMM over the layer's packed
+    weight (``packed_rows``) and reads the outputs as column slices."""
+    return os.environ.get("ENGINE_PREFILL_MERGED", "1") != "0"
+
+
+_PACKED: dict[tuple, torch.Tensor | None] = {}
+
+
+def packed_rows(weights) -> torch.Tensor | None:
+    """The [sum(N), K] tensor whose consecutive row blocks are ``weights`` (each [N_i, K]),
+    as a view of their shared storage, when they are laid out that way (``fused._pack``
+    packs every layer's projections like this on every rank); else None. No copy: the
+    view is the same memory the separate GEMMs read."""
+    key = tuple((w.data_ptr(), tuple(w.shape)) for w in weights)
+    if key in _PACKED:
+        return _PACKED[key]
+    w0 = weights[0]
+    k = w0.shape[-1]
+    ok = all(
+        w.dim() == 2 and w.shape[1] == k and w.is_contiguous() and w.dtype == w0.dtype
+        and w.device == w0.device
+        and w.untyped_storage().data_ptr() == w0.untyped_storage().data_ptr()
+        for w in weights
+    )
+    ptr = w0.data_ptr()
+    for w in weights:
+        ok = ok and w.data_ptr() == ptr
+        ptr += w.numel() * w.element_size()
+    out = None
+    if ok:
+        rows = sum(w.shape[0] for w in weights)
+        out = w0.detach().as_strided((rows, k), (k, 1))
+    _PACKED[key] = out
+    return out
+
+
+def project(x: torch.Tensor, weights) -> tuple[torch.Tensor, ...] | None:
+    """``tuple(F.linear(x, w) for w in weights)`` as one GEMM over ``packed_rows(weights)``:
+    column views of one [T, sum(N)] output (row stride sum(N)); None if not packed."""
+    w = packed_rows(weights)
+    if w is None:
+        return None
+    return torch.split(F.linear(x, w), [t.shape[0] for t in weights], dim=-1)
 
 
 if triton is not None:
@@ -136,14 +193,14 @@ if triton is not None:
 
     @triton.jit
     def _route_kernel(
-        logit_ptr, w_ptr, i_ptr, counts_ptr, E: tl.constexpr, K: tl.constexpr,
+        logit_ptr, w_ptr, i_ptr, counts_ptr, SL, E: tl.constexpr, K: tl.constexpr,
         WIDEN: tl.constexpr,
     ):
         """softmax (fp32) over the row's E logits, top K (ties to the lower expert), the
         weights renormalized to sum 1 and rounded to BF16; per-expert pair counts."""
         row = tl.program_id(0).to(tl.int64)
         e = tl.arange(0, E)
-        z = tl.load(logit_ptr + row * E + e).to(tl.float32)
+        z = tl.load(logit_ptr + row * SL + e).to(tl.float32)
         z = tl.exp(z - tl.max(z, axis=0))
         probs = z / tl.sum(z, axis=0)
         kk = tl.arange(0, K)
@@ -160,17 +217,6 @@ if triton is not None:
         tl.store(w_ptr + row * K + kk, _bf16(top_w / total, WIDEN).to(tl.bfloat16))
         tl.store(i_ptr + row * K + kk, top_i.to(tl.int64))
         tl.atomic_add(counts_ptr + top_i, tl.full([K], 1, tl.int32))
-
-    @triton.jit
-    def _expert_offsets_kernel(
-        counts_ptr, starts_ptr, cursor_ptr, tile_ends_ptr, E: tl.constexpr, BLOCK_M: tl.constexpr
-    ):
-        e = tl.arange(0, E)
-        c = tl.load(counts_ptr + e)
-        ends = tl.cumsum(c, axis=0)
-        tl.store(starts_ptr + e, ends - c)
-        tl.store(cursor_ptr + e, ends - c)
-        tl.store(tile_ends_ptr + e, tl.cumsum((c + BLOCK_M - 1) // BLOCK_M, axis=0))
 
     @triton.jit(do_not_specialize=["P"])
     def _expert_order_kernel(ids_ptr, cursor_ptr, order_ptr, P, BLOCK: tl.constexpr):
@@ -193,19 +239,34 @@ if triton is not None:
         tl.store(out_ptr + i, _bf16(a * u, WIDEN).to(tl.bfloat16), mask=ok)
 
     @triton.jit
+    def _silu_mul_rows_kernel(gu_ptr, out_ptr, SG, S: tl.constexpr, BLOCK: tl.constexpr,
+                              WIDEN: tl.constexpr):
+        """``_silu_mul_kernel`` on row ``t`` of [T, 2S] (gate | up, row stride SG) -> [T, S]."""
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        ok = cols < S
+        g = tl.load(gu_ptr + row * SG + cols, mask=ok, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + row * SG + S + cols, mask=ok, other=0.0).to(tl.float32)
+        a = _bf16(g * tl.sigmoid(g), WIDEN)  # F.silu on BF16
+        tl.store(out_ptr + row * S + cols, _bf16(a * u, WIDEN).to(tl.bfloat16), mask=ok)
+
+    @triton.jit
     def _moe_combine_kernel(
-        pairs_ptr, sg_ptr, shared_ptr, out_ptr, H: tl.constexpr, K: tl.constexpr,
+        pairs_ptr, wt_ptr, sg_ptr, shared_ptr, out_ptr, SSG, H: tl.constexpr, K: tl.constexpr,
         BLOCK: tl.constexpr, WIDEN: tl.constexpr,
     ):
-        """bf16(sum_k pairs[t, k]) + bf16(bf16(sigmoid(sg[t])) * shared[t]), rounded as eager."""
+        """bf16(sum_k w[t, k] * pairs[t, k]) + bf16(bf16(sigmoid(sg[t])) * shared[t]), rounded as
+        eager. ``pairs`` holds each pair's bf16 expert output; w (BF16) times it is exact in fp32,
+        so the fp32 sum is the one over ``bf16(acc) * w`` rows."""
         row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         ok = cols < H
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         for k in tl.static_range(K):
-            acc += tl.load(pairs_ptr + (row * K + k) * H + cols, mask=ok, other=0.0)
+            w = tl.load(wt_ptr + row * K + k).to(tl.float32)
+            acc += tl.load(pairs_ptr + (row * K + k) * H + cols, mask=ok, other=0.0).to(tl.float32) * w
         routed = _bf16(acc, WIDEN)
-        gate = _bf16(tl.sigmoid(tl.load(sg_ptr + row).to(tl.float32)), WIDEN)
+        gate = _bf16(tl.sigmoid(tl.load(sg_ptr + row * SSG).to(tl.float32)), WIDEN)
         shared = tl.load(shared_ptr + row * H + cols, mask=ok, other=0.0).to(tl.float32)
         y = _bf16(routed + _bf16(gate * shared, WIDEN), WIDEN)
         tl.store(out_ptr + row * H + cols, y.to(tl.bfloat16), mask=ok)
@@ -217,7 +278,7 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=["T"])
     def _gdn_conv_kernel(
-        qkv_ptr, state_ptr, w_ptr, out_ptr, T, C, K: tl.constexpr, BLOCK_T: tl.constexpr,
+        qkv_ptr, state_ptr, w_ptr, out_ptr, T, C, SX, K: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr, WIDEN: tl.constexpr,
     ):
         """silu(causal depthwise conv) of [T, C] inputs after the slot's last K inputs (its
@@ -229,7 +290,7 @@ if triton is not None:
         for j in tl.static_range(K):
             src = t + 1 + j - K  # the input row; < 0: the state's column src + K
             from_x = (src >= 0)[:, None]
-            xv = tl.load(qkv_ptr + src.to(tl.int64)[:, None] * C + c[None, :], mask=ok & from_x, other=0.0)
+            xv = tl.load(qkv_ptr + src.to(tl.int64)[:, None] * SX + c[None, :], mask=ok & from_x, other=0.0)
             sv = tl.load(state_ptr + c[None, :] * K + (src + K)[:, None], mask=ok & (~from_x), other=0.0)
             w = tl.load(w_ptr + c * K + j, mask=c < C, other=0.0).to(tl.float32)
             acc += tl.where(from_x, xv, sv).to(tl.float32) * w[None, :]
@@ -238,7 +299,7 @@ if triton is not None:
         tl.store(out_ptr + t.to(tl.int64)[:, None] * C + c[None, :], y.to(tl.bfloat16), mask=ok)
 
     @triton.jit(do_not_specialize=["T"])
-    def _gdn_conv_state_kernel(qkv_ptr, state_ptr, T, C, meta_ptr, K: tl.constexpr, BLOCK_C: tl.constexpr,
+    def _gdn_conv_state_kernel(qkv_ptr, state_ptr, T, C, SX, meta_ptr, K: tl.constexpr, BLOCK_C: tl.constexpr,
                                HAS_META: tl.constexpr):
         """The conv state after T inputs: the last K of (state ++ inputs). With ``HAS_META``,
         T is the real row count read from ``meta_ptr`` (rows past it are padding)."""
@@ -251,30 +312,31 @@ if triton is not None:
         src = n - K + i  # input row of new column i; < 0: old column n + i
         c_ok = (c < C)[:, None]
         from_x = (src >= 0)[None, :]
-        xv = tl.load(qkv_ptr + src.to(tl.int64)[None, :] * C + c[:, None], mask=c_ok & from_x, other=0.0)
+        xv = tl.load(qkv_ptr + src.to(tl.int64)[None, :] * SX + c[:, None], mask=c_ok & from_x, other=0.0)
         sv = tl.load(state_ptr + c[:, None] * K + (n + i)[None, :], mask=c_ok & (~from_x), other=0.0)
         tl.store(state_ptr + c[:, None] * K + i[None, :], tl.where(from_x, xv, sv), mask=c_ok)
 
     @triton.jit(do_not_specialize=["NUMEL"])
     def _gdn_gates_kernel(
-        a_ptr, b_ptr, alog_ptr, dtb_ptr, g_ptr, beta_ptr, NUMEL, HV: tl.constexpr,
+        a_ptr, b_ptr, alog_ptr, dtb_ptr, g_ptr, beta_ptr, NUMEL, SA, SB, HV: tl.constexpr,
         BLOCK: tl.constexpr, WIDEN: tl.constexpr,
     ):
         """g = -exp(A_log) * softplus(a + dt_bias) (fp32), beta = sigmoid(b) (BF16)."""
         i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         ok = i < NUMEL
         h = i % HV
-        a = tl.load(a_ptr + i, mask=ok, other=0.0).to(tl.float32) + tl.load(dtb_ptr + h, mask=ok, other=0.0).to(tl.float32)
+        t = (i // HV).to(tl.int64)
+        a = tl.load(a_ptr + t * SA + h, mask=ok, other=0.0).to(tl.float32) + tl.load(dtb_ptr + h, mask=ok, other=0.0).to(tl.float32)
         softplus = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
         g = -tl.exp(tl.load(alog_ptr + h, mask=ok, other=0.0).to(tl.float32)) * softplus
         tl.store(g_ptr + i, g, mask=ok)
-        b = tl.load(b_ptr + i, mask=ok, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + t * SB + h, mask=ok, other=0.0).to(tl.float32)
         tl.store(beta_ptr + i, _bf16(tl.sigmoid(b), WIDEN).to(tl.bfloat16), mask=ok)
 
     @triton.jit(do_not_specialize=["ROWS"])
     def _gated_rms_kernel(
-        x_ptr, z_ptr, w_ptr, out_ptr, ROWS, eps, D: tl.constexpr, BLOCK_R: tl.constexpr,
-        ROUND_Y: tl.constexpr, WIDEN: tl.constexpr,
+        x_ptr, z_ptr, w_ptr, out_ptr, ROWS, eps, SZ, D: tl.constexpr, ZH: tl.constexpr,
+        BLOCK_R: tl.constexpr, ROUND_Y: tl.constexpr, WIDEN: tl.constexpr,
     ):
         """``_gated_rms`` per D-wide row: normalize (fp32, rounded), * weight, * silu(z)."""
         r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -286,7 +348,9 @@ if triton is not None:
         y = tl.load(w_ptr + d).to(tl.float32)[None, :] * n
         if ROUND_Y:
             y = _bf16(y, WIDEN)
-        z = tl.load(z_ptr + offs, mask=ok, other=0.0).to(tl.float32)
+        rz = r.to(tl.int64)
+        zoffs = ((rz // ZH) * SZ + (rz % ZH) * D)[:, None] + d[None, :]  # z [T, ZH * D], row stride SZ
+        z = tl.load(z_ptr + zoffs, mask=ok, other=0.0).to(tl.float32)
         tl.store(out_ptr + offs, _bf16(y * (z * tl.sigmoid(z)), WIDEN).to(tl.bfloat16), mask=ok)
 
 
@@ -342,8 +406,29 @@ def prefill_attention(
     ``meta``, an int64 tensor ``[count, start]`` on ``q``'s device, ``start`` is ignored and
     ``q``'s T rows are a bucket whose first ``count`` rows are real, at positions
     ``start .. start + count - 1``. Real rows give the same bits as a call over those rows
-    alone. Padding rows (``>= count``) are computed as if at position ``start + count - 1``
-    (finite values, to be discarded); keys past ``start + count`` are never read."""
+    alone with the same kernel and launch knobs. Padding rows (``>= count``) are computed as if
+    at position ``start + count - 1`` (finite values, to be discarded); keys past
+    ``start + count`` are never read.
+
+    With ``ENGINE_PREFILL_FLASH`` (default on) this is the flash kernel of
+    ``engine.fast.flash_prefill`` (plan 35), whose tile and key split come from T alone (the
+    bucket size under ``meta``); its per-row bits depend on that choice (the summation order
+    over keys), so a captured pass and an eager one of the same rows agree bitwise only when
+    their T choose the same knobs, as the GEMMs at M = size and M = count."""
+    if _FLASH:
+        return flash_prefill.flash_prefill_attention(
+            q, k_pool, v_pool, table, start, gate, scale, out, meta=meta
+        )
+    return prefill_attention_rows(q, k_pool, v_pool, table, start, gate, scale, out, meta)
+
+
+def prefill_attention_rows(
+    q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor, table: torch.Tensor,
+    start: int, gate: torch.Tensor, scale: float, out: torch.Tensor | None = None,
+    meta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``_prefill_attn_kernel`` (the path before plan 35, ``ENGINE_PREFILL_FLASH=0``); its
+    per-row results do not depend on T."""
     count, q_heads, dim = q.shape
     heads, page = k_pool.shape[1], k_pool.shape[2]
     group = q_heads // heads
@@ -430,12 +515,14 @@ def moe_reference(x: torch.Tensor, mlp: torch.nn.Module, top_k: int) -> torch.Te
 def route(logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(top_w BF16 [T, k], top_i int64 [T, k], per-expert pair counts int32 [E])."""
     tokens, experts = logits.shape
+    if logits.stride(-1) != 1:
+        logits = logits.contiguous()
     top_w = torch.empty((tokens, top_k), dtype=logits.dtype, device=logits.device)
     top_i = torch.empty((tokens, top_k), dtype=torch.long, device=logits.device)
     counts = torch.zeros(experts, dtype=torch.int32, device=logits.device)
     with on_device(logits):
         _route_kernel[(tokens,)](
-            logits.contiguous(), top_w, top_i, counts, E=experts, K=top_k, WIDEN=_WIDEN,
+            logits, top_w, top_i, counts, logits.stride(0), E=experts, K=top_k, WIDEN=_WIDEN,
             num_warps=4,
         )
     return top_w, top_i, counts
@@ -451,55 +538,75 @@ def moe_supported(x: torch.Tensor, mlp: torch.nn.Module, top_k: int) -> bool:
     )
 
 
-def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int) -> torch.Tensor:
-    """The MoE block of ``FastModel._moe`` for a prefill chunk [T, hidden] (T > 16)."""
+def moe(x: torch.Tensor, mlp: torch.nn.Module, top_k: int, merged: bool = False) -> torch.Tensor:
+    """The MoE block of ``FastModel._moe`` for a prefill chunk [T, hidden] (T > 16).
+
+    ``merged`` (plan 40): router, shared gate, shared up and shared-expert gate as one GEMM
+    over their packed rows (``project``) when packed, the kernels reading column slices."""
     tokens, hidden = x.shape
     dev = x.device
     x = x.contiguous()
     shared = mlp.shared_expert
-    g = F.linear(x, shared.gate_proj.weight)
-    u = F.linear(x, shared.up_proj.weight)
-    act = torch.empty_like(g)
-    numel = g.numel()
-    with on_device(x):
-        _silu_mul_kernel[(triton.cdiv(numel, 1024),)](g, u, act, numel, BLOCK=1024, WIDEN=_WIDEN)
+    parts = None
+    if merged:
+        parts = project(x, (mlp.gate.weight, shared.gate_proj.weight, shared.up_proj.weight,
+                            mlp.shared_expert_gate.weight))
+    if parts is not None:
+        logits, g, _, sg = parts
+        inter_s = g.shape[1]
+        act = torch.empty((tokens, inter_s), dtype=x.dtype, device=dev)
+        block_s = min(1024, triton.next_power_of_2(inter_s))
+        with on_device(x):
+            # gate | up are adjacent columns: one [T, 2S] view from the gate's start.
+            _silu_mul_rows_kernel[(tokens, triton.cdiv(inter_s, block_s))](
+                g, act, g.stride(0), S=inter_s, BLOCK=block_s, WIDEN=_WIDEN,
+            )
+    else:
+        g = F.linear(x, shared.gate_proj.weight)
+        u = F.linear(x, shared.up_proj.weight)
+        act = torch.empty_like(g)
+        numel = g.numel()
+        with on_device(x):
+            _silu_mul_kernel[(triton.cdiv(numel, 1024),)](g, u, act, numel, BLOCK=1024, WIDEN=_WIDEN)
+        sg = F.linear(x, mlp.shared_expert_gate.weight)  # [T, 1]
+        logits = F.linear(x, mlp.gate.weight)
     shared_out = F.linear(act, shared.down_proj.weight)
-    sg = F.linear(x, mlp.shared_expert_gate.weight)  # [T, 1]
-    top_w, top_i, counts = route(F.linear(x, mlp.gate.weight), top_k)
+    top_w, top_i, counts = route(logits, top_k)
     # The grouped experts (``moe_prefill``) with the bookkeeping from the counts above.
     gate_up, down = mlp.experts.gate_up_proj, mlp.experts.down_proj
     experts, two_i, _ = gate_up.shape
     inter = two_i // 2
     pairs = tokens * top_k
-    bm, bn1, bk1, bn2, bk2, warps, stages = moe_prefill.config(pairs, experts)
-    bn1, bk2 = min(bn1, inter), min(bk2, inter)
-    bk1, bn2 = min(bk1, hidden), min(bn2, hidden)
-    meta = torch.empty((3, experts), dtype=torch.int32, device=dev)
-    starts, cursor, tile_ends = meta[0], meta[1], meta[2]
+    cfg = moe_prefill.config(pairs, experts)
+    bm = cfg.bm
+    bn1, bk1 = min(cfg.gate_up.bn, inter), min(cfg.gate_up.bk, hidden)
+    bn2, bk2 = min(cfg.down.bn, hidden), min(cfg.down.bk, inter)
+    meta = torch.empty((2, experts), dtype=torch.int32, device=dev)
+    starts, cursor = meta[0], meta[1]
+    max_tiles = triton.cdiv(pairs, bm) + experts
+    table = torch.empty(3 * max_tiles + 1, dtype=torch.int32, device=dev)
     order = torch.empty(pairs, dtype=torch.int32, device=dev)
     act_r = torch.empty((pairs, inter), dtype=torch.bfloat16, device=dev)
-    out_r = torch.empty((pairs, hidden), dtype=torch.float32, device=dev)
-    max_tiles = triton.cdiv(pairs, bm) + experts
-    log_e = max(1, (experts - 1).bit_length())
+    out_r = torch.empty((pairs, hidden), dtype=torch.bfloat16, device=dev)
     y = torch.empty_like(x)
     block = min(1024, triton.next_power_of_2(hidden))
     with on_device(x):
-        _expert_offsets_kernel[(1,)](counts, starts, cursor, tile_ends, E=experts, BLOCK_M=bm)
+        moe_prefill._tiles_kernel[(triton.cdiv(max_tiles, moe_prefill.TILE_BLOCK),)](
+            counts, starts, cursor, table, max_tiles, E=experts, BLOCK_M=bm, BLOCK_T=moe_prefill.TILE_BLOCK,
+        )
         _expert_order_kernel[(triton.cdiv(pairs, 1024),)](top_i, cursor, order, pairs, BLOCK=1024)
         moe_prefill._gate_up_kernel[(max_tiles, triton.cdiv(inter, bn1))](
-            x, gate_up, order, tile_ends, counts, starts, act_r,
-            gate_up.stride(0), gate_up.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e, TOP_K=top_k,
-            BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            x, gate_up, order, table, act_r, gate_up.stride(0), gate_up.stride(1), max_tiles,
+            H=hidden, I=inter, TOP_K=top_k, BLOCK_M=bm, BLOCK_N=bn1, BLOCK_K=bk1, WIDEN=_WIDEN,
+            **moe_prefill.launch_options(cfg.gate_up),
         )
         moe_prefill._down_kernel[(max_tiles, triton.cdiv(hidden, bn2))](
-            act_r, down, top_w.reshape(-1), order, tile_ends, counts, starts, out_r,
-            down.stride(0), down.stride(1),
-            H=hidden, I=inter, E=experts, LOG_E=log_e,
-            BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN, num_warps=warps, num_stages=stages,
+            act_r, down, order, table, out_r, down.stride(0), down.stride(1), max_tiles,
+            H=hidden, I=inter, BLOCK_M=bm, BLOCK_N=bn2, BLOCK_K=bk2, WIDEN=_WIDEN,
+            **moe_prefill.launch_options(cfg.down),
         )
         _moe_combine_kernel[(tokens, triton.cdiv(hidden, block))](
-            out_r, sg, shared_out.contiguous(), y, H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
+            out_r, top_w.reshape(-1), sg, shared_out.contiguous(), y, sg.stride(0), H=hidden, K=top_k, BLOCK=block, WIDEN=_WIDEN,
         )
     return y
 
@@ -528,15 +635,16 @@ def gdn_conv_(qkv: torch.Tensor, state: torch.Tensor, weight: torch.Tensor,
     count, channels = qkv.shape
     kernel = state.shape[-1]
     assert state.stride(-1) == 1 and state.stride(-2) == kernel and kernel & (kernel - 1) == 0
-    qkv = qkv.contiguous()
-    out = torch.empty_like(qkv)
+    if qkv.stride(-1) != 1:
+        qkv = qkv.contiguous()  # rows may be strided (a column slice of a merged projection)
+    out = torch.empty((count, channels), dtype=qkv.dtype, device=qkv.device)
     with on_device(qkv):
         _gdn_conv_kernel[(triton.cdiv(count, 16), triton.cdiv(channels, 128))](
-            qkv, state, weight.contiguous(), out, count, channels, K=kernel, BLOCK_T=16,
+            qkv, state, weight.contiguous(), out, count, channels, qkv.stride(0), K=kernel, BLOCK_T=16,
             BLOCK_C=128, WIDEN=_WIDEN,
         )
         _gdn_conv_state_kernel[(triton.cdiv(channels, 256),)](
-            qkv, state, count, channels, meta if meta is not None else state, K=kernel, BLOCK_C=256,
+            qkv, state, count, channels, qkv.stride(0), meta if meta is not None else state, K=kernel, BLOCK_C=256,
             HAS_META=meta is not None,
         )
     return out
@@ -550,13 +658,16 @@ def gdn_gates_reference(a, b, a_log, dt_bias):
 
 def gdn_gates(a: torch.Tensor, b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor):
     """(g fp32 [T, HV], beta [T, HV] in ``b``'s dtype), as ``gdn_gates_reference``, one launch."""
-    a, b = a.contiguous(), b.contiguous()
+    # [T, HV] rows, possibly strided (column slices of a merged projection).
+    a = a if a.dim() == 2 and a.stride(-1) == 1 else a.reshape(-1, a.shape[-1]).contiguous()
+    b = b if b.dim() == 2 and b.stride(-1) == 1 else b.reshape(-1, b.shape[-1]).contiguous()
     g = torch.empty(a.shape, dtype=torch.float32, device=a.device)
-    beta = torch.empty_like(b)
+    beta = torch.empty(b.shape, dtype=b.dtype, device=b.device)
     numel = a.numel()
     with on_device(a):
         _gdn_gates_kernel[(triton.cdiv(numel, 1024),)](
-            a, b, a_log, dt_bias, g, beta, numel, HV=a.shape[-1], BLOCK=1024, WIDEN=_WIDEN,
+            a, b, a_log, dt_bias, g, beta, numel, a.stride(0), b.stride(0), HV=a.shape[-1], BLOCK=1024,
+            WIDEN=_WIDEN,
         )
     return g, beta
 
@@ -567,12 +678,16 @@ def gated_rms(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float
     dim = weight.shape[0]
     tokens = z.shape[0]
     x = x.reshape(-1, dim).contiguous()
-    z = z.reshape(-1, dim).contiguous()
+    if not (z.dim() == 2 and z.stride(-1) == 1 and z.shape[1] % dim == 0):
+        z = z.reshape(-1, dim).contiguous()
+    # z as [T', ZH * dim] rows of stride SZ (a column slice of a merged projection, or dense)
+    zh = z.shape[1] // dim
     rows = x.shape[0]
-    out = torch.empty_like(z)
+    assert rows == z.shape[0] * zh
+    out = torch.empty((rows, dim), dtype=z.dtype, device=z.device)
     with on_device(x):
         _gated_rms_kernel[(triton.cdiv(rows, 16),)](
-            x, z, weight, out, rows, eps, D=dim, BLOCK_R=16,
+            x, z, weight, out, rows, eps, z.stride(0), D=dim, ZH=zh, BLOCK_R=16,
             ROUND_Y=weight.dtype == torch.bfloat16, WIDEN=_WIDEN,
         )
     return out.reshape(tokens, -1)

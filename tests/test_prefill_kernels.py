@@ -134,7 +134,7 @@ def _to(mlp, dev):
     return mlp
 
 
-@pytest.mark.parametrize("tokens", [17, 90])
+@pytest.mark.parametrize("tokens", [17, 90, 130])
 def test_moe_block_matches_eager(tokens):
     dev = _device()
     experts, hidden, inter, k = 16, 64, 32, 4
@@ -185,6 +185,68 @@ def test_gdn_gates_and_gated_norm_match_eager():
     for w in ((torch.randn(dim, generator=g) * 0.2 + 1).bfloat16().to(dev), torch.ones(dim).to(dev)):
         ref = _gated_rms(core.reshape(-1, dim), z.reshape(-1, dim), w, 1e-6).reshape(tokens, -1)
         _close(pk.gated_rms(core, z, w, 1e-6), ref)
+
+
+def _pack_rows(parts):
+    """Re-point each NS weight to a row-slice of one contiguous tensor (as ``fused._pack``)."""
+    cat = torch.cat([p.weight for p in parts]).contiguous()
+    start = 0
+    for p in parts:
+        n = p.weight.shape[0]
+        p.weight = cat[start : start + n]
+        start += n
+    return cat
+
+
+@pytest.mark.parametrize("tokens", [17, 130])
+def test_moe_block_merged_matches_separate(tokens):
+    """Plan 40: router | shared gate | shared up | shared-expert gate as one GEMM over packed
+    rows, read as strided column views, against the separate GEMMs."""
+    dev = _device()
+    experts, hidden, inter, k = 16, 64, 32, 4
+    mlp = _to(_mlp(experts, hidden, inter, 48, tokens), dev)
+    sh = mlp.shared_expert
+    w = _pack_rows([mlp.gate, sh.gate_proj, sh.up_proj, mlp.shared_expert_gate])
+    assert pk.packed_rows((mlp.gate.weight, sh.gate_proj.weight, sh.up_proj.weight,
+                           mlp.shared_expert_gate.weight)).data_ptr() == w.data_ptr()
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(tokens, hidden, generator=g).bfloat16().to(dev)
+    ref = pk.moe(x, mlp, k)
+    got = pk.moe(x, mlp, k, merged=True)
+    _close(got, ref)
+    _close(got, pk.moe_reference(x, mlp, k))
+    assert torch.equal(got, pk.moe(x, mlp, k, merged=True))
+
+
+def test_packed_rows_rejects_unpacked():
+    dev = _device()
+    a = torch.zeros(4, 8, dtype=torch.bfloat16, device=dev)
+    b = torch.zeros(3, 8, dtype=torch.bfloat16, device=dev)
+    assert pk.packed_rows((a, b)) is None
+    assert pk.project(torch.zeros(2, 8, dtype=torch.bfloat16, device=dev), (a, b)) is None
+
+
+def test_gdn_kernels_on_strided_slices():
+    """Plan 40: conv, gates and the gated norm read column slices of one merged projection
+    (row stride N) with the same bits as on dense copies."""
+    dev = _device()
+    g = torch.Generator().manual_seed(11)
+    tokens, channels, heads, dim, kernel = 37, 96, 4, 16, 4
+    big = torch.randn(tokens, channels + heads * dim + 2 * heads, generator=g).bfloat16().to(dev)
+    qkv, z, b, a = torch.split(big, [channels, heads * dim, heads, heads], dim=-1)
+    state = torch.randn(channels, kernel, generator=g).bfloat16().to(dev)
+    weight = (torch.randn(channels, 1, kernel, generator=g) * 0.5).bfloat16().to(dev)
+    s1, s2 = state.clone(), state.clone()
+    assert torch.equal(pk.gdn_conv_(qkv, s1, weight), pk.gdn_conv_(qkv.contiguous(), s2, weight))
+    assert torch.equal(s1, s2)
+    a_log = torch.randn(heads, generator=g).to(dev)
+    dt_bias = torch.randn(heads, generator=g).to(dev)
+    g1, b1 = pk.gdn_gates(a, b, a_log, dt_bias)
+    g2, b2 = pk.gdn_gates(a.contiguous(), b.contiguous(), a_log, dt_bias)
+    assert torch.equal(g1, g2) and torch.equal(b1, b2)
+    core = torch.randn(tokens, heads, dim, generator=g).bfloat16().to(dev)
+    w = (torch.randn(dim, generator=g) * 0.2 + 1).bfloat16().to(dev)
+    assert torch.equal(pk.gated_rms(core, z, w, 1e-6), pk.gated_rms(core, z.contiguous(), w, 1e-6))
 
 
 # ------------------------------------------------------------------------- the whole prefill

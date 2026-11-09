@@ -2,9 +2,11 @@
 
     python tools/lut12_bench.py [--devices 6,7] [--layers 4] [--samples 6]
 
-1. Compile ``engine/fast/hip/lut12_moe.hip`` with hipRTC from torch's wheel (a child process;
-   plan 39's loader, ``engine/fast/hipmega_rtc.py``) for MAXP = 4 and 8 rows and two tile
-   configs, and print each kernel's VGPRs / spills / occupancy.
+1. Compile ``engine/fast/hip/lut12_moe2.hip`` (kernel pass 2: expert-grouped up and down, 16
+   weights per lane, in-kernel or separate combine, streaming-ceiling variants) with hipRTC
+   from torch's wheel (a child process; plan 39's loader, ``engine/fast/hipmega_rtc.py``) for
+   MAXP = 4 and 8 rows and the ``CONFIGS`` tiles; print each kernel's VGPRs / occupancy / LDS.
+   (j217 measured pass 1, ``lut12_moe.hip``, at commit f807147.)
 2. Load one 2-GCD replica as ``tools/moe_decode_bench.py`` does (``ENGINE_TP=1``, whole layers
    per GCD), prefill ``--sessions`` replay-like prompts (Request Factory-style synthetic coding
    lines, not the benchmark's sessions) and greedy-decode them eagerly, recording the MoE
@@ -18,7 +20,8 @@
    today's kernels on rank 0's TP2 shard of the real layer. Methods, all on the same sets:
    ``triton``: ``fused._moe_up_kernel`` + ``fused._moe_down_kernel`` exactly as
    ``FusedDecode._moe`` launches them (no residual, as under TP2); ``hip-raw`` and ``hip-pk``
-   (BF16 vs LUT-12 weights, same kernels otherwise). Timed as CUDA graphs of back-to-back
+   (BF16 vs LUT-12 weights, same kernels otherwise); ``ceiling``: the s* kernels, the same
+   grid, launch shape and loads with no decode or math (the streaming ceiling). Timed as CUDA graphs of back-to-back
    launches cycling over the sets (``moe_decode_bench.time_us``). Bitwise: hip-pk == hip-raw
    on every set (act and out); hip-raw vs triton: max relative difference.
 5. A captured graph mixing Triton and hipRTC launches (top-k -> HIP up -> Triton down),
@@ -50,7 +53,15 @@ import torch  # noqa: E402
 from engine.fast import hipmega_rtc as rtc  # noqa: E402
 from engine.fast import lut12  # noqa: E402
 
-CONFIGS = {"a": dict(NT=16, ITD=1, UN=2), "b": dict(NT=32, ITD=2, UN=2), "c": dict(NT=16, ITD=2, UN=4)}
+# Kernel pass 2 (lut12_moe2.hip): NT gate_up n per block, SC K steps per load chunk, NTD down
+# rows per block, INK 1 = in-kernel combine by the tile's last block, 0 = moe_combine pass.
+CONFIGS = {
+    "a": dict(NT=16, SC=2, NTD=32, INK=1),
+    "b": dict(NT=16, SC=4, NTD=64, INK=1),
+    "c": dict(NT=32, SC=4, NTD=64, INK=0),
+    "d": dict(NT=32, SC=2, NTD=32, INK=1),
+}
+HIP_SRC = ROOT / "engine" / "fast" / "hip" / "lut12_moe2.hip"
 
 
 def out(msg: str) -> None:
@@ -62,8 +73,8 @@ def out(msg: str) -> None:
 
 def compile_all(shape: dict) -> dict:
     """(maxp, cfg) -> (code, resources), compiled in a child process."""
-    src = lut12.hip_source()
-    path = Path(tempfile.gettempdir()) / "lut12_moe.hip"
+    src = HIP_SRC.read_text()
+    path = Path(tempfile.gettempdir()) / "lut12_moe2.hip"
     path.write_text(src)
     res = {}
     for maxp in (4, 8):
@@ -84,30 +95,39 @@ def compile_all(shape: dict) -> dict:
 class Hip:
     """The kernels of one compiled variant on one device."""
 
+    NAMES = ("moe_up_raw", "moe_up_pk", "moe_up_sraw", "moe_up_spk", "moe_down_raw", "moe_down_pk",
+             "moe_down_sraw", "moe_down_spk", "moe_combine", "lut12_decode")
+
     def __init__(self, code: bytes, dev: torch.device, maxp: int, cfg: dict, shape: dict) -> None:
         self.mod = rtc.Module(code, dev)
         self.dev, self.maxp, self.cfg, self.shape = dev, maxp, cfg, shape
-        self.fn = {n: self.mod.fn(n) for n in ("moe_up_raw", "moe_up_pk", "moe_down_raw", "moe_down_pk",
-                                               "lut12_decode")}
+        self.fn = {n: self.mod.fn(n) for n in self.NAMES}
+        H = shape["H"]
+        self.parts = torch.zeros((maxp * shape["TOPK"], H), dtype=torch.float32, device=dev)
+        self.shb = torch.zeros((maxp, H), dtype=torch.float32, device=dev)
+        self.cnt = torch.zeros(H // 16, dtype=torch.int32, device=dev)
 
-    def up(self, pk: bool, h, idx, w, side, act, R: int) -> None:
+    def up(self, kind: str, h, idx, w, side, act, R: int) -> None:
+        """kind: raw, pk, sraw (streaming ceiling, raw bytes), spk (ceiling, packed bytes)."""
         S = self.shape
         grid = R * S["TOPK"] * (S["I"] // self.cfg["NT"])
-        self.fn["moe_up_pk" if pk else "moe_up_raw"].launch(
-            grid, 256, [h, idx, w, side, act, ctypes.c_int(R)])
+        self.fn["moe_up_" + kind].launch(grid, 256, [h, idx, w, side, act, ctypes.c_int(R)])
 
-    def down(self, pk: bool, act, r, idx, wt, w, side, sd, sside, res, outt, R: int) -> None:
+    def down(self, kind: str, act, r, idx, wt, w, side, sd, sside, outt, R: int) -> None:
         S = self.shape
-        grid = R * (S["H"] // (8 * self.cfg["ITD"]))
-        has_res = res is not None
-        self.fn["moe_down_pk" if pk else "moe_down_raw"].launch(
-            grid, 256, [act, r, idx, wt, w, side, sd, sside, res if has_res else outt, outt,
-                        ctypes.c_int(R), ctypes.c_int(int(has_res))])
+        grid = (R * S["TOPK"] + 1) * (S["H"] // self.cfg["NTD"])
+        self.fn["moe_down_" + kind].launch(
+            grid, 256, [act, r, idx, wt, w, side, sd, sside, outt, outt, self.parts, self.shb, self.cnt,
+                        ctypes.c_int(R), ctypes.c_int(0)])
+        if not self.cfg["INK"] and kind in ("raw", "pk"):
+            self.fn["moe_combine"].launch((R * S["H"] + 255) // 256, 256,
+                                          [self.parts, self.shb, wt, r, outt, outt, ctypes.c_int(R),
+                                           ctypes.c_int(0)])
 
     def decode(self, p: lut12.Packed) -> torch.Tensor:
         nt = p.tiles
         o = torch.empty(nt * 128, dtype=torch.int16, device=p.planes.device)
-        self.fn["lut12_decode"].launch((nt + 15) // 16, 256, [p.planes, p.side, o, ctypes.c_int64(nt)])
+        self.fn["lut12_decode"].launch((nt + 31) // 32, 256, [p.planes, p.side, o, ctypes.c_int64(nt)])
         return o
 
 
@@ -342,23 +362,27 @@ def real(args) -> None:
                 BKI=min(1024, mdb.p2(L.I)), BKS=min(1024, mdb.p2(L.IS)), ORDER=order,
                 HAS_RES=False, num_warps=4)
 
-        def hip_up(s, pk, cfg):
+        def kind(pk, stream=False):
+            return ("s" if stream else "") + ("pk" if pk else "raw")
+
+        def hip_up(s, pk, cfg, stream=False):
             L = s.layer
             hp = hips[(s.R, cfg, dev0)]
             if pk:
-                hp.up(True, s.h, s.idx, L.pg.planes, L.pg.side, s.hact, s.R)
+                hp.up(kind(pk, stream), s.h, s.idx, L.pg.planes, L.pg.side, s.hact, s.R)
             else:
-                hp.up(False, s.h, s.idx, L.gu, L.pg.side, s.hact, s.R)
+                hp.up(kind(pk, stream), s.h, s.idx, L.gu, L.pg.side, s.hact, s.R)
 
-        def hip_dn(s, pk, cfg, act=None, outt=None):
+        def hip_dn(s, pk, cfg, act=None, outt=None, stream=False):
             L = s.layer
             hp = hips[(s.R, cfg, dev0)]
             a = s.hact if act is None else act
             o = s.hout if outt is None else outt
             if pk:
-                hp.down(True, a, s.r, s.idx, s.wt, L.pd.planes, L.pd.side, L.ps.planes, L.ps.side, None, o, s.R)
+                hp.down(kind(pk, stream), a, s.r, s.idx, s.wt, L.pd.planes, L.pd.side, L.ps.planes,
+                        L.ps.side, o, s.R)
             else:
-                hp.down(False, a, s.r, s.idx, s.wt, L.dn, L.pd.side, L.sd, L.ps.side, None, o, s.R)
+                hp.down(kind(pk, stream), a, s.r, s.idx, s.wt, L.dn, L.pd.side, L.sd, L.ps.side, o, s.R)
 
         # correctness
         for R, sets in sets_by_r.items():
@@ -437,6 +461,14 @@ def real(args) -> None:
                         f"updn_us={ud:.1f} x_triton={ud / t_ud:.3f} up_x={u / t_up:.3f} dn_x={d / t_dn:.3f} "
                         f"GBps_streamed={b / ud / 1e3:.0f} GBps_raw_equiv={raw_bytes / ud / 1e3:.0f}")
                     summary[(R, m, cfg)] = ud
+                    try:
+                        su = mdb.time_us([lambda s=s: hip_up(s, pk, cfg, stream=True) for s in sets])
+                        sdn = mdb.time_us([lambda s=s: hip_dn(s, pk, cfg, stream=True) for s in sets])
+                        out(f"RESULT ceiling R={R} bytes={'packed' if pk else 'raw'} cfg={cfg} up_us={su:.1f} "
+                            f"dn_us={sdn:.1f} sum_us={su + sdn:.1f} GBps_streamed={b / (su + sdn) / 1e3:.0f} "
+                            f"kernel_x_ceiling={ud / (su + sdn):.3f}")
+                    except Exception as exc:  # noqa: BLE001
+                        out(f"RESULT ceiling R={R} cfg={cfg} failed: {exc!r}")
 
         # ---- (c) graph capture: Triton top-k -> hipRTC up -> Triton down, replayed vs eager
         s = sets_by_r[8][0]
@@ -448,7 +480,7 @@ def real(args) -> None:
         def chain():
             fused._topk_kernel[(s.R,)](s.r, idx2, wt2, L.N3, E=L.E, TOPK=s.topk, TOPKP=mdb.p2(s.topk),
                                        num_warps=1)
-            hp.up(True, s.h, idx2, L.pg.planes, L.pg.side, act2, s.R)
+            hp.up("pk", s.h, idx2, L.pg.planes, L.pg.side, act2, s.R)
             tri_dn(s, act=act2, outt=out2)
 
         try:
@@ -490,9 +522,9 @@ def real(args) -> None:
         pk8 = best[(8, "hip-pk")][0] / summary[(8, "triton")]
         raw8 = best[(8, "hip-raw")][0] / summary[(8, "triton")]
         passed = pk8 <= 0.85 and exact and ratio <= 0.80
-        out(f"RESULT verdict {'PASS' if passed else 'KILL'} pk_x_triton_R8={pk8:.3f} (<=0.85) "
-            f"roundtrip_exact={exact} ratio={ratio:.4f} (<=0.80) fallback_rate={fb_rate:.2e} "
-            f"raw_x_triton_R8={raw8:.3f} raw_hip_slower_than_1.15x={raw8 > 1.15}")
+        out(f"RESULT verdict {'PASS' if passed else 'KILL'} pk_x_triton_R8={pk8:.3f} (<=0.85 to serve) "
+            f"raw_x_triton_R8={raw8:.3f} (<=1.0 reopen line: {raw8 <= 1.0}) roundtrip_exact={exact} "
+            f"ratio={ratio:.4f} (<=0.80) fallback_rate={fb_rate:.2e}")
 
 
 def main() -> None:

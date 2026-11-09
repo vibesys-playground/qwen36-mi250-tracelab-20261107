@@ -89,7 +89,7 @@ def first_of(index: int, args) -> int:
     """Session ``index``'s first-round prompt length: ``--first``, or with ``--first-max`` one of
     ``--sessions`` evenly spaced lengths from ``--first`` to ``--first-max``, in a fixed shuffled
     order (so long and short first rounds are mixed in time)."""
-    top = args.first_max or args.first
+    top = getattr(args, "first_max", 0) or args.first
     if top <= args.first or args.sessions < 2:
         return args.first
     order = list(range(args.sessions))
@@ -100,7 +100,7 @@ def first_of(index: int, args) -> int:
 def session(url: str, pool: list[int], index: int, args) -> list[dict]:
     rounds = rounds_of(index, args)
     first = first_of(index, args)
-    top = max(args.first, args.first_max or 0)
+    top = max(args.first, getattr(args, "first_max", 0) or 0)
     span = first + rounds * args.grow
     stride = top + math.ceil(args.rounds) * args.grow  # sessions do not share tokens
     offset = (index * stride) % max(1, len(pool) - span)

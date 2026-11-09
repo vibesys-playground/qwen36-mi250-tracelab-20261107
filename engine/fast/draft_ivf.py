@@ -468,8 +468,8 @@ if triton is not None:
         tl.store(loc_ptr + r * 3 + 2, nxt)
         tl.store(ids_ptr + r, tid.to(tl.int64))
 
-    @triton.jit(do_not_specialize=["R", "gap"])
-    def _ivf_flag_kernel(loc_ptr, flag_ptr, stats_ptr, R, gap, RB: tl.constexpr):
+    @triton.jit(do_not_specialize=["R", "gap", "link"])
+    def _ivf_flag_kernel(loc_ptr, flag_ptr, stats_ptr, hist_ptr, link, R, gap, RB: tl.constexpr):
         """The step falls back (flag[0] = 1, kept for the rest of the step's chain) when any
         row's shortlist max is within ``gap`` of the best unscanned centroid score. Counts
         drafts and drafts on the full pass."""
@@ -487,7 +487,7 @@ if triton is not None:
         # profiling only (plan 47 profile): per (link, slot bin) steps, steps on the full pass
         # (sticky included), steps where this link set the flag. Never read by the draft.
         h = hist_ptr + ((link - 1) * 3 + tl.minimum(R, 3) - 1) * 3
-        tl.atomic_add(h, 1)
+        tl.atomic_add(h, (R * 0 + 1).to(tl.int64))
         tl.atomic_add(h + 1, f.to(tl.int64))
         tl.atomic_add(h + 2, (f * (1 - f0)).to(tl.int64))
 

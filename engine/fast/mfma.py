@@ -34,9 +34,9 @@ triton, tl = kernels.triton, kernels.tl
 CHAIN = os.environ.get("ENGINE_SPEC_CHAIN", "1") == "1"
 GEMV = CHAIN or os.environ.get("ENGINE_MFMA_GEMV", "0") == "1"
 # Most drafts per slot of a chained verify step (the GDN ring holds KMAX + 1 states per slot).
-# 3 by default (plan 31 stage 1, j161: k = 3 the best tokens/ms on replay-like text); 7 for
-# experiments.
-KMAX = int(os.environ.get("ENGINE_SPEC_KMAX", "3"))
+# 7 by default (plan 58: deeper chains pay at 1-2 slots when a request's acceptance holds by
+# depth, j268; ``speculative.choose_k`` decides per step); 3 restores plan 31's ring of 4.
+KMAX = int(os.environ.get("ENGINE_SPEC_KMAX", "7"))
 RING = KMAX + 1
 BM = 16  # the fixed row tile
 # Plan 37: the MoE router top-k inside the router|shared GEMV's K-sum kernel, so no

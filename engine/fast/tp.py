@@ -1658,9 +1658,7 @@ class TPModel:
             for meta in model.devices.values():
                 packed = meta.packed.clone()
                 out = torch.zeros(3 * packed.shape[1], dtype=torch.long, device=packed.device)
-                for groups in (2, 4, 8):
-                    if groups > mfma.RING:
-                        continue
+                for groups in range(2, mfma.RING + 1):  # every chain depth up to KMAX
                     with kernels.on_device(packed):
                         _chain_next_kernel[(1,)](out, packed, 1, 1, packed.shape[1], model.ring,
                                                  model.gdn_rows, G=groups, num_warps=1)

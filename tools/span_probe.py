@@ -40,6 +40,18 @@ Parts (all ``RESULT`` lines):
   standalone rate, any bit differs, or any timeout/hang.
 
 A tool for the plan, not the task's metric; it changes nothing in the served path.
+
+Stage 0 result (j270 on f61287c, GCD 0,1, layer 0, real routing; j269 gave the same ceiling):
+KILL. Fused span at 4 rows 164.0 us per span in a 10-span graph vs today's 149.8 (x1.095),
+175.5 vs 162.4 as one graph (x1.081); best variant num_stages 2, no prefetch, 3 CTAs/CU (312,
+VGPR 140 -> occupancy 3). Bitwise on both ranks (all 10 outputs, every variant), 2000-replay
+stress at 4 and 8 rows with 0 barrier / all-reduce timeouts. Ceiling at 4 rows: stream floor
+97.2 us (1.36 TB/s), today's excess 52.5 us = node launch ~21.7 (10 x 2.17 us empty node) +
+fill/drain ~30.8. Inside the persistent kernel each phase still costs about its standalone
+kernel (phases 155 us vs kernels alone 158 us): a grid barrier (1.2 us) replaces a node launch
+(2.2 us) but every phase keeps its own fill and tail, P0 out_proj runs at 0.81-0.84x (512 tiles
+on 312 CTAs), P3 top-k 8.0 vs 5.2 us, prefetch adds VGPRs and time. Top-k order: the 1-warp
+reference sums strided in-thread then in the gfx9 DPP lane order (mode strided=1, tree=0).
 """
 
 from __future__ import annotations

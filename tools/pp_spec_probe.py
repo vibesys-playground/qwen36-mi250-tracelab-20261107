@@ -220,6 +220,22 @@ def _capture(torch, fast, dev, fn, static_in):
     return graph, o
 
 
+def _ivf(fast):
+    return (fast.ranks[0] if hasattr(fast, "ranks") else fast).ivf
+
+
+def _ivf_stats(fast):
+    ivf = _ivf(fast)
+    return None if ivf is None else ivf.stats[:2].cpu().tolist()
+
+
+def _ivf_frac(before, after):
+    if before is None or after is None:
+        return None
+    n = after[0] - before[0]
+    return round((after[1] - before[1]) / n, 4) if n else None
+
+
 def _draft(fast, h, first: bool = False):
     if fast.ivf is not None:
         return fast.ivf.draft(h, fast, first=first)
@@ -257,11 +273,14 @@ def cmd_stage(args) -> None:
         size = fast.bucket(b)
         rows = groups * size
         drafts = [ids[9973 * s + plen + 1: 9973 * s + plen + 1 + k] for s in slots[:b]]
-        rec = {"tp": args.tp, "B": b, "k": k, "size": size, "rows": rows}
+        rec = {"tp": args.tp, "B": b, "k": k, "size": size, "rows": rows, "variant": args.variant}
         try:
             with torch.inference_mode():
                 call = lambda: fast.verify_chain(lasts[:b], drafts, slots[:b], [plen] * b)  # noqa: E731
+                st0 = _ivf_stats(fast)
                 rec["call_ms"] = round(_median_ms(torch, call, args.iters), 3)
+                # drafts the IVF search could not settle (taken by the full-vocabulary pass)
+                rec["ivf_full_frac"] = _ivf_frac(st0, _ivf_stats(fast))
                 if fast.graph_error is not None:
                     raise RuntimeError(f"graph_error {fast.graph_error}")
                 if args.tp == 2:
@@ -312,6 +331,7 @@ def cmd_stage(args) -> None:
                     if not args.quick:
                         rec["classes_seg0"] = _class_split(torch, r0)
                         rec["classes_seg1"] = _class_split(torch, r1)
+                    if spec in args.perop.split(","):
                         rec.update(_per_op(torch, fast, groups, size, b))
             log(f"stage {json.dumps({k_: v for k_, v in rec.items() if not k_.startswith(('classes', 'op_'))})}")
         except Exception as exc:  # noqa: BLE001
@@ -356,9 +376,13 @@ def _per_op(torch, fast, groups: int, size: int, b: int) -> dict:
         hdev = fast.lm_head.device
         meta = fast.devices[hdev]
         with torch.cuda.device(hdev):
-            h0 = torch.zeros((size, fast.config.hidden_size), dtype=fast.embed.dtype, device=hdev)
-            h0.normal_()
-            d0 = torch.zeros((size,), dtype=torch.long, device=hdev)
+            # a real link input: the head on the step's own normed rows and picks (eager)
+            xn = keep[-2][1][:size]
+            picks = keep[-1][1][:size].argmax(-1)
+            z = fast._fused_layer(fast.mtp_index, fast._mtp_in(xn, picks, True), meta.slots[:size],
+                                  meta.positions[:size], meta)
+            h0 = fast._mtp_norm(z).contiguous().clone()
+            d0 = _draft(fast, h0, first=True).clone()
             pos = meta.positions[:size].clone() + groups  # the chain's next link position
 
         def link(h):
@@ -371,7 +395,9 @@ def _per_op(torch, fast, groups: int, size: int, b: int) -> dict:
         def rl():
             with torch.cuda.device(hdev):
                 lg.replay()
+        st0 = _ivf_stats(fast)
         link_ms = _per_launch_ms(torch, rl, n=30, reps=5)
+        link_full = _ivf_frac(st0, _ivf_stats(fast))
         del lg
     finally:
         for meta, packed in saved:
@@ -380,7 +406,8 @@ def _per_op(torch, fast, groups: int, size: int, b: int) -> dict:
         keep.clear()
         torch.cuda.empty_cache()
     devs = [str(d) for d, _ in ops]
-    return {"op_ms": times, "op_dev": devs, "op_n": len(ops), "link_ms": round(link_ms, 4)}
+    return {"op_ms": times, "op_dev": devs, "op_n": len(ops), "link_ms": round(link_ms, 4),
+            "link_ivf_full_frac": link_full}
 
 
 # ============================================================================ (b) deep
@@ -678,7 +705,16 @@ def cmd_project(args) -> None:
                     recs.setdefault(mt.group(1), []).append(json.loads(mt.group(2)))
                 except json.JSONDecodeError:
                     pass
-    stage = {(r["tp"], r["B"], r["k"]): r for r in recs.get("stage", []) if "error" not in r}
+    stage: dict = {}
+    for r in recs.get("stage", []):
+        if "error" in r or (r["tp"] == 1 and r.get("variant", "base") != args.variant):
+            continue
+        stage.setdefault((r["tp"], r["B"], r["k"]), {}).update(r)
+    links = {}
+    for (tp, b, k), r in stage.items():
+        if tp == 1 and "link_ms" in r:
+            links.setdefault(b, []).append(r["link_ms"])
+    out(f"RESULT project variant={args.variant} link_ms by B={links}")
     deep = {r["corpus"]: [[HEX.index(c) for c in s] for s in r["M"]] for r in recs.get("deep", [])}
     layout = (recs.get("tp1_layout") or [None])[0]
     out(f"RESULT project inputs: stage configs={sorted(stage)} corpora={sorted(deep)}")
@@ -694,7 +730,9 @@ def cmd_project(args) -> None:
         tp2 = r2.get("replay_b2b_ms") or r2["replay_ms"]
         s1 = r1.get("seg0_b2b_ms") or r1["seg0_ms"]
         s2 = r1.get("seg1_b2b_ms") or r1["seg1_ms"]
-        link = r1.get("link_ms", 0.0)
+        anyl = [x for v in links.values() for x in v]
+        link = r1.get("link_ms") or (statistics.median(links[b]) if links.get(b)
+                                     else (max(anyl) if anyl else 0.0))
         hand = r1.get("handoff_ms", 0.0)
         s2pp = s2 + (k + 1) * link
         # balanced split from the per-op times, scaled to the measured segment times
@@ -719,6 +757,11 @@ def cmd_project(args) -> None:
                     best_s = (sp, st1, st2)
             bal = {"split": best_s[0], "stage1": round(best_s[1], 3), "stage2": round(best_s[2], 3),
                    "scale": [round(sc0, 3), round(sc1, 3)]}
+        if bal is None:  # no per-op times: equal layers, half the total each, plus half a layer
+            per_layer = s1 / max(layout["split"], 1) if layout else 0.0
+            tot = s1 + s2pp
+            bal = {"split": None, "stage1": round(tot / 2 + per_layer / 2, 3),
+                   "stage2": round(tot / 2 + per_layer / 2, 3), "estimated": True}
         tick_now = max(s1, s2pp) + hand
         tick_bal = (max(bal["stage1"], bal["stage2"]) + hand) if bal else tick_now
         big = max(s1, s2pp) if not bal else max(bal["stage1"], bal["stage2"])
@@ -784,7 +827,9 @@ def main() -> None:
     a.add_argument("--configs", default="1:1,1:3,1:5,1:7,2:1,2:3,2:5,2:7")
     a.add_argument("--prompt-len", type=int, default=1800)
     a.add_argument("--iters", type=int, default=40)
-    a.add_argument("--quick", action="store_true")
+    a.add_argument("--quick", action="store_true", help="no class split")
+    a.add_argument("--perop", default="", help="configs B:k that also get the per-op graphs and link")
+    a.add_argument("--variant", default=os.environ.get("P68_VARIANT", "base"))
     d = sub.add_parser("deep")
     d.add_argument("--devices", default="2,3")
     d.add_argument("--texts", type=int, default=8)
@@ -797,6 +842,7 @@ def main() -> None:
     m.add_argument("--split", type=int, default=22)
     p = sub.add_parser("project")
     p.add_argument("logs", nargs="+")
+    p.add_argument("--variant", default="base", help="which tp1 records (stage --variant)")
     args = ap.parse_args()
     {"stage": cmd_stage, "deep": cmd_deep, "mem": cmd_mem, "project": cmd_project}[args.cmd](args)
 

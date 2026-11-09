@@ -499,9 +499,10 @@ def glue_parity(fast, ranks, prefill, ids, plen, steps, torch, sync) -> None:
         return hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
     from engine.fast import mfma as MF
+    from engine.fast import model as MD
 
     flags = (f"topk={int(FZ.GLUE_TOPK)} nozero={int(FZ.GLUE_NOZERO)} arrms={int(TP.GLUE_ARRMS)} "
-             f"topk_epi={MF.TOPK_EPI}")
+             f"topk_epi={MF.TOPK_EPI} chain_glue={int(MD.CHAIN_GLUE)} ar_ksum={int(TP.AR_KSUM)}")
     if MF.CHAIN:
         for k in (1, 3):
             if k > MF.KMAX:

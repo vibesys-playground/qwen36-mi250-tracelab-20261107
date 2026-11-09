@@ -797,12 +797,16 @@ class FusedDecode:
 
     def _gemv(self, x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None,
               conv: tuple | None = None, tiles: tuple[int, int, int] | None = None,
-              grid_per_cu: int = GRID) -> torch.Tensor:
+              grid_per_cu: int = GRID, defer: bool = False) -> torch.Tensor:
+        """``bf16(x @ w.T)``; with ``defer`` (plan 51, MFMA path, no conv) possibly
+        ``mfma.KParts``, the unsummed K parts for the all-reduce to sum."""
         rows, k = x.shape
         n = w.shape[0]
         assert w.shape[1] == k and x.stride(1) == 1 and x.stride(0) == k
         if out is None:
             out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
+        if mfma.GEMV and tiles is None and defer and conv is None:
+            return mfma.gemv(x, w, out, defer=True)
         if mfma.GEMV and tiles is None:  # plan 31: 16-row MFMA tiles (``engine.fast.mfma``)
             mfma.gemv(x, w, out)
             if conv is not None:
@@ -927,7 +931,7 @@ class FusedDecode:
         )
         return out
 
-    def _gdn(self, i: int, h: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    def _gdn(self, i: int, h: torch.Tensor, slots: torch.Tensor, defer: bool = False) -> torch.Tensor:
         """``slots`` are the rows' Gated DeltaNet state rows."""
         fast = self.fast
         m = fast.layers[i].linear_attn
@@ -935,12 +939,12 @@ class FusedDecode:
         if getattr(m, "_gdn_hip", None) is not None:  # plan 50: conv + step + norm in HIP
             proj = self._gemv(h, self.w_in[i])
             core = gdn_hip.layer_core(m, conv_state, rec_state, proj, slots, 1)
-            return self._gemv(core, m.out_proj.weight)
+            return self._gemv(core, m.out_proj.weight, defer=defer)
         conv_dim = 2 * m.key_dim + m.value_dim
         proj = self._gemv(h, self.w_in[i], conv=(conv_state, slots, m.conv1d.weight, conv_dim))
         core = torch.empty((h.shape[0], m.num_v_heads * m.head_v_dim), dtype=h.dtype, device=h.device)
         self._gdn_step(m, rec_state, slots, proj, core)
-        return self._gemv(core, m.out_proj.weight)
+        return self._gemv(core, m.out_proj.weight, defer=defer)
 
     def _gdn_step(self, m, rec_state: torch.Tensor, slots: torch.Tensor, proj: torch.Tensor,
                   core: torch.Tensor) -> None:
@@ -959,7 +963,8 @@ class FusedDecode:
         )
 
     def _gdn_verify(self, i: int, h: torch.Tensor, states: torch.Tensor,
-                    bank_fused: bool | None = None, groups: int = 2) -> torch.Tensor:
+                    bank_fused: bool | None = None, groups: int = 2,
+                    defer: bool = False) -> torch.Tensor:
         """A verify step's GDN layer: rows ``[:n]`` are each slot's first token on its current
         state row, rows ``[n:]`` its draft on the other bank's row (``FastModel._gdn_verify``).
 
@@ -976,9 +981,9 @@ class FusedDecode:
             conv_state, rec_state = self.fast.gdn_state[i]
             proj = self._gemv(h, self.w_in[i])
             core = gdn_hip.layer_core(m, conv_state, rec_state, proj, states, groups)
-            return self._gemv(core, m.out_proj.weight)
+            return self._gemv(core, m.out_proj.weight, defer=defer)
         if mfma.CHAIN or groups != 2:  # plan 31: G rows per slot, states to the ring
-            return mfma.gdn_chain(self, i, h, states, groups)
+            return mfma.gdn_chain(self, i, h, states, groups, defer)
         fast = self.fast
         m = fast.layers[i].linear_attn
         conv_state, rec_state = fast.gdn_state[i]
@@ -1003,7 +1008,7 @@ class FusedDecode:
                 m.norm.variance_epsilon, dk ** -0.5, z_off, b_off, a_off,
                 RATIO=heads // m.num_k_heads, KEY_DIM=m.key_dim, DK=dk, DV=dv, num_warps=8,
             )
-            return self._gemv(core, m.out_proj.weight)
+            return self._gemv(core, m.out_proj.weight, defer=defer)
         halves = ((slice(0, n), states[:n]), (slice(n, 2 * n), states[n:]))
         for index, (rows, slots) in enumerate(halves):
             if index:
@@ -1013,10 +1018,10 @@ class FusedDecode:
             part = proj[rows]
             part[:, :conv_dim] = kernels.gdn_conv_(conv_state, slots, part[:, :conv_dim], m.conv1d.weight)
             self._gdn_step(m, rec_state, slots, part, core[rows])
-        return self._gemv(core, m.out_proj.weight)
+        return self._gemv(core, m.out_proj.weight, defer=defer)
 
     def _attn(self, i: int, h: torch.Tensor, slots: torch.Tensor, positions: torch.Tensor,
-              meta) -> torch.Tensor:
+              meta, defer: bool = False) -> torch.Tensor:
         fast = self.fast
         m = self._layer(i).self_attn
         qkv = self._gemv(h, self.w_in[i])
@@ -1048,7 +1053,7 @@ class FusedDecode:
         _attn_combine_kernel[(rows, q_heads)](
             acc, ml, qkv, gated, qkv.stride(0), QH=q_heads, D=dim, SPLITS=splits, num_warps=4,
         )
-        return self._gemv(gated, m.o_proj.weight)
+        return self._gemv(gated, m.o_proj.weight, defer=defer)
 
     # ---------------------------------------------------------------- one layer
 

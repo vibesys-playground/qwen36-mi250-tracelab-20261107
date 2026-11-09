@@ -67,6 +67,18 @@ NATURAL = [
     "What are the trade-offs between microservices and a monolith for a five-person startup?",
     "Write a bash script that rotates log files older than seven days and compresses them.",
     "Describe how a transformer language model generates text, for a high-school student.",
+    "Write a cover letter for a junior data analyst position at a hospital.",
+    "Compare Python's asyncio with threads for an I/O-bound web scraper, with code.",
+    "Explain how vaccines train the immune system, in plain language.",
+    "Write a JavaScript debounce function with TypeScript types and unit tests.",
+    "Plan a three-day trip to Kyoto for a family with two children.",
+    "Explain the CAP theorem with a concrete example from a distributed database.",
+    "Write a haiku sequence about autumn rain, then explain the imagery.",
+    "Implement binary search in C and discuss its off-by-one pitfalls.",
+    "What should I consider when choosing between renting and buying a home?",
+    "Explain gradient descent and learning-rate schedules with a small NumPy example.",
+    "Draft a polite email asking a landlord to fix a broken heater.",
+    "Describe the water cycle and how climate change affects it.",
 ]
 
 
@@ -161,6 +173,8 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=16)
     ap.add_argument("--chain-max", type=int, default=400, help="chain positions per sequence")
     ap.add_argument("--rows", default="1,2,8")
+    ap.add_argument("--gate", action="store_true",
+                    help="plan 47 gated hybrid: natural prompts split cal/test by index; tools/ivf_gate.py")
     args = ap.parse_args()
     t_start = time.perf_counter()
 
@@ -242,7 +256,8 @@ def main() -> None:
     for k in range(args.natural):
         msg = [{"role": "user", "content": NATURAL[k % len(NATURAL)]}]
         s = tok.apply_chat_template(msg, add_generation_prompt=True, tokenize=False, enable_thinking=False)
-        prompts.append(("natural", tok.encode(s, add_special_tokens=False)))
+        kind = ("natural_cal" if k % 2 == 0 else "natural_test") if args.gate else "natural"
+        prompts.append((kind, tok.encode(s, add_special_tokens=False)))
 
     # Greedy continuation, one left-padded batch, ignore_eos.
     t0 = time.perf_counter()
@@ -399,6 +414,12 @@ def main() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     out("mem", free_GB=round(torch.cuda.mem_get_info(dev)[0] / 1e9, 1))
+    if args.gate:
+        import ivf_gate
+
+        ivf_gate.run(samples, W, args, out, time_us)
+        out("total", seconds=round(time.perf_counter() - t_start))
+        return
 
     # ------------------------------------------------------------------ 4. indexes
     bounds = [math.ceil(V * r / 2) for r in range(3)]
